@@ -215,8 +215,8 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
             if wallet in hidden:
                 continue
             rows.append({
-                'Wallet': wallet[:8] + '...' + wallet[-4:],
-                'wallet_full': wallet,
+                '👁': 'hide',
+                'Wallet': wallet,
                 'Snaps': f"🟢#{snap['snapshot_id']}",
                 'Filter': data.get('filter_game') or '—',
                 'Actual': data.get('game') or '—',
@@ -247,8 +247,8 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
     rows = []
     for wallet in sorted(all_wallets):
         row = {
-            'Wallet': wallet[:8] + '...' + wallet[-4:],
-            'wallet_full': wallet,
+            '👁': 'hide',
+            'Wallet': wallet,
         }
 
         # Snapshot presence indicators

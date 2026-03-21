@@ -238,13 +238,24 @@ def update_table(snapshot_ids, show_hidden, _):
         if df.empty:
             return [], [], [], summary, "", f"Show Hidden ({hidden_count})"
 
-        # Remove internal columns from display
-        display_cols = [c for c in df.columns if c != 'wallet_full']
-        columns = [{'name': c, 'id': c} for c in display_cols]
+        # Build columns with proper types
+        display_cols = [c for c in df.columns]
+        numeric_keywords = ['Invested', 'Realized', 'Open Val', 'Open P&L', 'Total P&L',
+                            'Markets', 'Trades', 'Excluded', 'Combined', 'Inv', 'Real']
+        columns = []
+        for c in display_cols:
+            col = {'name': c, 'id': c}
+            if any(c == k or c.endswith(k) for k in numeric_keywords):
+                col['type'] = 'numeric'
+            columns.append(col)
 
-        # Conditional formatting for P&L columns
+        # Conditional formatting for P&L columns + cell selection fix
         pnl_cols = [c for c in display_cols if any(k in c for k in ['Real', 'P&L', 'Total', 'Combined'])]
-        style_cond = []
+        style_cond = [
+            # Fix cell selection highlight (dark theme compatible)
+            {'if': {'state': 'active'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
+            {'if': {'state': 'selected'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
+        ]
         for col in pnl_cols:
             style_cond.append({
                 'if': {'filter_query': f'{{{col}}} > 0', 'column_id': col},
@@ -367,44 +378,37 @@ def toggle_hidden(n_clicks, current):
     return not current
 
 
-# ─── Hide wallet (via table click) ─────────────────────────────
+# ─── Hide wallet (via 👁 column click) ─────────────────────────
 @callback(
     Output('refresh-trigger', 'data', allow_duplicate=True),
     Input('pnl-table', 'active_cell'),
     State('pnl-table', 'data'),
-    State('hidden-visible', 'data'),
     prevent_initial_call=True,
 )
-def handle_cell_click(active_cell, data, show_hidden):
+def handle_cell_click(active_cell, data):
     if not active_cell or not data:
         return no_update
 
-    row = data[active_cell['row']]
     col = active_cell['column_id']
+    if col != '👁':
+        return no_update
 
-    # Check if the wallet column was clicked — use as hide/unhide toggle
-    if col == 'Wallet':
-        wallet_short = row['Wallet']
-        # Find full wallet address
-        conn = get_connection()
-        full = conn.execute(
-            "SELECT master_wallet FROM wallet_pnl WHERE master_wallet LIKE ? LIMIT 1",
-            (wallet_short[:8] + '%',)
-        ).fetchone()
-        if full:
-            addr = full['master_wallet']
-            existing = conn.execute(
-                "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?", (addr,)
-            ).fetchone()
-            if existing:
-                conn.execute("DELETE FROM hidden_wallets WHERE wallet_address = ?", (addr,))
-            else:
-                conn.execute("INSERT OR IGNORE INTO hidden_wallets (wallet_address) VALUES (?)", (addr,))
-            conn.commit()
-        conn.close()
-        return 'hide-toggle'
+    row = data[active_cell['row']]
+    wallet = row.get('Wallet', '')
+    if not wallet.startswith('0x'):
+        return no_update
 
-    return no_update
+    conn = get_connection()
+    existing = conn.execute(
+        "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?", (wallet,)
+    ).fetchone()
+    if existing:
+        conn.execute("DELETE FROM hidden_wallets WHERE wallet_address = ?", (wallet,))
+    else:
+        conn.execute("INSERT OR IGNORE INTO hidden_wallets (wallet_address) VALUES (?)", (wallet,))
+    conn.commit()
+    conn.close()
+    return 'hide-toggle'
 
 
 # ─── Wallet Changes tab ───────────────────────────────────────
