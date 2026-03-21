@@ -11,10 +11,14 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def compute_wallet_pnl(conn, excluded_counts=None):
-    """Compute P&L for all wallets from positions + resolutions."""
+def compute_wallet_pnl(conn, excluded_counts=None, current_prices=None):
+    """Compute P&L for all wallets from positions + resolutions.
+
+    Args:
+        current_prices: dict of {token_id_hex: current_price} for live pricing.
+                        If None, unrealized positions show cost basis only.
+    """
     if excluded_counts is None:
-        # Compute excluded counts dynamically
         cursor = conn.execute("""
             SELECT master_wallet, COUNT(DISTINCT token_id) as excluded
             FROM trades
@@ -24,6 +28,9 @@ def compute_wallet_pnl(conn, excluded_counts=None):
             GROUP BY master_wallet
         """)
         excluded_counts = {r['master_wallet']: r['excluded'] for r in cursor.fetchall()}
+
+    if current_prices is None:
+        current_prices = {}
 
     conn.execute("DELETE FROM wallet_pnl")
 
@@ -46,6 +53,8 @@ def compute_wallet_pnl(conn, excluded_counts=None):
         realized_pnl = 0.0
         unrealized_shares = 0.0
         unrealized_invested = 0.0
+        unrealized_value = 0.0
+        unrealized_pnl_total = 0.0
         unique_markets = set()
         unique_tokens = set()
 
@@ -73,16 +82,34 @@ def compute_wallet_pnl(conn, excluded_counts=None):
             if resolved == 1:  # Won
                 resolution_value = net_shares * 1.0
                 cost_of_remaining = avg_cost * net_shares
-                resolved_pnl = resolution_value - cost_of_remaining
-                realized_pnl += resolved_pnl
+                resolved_pnl_val = resolution_value - cost_of_remaining
+                realized_pnl += resolved_pnl_val
                 total_received_resolutions += resolution_value
             elif resolved == -1:  # Lost
                 cost_of_remaining = avg_cost * net_shares
                 realized_pnl -= cost_of_remaining
                 total_lost_resolutions += cost_of_remaining
-            else:  # Unresolved or unresolvable
+            elif resolved == 2:  # Voided — resolved at partial price (typically $0.50)
+                res_price = pos['resolution_price'] if pos['resolution_price'] is not None else 0.5
+                resolution_value = net_shares * res_price
+                cost_of_remaining = avg_cost * net_shares
+                resolved_pnl_val = resolution_value - cost_of_remaining
+                realized_pnl += resolved_pnl_val
+                total_received_resolutions += resolution_value
+            else:  # Unresolved (0) or unresolvable (-2)
+                cost_basis = avg_cost * net_shares
                 unrealized_shares += net_shares
-                unrealized_invested += avg_cost * net_shares
+                unrealized_invested += cost_basis
+
+                # Live pricing
+                token_id = pos['token_id']
+                if token_id in current_prices and current_prices[token_id] is not None:
+                    cur_value = current_prices[token_id] * net_shares
+                    unrealized_value += cur_value
+                    unrealized_pnl_total += cur_value - cost_basis
+                else:
+                    # No live price — use cost basis as value estimate
+                    unrealized_value += cost_basis
 
         # Get trade stats
         stats = conn.execute("""
@@ -102,13 +129,15 @@ def compute_wallet_pnl(conn, excluded_counts=None):
         conn.execute("""
             INSERT INTO wallet_pnl (master_wallet, game, total_invested, total_received_sells,
                 total_received_resolutions, total_lost_resolutions, realized_pnl,
-                unrealized_shares, unrealized_invested, unique_markets, unique_tokens,
+                unrealized_shares, unrealized_invested, unrealized_value, unrealized_pnl,
+                unique_markets, unique_tokens,
                 total_trades, incomplete_positions, first_trade, last_trade)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             wallet, game, total_invested, total_received_sells,
             total_received_resolutions, total_lost_resolutions, realized_pnl,
-            unrealized_shares, unrealized_invested, len(unique_markets), len(unique_tokens),
+            unrealized_shares, unrealized_invested, unrealized_value, unrealized_pnl_total,
+            len(unique_markets), len(unique_tokens),
             stats['trade_count'], excluded_counts.get(wallet, 0),
             stats['first_trade'], stats['last_trade'],
         ))
@@ -152,8 +181,16 @@ def run():
     except Exception as e:
         print(f"⚠️ Resolution check failed: {e}")
 
+    # Fetch live prices for open positions
+    current_prices = {}
+    try:
+        from lib.pricing import fetch_prices
+        current_prices = fetch_prices(conn)
+    except Exception as e:
+        print(f"⚠️ Live pricing failed: {e}")
+
     print("Computing P&L...")
-    compute_wallet_pnl(conn)
+    compute_wallet_pnl(conn, current_prices=current_prices)
 
     # Read active_wallets.csv
     csv_path = os.path.join(BASE_DIR, 'active_wallets.csv')
@@ -179,21 +216,28 @@ def run():
     """).fetchall()
     res_map = {r['resolved']: r['cnt'] for r in res_stats}
     total_tokens = sum(res_map.values())
-    resolved_count = res_map.get(1, 0) + res_map.get(-1, 0)
+    resolved_count = res_map.get(1, 0) + res_map.get(-1, 0) + res_map.get(2, 0)
+    voided = res_map.get(2, 0)
     unresolvable = res_map.get(-2, 0)
 
     total_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
 
     now = datetime.now()
     header = f"Wallet P&L Dashboard — {now.strftime('%Y-%m-%d %H:%M')}"
-    data_line = (f"Data: {total_trades} total trades | {len(pnl_data)} wallets tracked | "
-                 f"{resolved_count}/{total_tokens} tokens resolved | {unresolvable} unresolvable")
+    data_parts = [f"Data: {total_trades} total trades | {len(pnl_data)} wallets tracked | "
+                  f"{resolved_count}/{total_tokens} tokens resolved"]
+    if voided:
+        data_parts.append(f"{voided} voided")
+    if unresolvable:
+        data_parts.append(f"{unresolvable} unresolvable")
+    data_line = " | ".join(data_parts)
 
     # Format table
     rows = []
     total_inv = 0
     total_real = 0
-    total_unreal = 0
+    total_open_val = 0
+    total_open_pnl = 0
     has_incomplete = False
 
     for w in pnl_data:
@@ -212,7 +256,9 @@ def run():
 
         invested = w['total_invested']
         realized = w['realized_pnl']
-        unrealized = w['unrealized_invested']
+        open_value = w['unrealized_value']
+        open_pnl = w['unrealized_pnl']
+        total_pnl = realized + open_pnl
         incomplete = w['incomplete_positions']
 
         if incomplete > 0:
@@ -220,7 +266,8 @@ def run():
 
         total_inv += invested
         total_real += realized
-        total_unreal += unrealized
+        total_open_val += open_value
+        total_open_pnl += open_pnl
 
         rows.append({
             'wallet': wallet_short,
@@ -229,8 +276,9 @@ def run():
             'sim': sim_num,
             'invested': f"${invested:,.0f}",
             'realized': _format_dollar(realized),
-            'unrealized': f"${unrealized:,.0f} open" if unrealized > 0 else "$0",
-            'total_pnl': _format_dollar(realized),
+            'open_value': f"${open_value:,.0f}" if open_value > 0 else "$0",
+            'open_pnl': _format_dollar(open_pnl) if open_value > 0 else "—",
+            'total_pnl': _format_dollar(total_pnl),
             'markets': str(w['unique_markets']),
             'trades': str(w['total_trades']),
             'in_csv': in_csv,
@@ -242,21 +290,23 @@ def run():
 
     # Table header
     hdr = (f"{'Wallet':<22} | {'Filter':<8} | {'Actual':<6} | {'Sim #':<5} | "
-           f"{'Invested':>10} | {'Realized':>10} | {'Unrealized':>12} | "
-           f"{'Total P&L':>10} | {'Markets':>7} | {'Trades':>6} | {'In CSV'}")
+           f"{'Invested':>10} | {'Realized':>10} | {'Open Val':>10} | {'Open P&L':>10} | "
+           f"{'Total P&L':>10} | {'Mkts':>5} | {'Trades':>6} | {'CSV'}")
     sep = "-" * len(hdr)
     lines.append(hdr)
     lines.append(sep)
 
     for r in rows:
         line = (f"{r['wallet']:<22} | {r['filter']:<8} | {r['actual']:<6} | {r['sim']:<5} | "
-                f"{r['invested']:>10} | {r['realized']:>10} | {r['unrealized']:>12} | "
-                f"{r['total_pnl']:>10} | {r['markets']:>7} | {r['trades']:>6} | {r['in_csv']}")
+                f"{r['invested']:>10} | {r['realized']:>10} | {r['open_value']:>10} | {r['open_pnl']:>10} | "
+                f"{r['total_pnl']:>10} | {r['markets']:>5} | {r['trades']:>6} | {r['in_csv']}")
         lines.append(line)
 
     lines.append(sep)
+    total_total = total_real + total_open_pnl
     lines.append(f"Totals: Invested ${total_inv:,.0f} | Realized {_format_dollar(total_real)} | "
-                 f"Unrealized ${total_unreal:,.0f} open")
+                 f"Open Value ${total_open_val:,.0f} | Open P&L {_format_dollar(total_open_pnl)} | "
+                 f"Total {_format_dollar(total_total)}")
 
     if has_incomplete:
         lines.append("")

@@ -93,7 +93,9 @@ def check_resolutions(conn):
             if dec_id in resolved_tokens:
                 info = resolved_tokens[dec_id]
                 if info['closed']:
-                    if info['price'] == '1':
+                    price = float(info['price'])
+                    if price >= 0.99:
+                        # Won — resolved at $1.00
                         cursor.execute("""
                             UPDATE resolutions
                             SET resolved = 1, resolution_price = 1.0,
@@ -101,7 +103,8 @@ def check_resolutions(conn):
                             WHERE token_id = ?
                         """, (hex_id,))
                         newly_resolved += 1
-                    elif info['price'] == '0':
+                    elif price <= 0.01:
+                        # Lost — resolved at $0.00
                         cursor.execute("""
                             UPDATE resolutions
                             SET resolved = -1, resolution_price = 0.0,
@@ -110,11 +113,15 @@ def check_resolutions(conn):
                         """, (hex_id,))
                         newly_resolved += 1
                     else:
-                        # Unexpected price value
-                        cursor.execute(
-                            "UPDATE resolutions SET checked_at = datetime('now') WHERE token_id = ?",
-                            (hex_id,)
-                        )
+                        # Voided/canceled — resolved at partial price (typically $0.50)
+                        cursor.execute("""
+                            UPDATE resolutions
+                            SET resolved = 2, resolution_price = ?,
+                                resolved_at = datetime('now'), checked_at = datetime('now')
+                            WHERE token_id = ?
+                        """, (price, hex_id))
+                        newly_resolved += 1
+                        logger.info("Token %s voided — resolved at $%.2f", hex_id[:20], price)
                 else:
                     # Market not closed yet
                     cursor.execute(

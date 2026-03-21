@@ -95,6 +95,8 @@ def init_db():
             realized_pnl REAL NOT NULL DEFAULT 0,
             unrealized_shares REAL NOT NULL DEFAULT 0,
             unrealized_invested REAL NOT NULL DEFAULT 0,
+            unrealized_value REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
             unique_markets INTEGER NOT NULL DEFAULT 0,
             unique_tokens INTEGER NOT NULL DEFAULT 0,
             total_trades INTEGER NOT NULL DEFAULT 0,
@@ -205,6 +207,18 @@ def init_db():
     """)
 
     conn.commit()
+
+    # Migration: add columns to existing wallet_pnl tables
+    try:
+        conn.execute("ALTER TABLE wallet_pnl ADD COLUMN unrealized_value REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE wallet_pnl ADD COLUMN unrealized_pnl REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # column already exists
+    conn.commit()
+
     conn.close()
     logger.info("Database initialized at %s", DB_PATH)
 

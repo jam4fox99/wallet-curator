@@ -30,10 +30,18 @@ def cmd_ingest(args):
         print(f"⚠️ Resolution check failed: {e}")
         newly_resolved = 0
 
+    # Fetch live prices for open positions
+    current_prices = {}
+    try:
+        from lib.pricing import fetch_prices
+        current_prices = fetch_prices(conn)
+    except Exception as e:
+        print(f"⚠️ Live pricing failed: {e}")
+
     try:
         from lib.pnl import compute_wallet_pnl
         print("Computing P&L...")
-        compute_wallet_pnl(conn, excluded_counts or {})
+        compute_wallet_pnl(conn, excluded_counts or {}, current_prices=current_prices)
     except Exception as e:
         print(f"⚠️ P&L computation failed: {e}")
 
