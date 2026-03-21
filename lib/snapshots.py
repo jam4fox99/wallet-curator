@@ -192,9 +192,8 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
 
     # Get hidden wallets
     hidden = set()
-    if not include_hidden:
-        for r in conn.execute("SELECT wallet_address FROM hidden_wallets"):
-            hidden.add(r['wallet_address'])
+    for r in conn.execute("SELECT wallet_address FROM hidden_wallets"):
+        hidden.add(r['wallet_address'])
 
     # Get snapshot info
     snapshots = []
@@ -212,10 +211,11 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
         delta = get_snapshot_delta(conn, snap['snapshot_id'])
         rows = []
         for wallet, data in delta.items():
-            if wallet in hidden:
+            is_hidden = wallet in hidden
+            if is_hidden and not include_hidden:
                 continue
             rows.append({
-                'hide': '👁',
+                'hide': 'Yes' if is_hidden else 'No',
                 'wallet': wallet,
                 'snaps': f"🟢#{snap['snapshot_id']}",
                 'filter': data.get('filter_game') or '—',
@@ -242,12 +242,14 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
         deltas[sid] = delta
         all_wallets.update(delta.keys())
 
-    all_wallets -= hidden
+    if not include_hidden:
+        all_wallets -= hidden
 
     rows = []
     for wallet in sorted(all_wallets):
+        is_hidden = wallet in hidden
         row = {
-            'hide': '👁',
+            'hide': 'Yes' if is_hidden else 'No',
             'wallet': wallet,
         }
 
