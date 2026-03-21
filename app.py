@@ -53,7 +53,7 @@ CELL_STYLE = {
 }
 
 SINGLE_COLUMNS = [
-    {'name': '👁', 'id': 'hide', 'type': 'text'},
+    {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
     {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
     {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
     {'name': 'Filter', 'id': 'filter', 'type': 'text'},
@@ -98,12 +98,19 @@ def get_default_pnl_sort():
     return [dict(item) for item in DEFAULT_PNL_SORT]
 
 
+def get_hidden_button_state(hidden_count, show_hidden):
+    label = f"Show Hidden: {'ON' if show_hidden else 'OFF'} ({hidden_count})"
+    if show_hidden:
+        return label, 'warning', False
+    return label, 'dark', True
+
+
 def build_pnl_columns(snapshot_ids):
     if len(snapshot_ids) == 1:
         return list(SINGLE_COLUMNS)
 
     columns = [
-        {'name': '👁', 'id': 'hide', 'type': 'text'},
+        {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
         {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
         {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
         {'name': 'Filter', 'id': 'filter', 'type': 'text'},
@@ -183,13 +190,14 @@ app.layout = dbc.Container([
 
 
 def pnl_tab_layout(sort_by=None):
+    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, False)
     return html.Div([
         # Action bar
         dbc.Row([
             dbc.Col([
                 dbc.Button("Ingest ▶", id='btn-ingest', color='primary', className='me-2', size='sm'),
                 dbc.Button("Refresh 🔄", id='btn-refresh', color='secondary', className='me-2', size='sm'),
-                dbc.Button("Show Hidden (0)", id='btn-hidden', color='dark', outline=True, size='sm'),
+                dbc.Button(hidden_label, id='btn-hidden', color=hidden_color, outline=hidden_outline, size='sm'),
             ], width=5),
             dbc.Col([
                 dcc.Dropdown(
@@ -291,15 +299,18 @@ def update_status(_):
      Output('pnl-table', 'style_data_conditional'),
      Output('summary-bar', 'children'),
      Output('footnotes', 'children'),
-     Output('btn-hidden', 'children')],
+     Output('btn-hidden', 'children'),
+     Output('btn-hidden', 'color'),
+     Output('btn-hidden', 'outline')],
     [Input('snapshot-select', 'value'),
      Input('hidden-visible', 'data'),
      Input('refresh-trigger', 'data')],
     State('pnl-sort-state', 'data'),
 )
 def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
+    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, show_hidden)
     if not snapshot_ids:
-        return [], [], get_default_pnl_sort(), [], "No snapshots selected", "", "Show Hidden (0)"
+        return [], [], get_default_pnl_sort(), [], "No snapshots selected", "", hidden_label, hidden_color, hidden_outline
 
     try:
         conn = get_connection()
@@ -317,6 +328,7 @@ def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
 
         # Hidden count
         hidden_count = conn.execute("SELECT COUNT(*) FROM hidden_wallets").fetchone()[0]
+        hidden_label, hidden_color, hidden_outline = get_hidden_button_state(hidden_count, show_hidden)
 
         # Summary bar
         snaps = get_all_snapshots(conn)
@@ -333,7 +345,7 @@ def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
         if df.empty:
             columns = build_pnl_columns(snapshot_ids)
             sort_by = sanitize_sort_by(stored_sort_by, columns)
-            return [], columns, sort_by, [], summary, "", f"Show Hidden ({hidden_count})"
+            return [], columns, sort_by, [], summary, "", hidden_label, hidden_color, hidden_outline
 
         columns = build_pnl_columns(snapshot_ids)
         sort_by = sanitize_sort_by(stored_sort_by, columns)
@@ -344,6 +356,10 @@ def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
         style_cond = [
             {'if': {'state': 'active'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
             {'if': {'state': 'selected'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
+            {'if': {'filter_query': '{hide} = "Yes"'}, 'backgroundColor': '#141414', 'color': '#999'},
+            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'hide'}, 'color': '#f59e0b', 'fontWeight': 'bold'},
+            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'wallet'}, 'textDecoration': 'line-through'},
+            {'if': {'filter_query': '{hide} = "No"', 'column_id': 'hide'}, 'color': '#888'},
         ]
         for col_id in pnl_col_ids:
             style_cond.append({
@@ -367,10 +383,10 @@ def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
         records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
-        return records, columns, sort_by, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
+        return records, columns, sort_by, style_cond, summary, fn_text, hidden_label, hidden_color, hidden_outline
 
     except Exception as e:
-        return [], [], get_default_pnl_sort(), [], f"Error: {e}", "", "Show Hidden (0)"
+        return [], [], get_default_pnl_sort(), [], f"Error: {e}", "", hidden_label, hidden_color, hidden_outline
 
 
 @callback(
@@ -489,6 +505,8 @@ def run_refresh(n_clicks):
     prevent_initial_call=True,
 )
 def toggle_hidden(n_clicks, current):
+    if not n_clicks:
+        return no_update
     return not current
 
 
