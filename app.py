@@ -237,6 +237,14 @@ def update_table(snapshot_ids, show_hidden, _):
 
         df = get_combined_dataframe(conn, snapshot_ids, include_hidden=show_hidden)
 
+        # Force numeric columns to proper numeric types
+        numeric_cols = [c for c in df.columns if c in
+                        ['invested', 'realized', 'open_val', 'open_pnl', 'total_pnl',
+                         'markets', 'trades', 'excluded', 'combined']
+                        or c.endswith('_inv') or c.endswith('_real') or c.endswith('_total')]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
         # Hidden count
         hidden_count = conn.execute("SELECT COUNT(*) FROM hidden_wallets").fetchone()[0]
 
