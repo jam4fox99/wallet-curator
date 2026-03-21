@@ -62,6 +62,7 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 server = app.server
+server.secret_key = os.environ.get("FLASK_SECRET_KEY", "wallet-curator-dashboard")
 app.title = "Wallet Curator Dashboard"
 
 if dash_auth and os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):

@@ -433,11 +433,10 @@ def ensure_resolution_entries(conn):
         cursor = conn.execute(
             """
             INSERT INTO resolutions (token_id, market, outcome, checked_at)
-            SELECT DISTINCT token_id, market, outcome, %s
+            SELECT DISTINCT token_id, market, outcome, TIMESTAMPTZ '2000-01-01 00:00:00+00'
             FROM positions
             ON CONFLICT (token_id) DO NOTHING
-            """,
-            ("2000-01-01 00:00:00+00",),
+            """
         )
         new_entries = cursor.rowcount
     else:
