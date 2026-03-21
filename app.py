@@ -39,6 +39,7 @@ COLORS = {
     "border": "#2a2a2a",
     "button": "#2563eb",
 }
+FONT_FAMILY = '"Manrope", "Avenir Next", "Segoe UI", sans-serif'
 
 RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
 TABLE_COLUMNS = [
@@ -58,7 +59,10 @@ TABLE_COLUMNS = [
 
 app = dash.Dash(
     __name__,
-    external_stylesheets=[dbc.themes.DARKLY],
+    external_stylesheets=[
+        dbc.themes.DARKLY,
+        "https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap",
+    ],
     suppress_callback_exceptions=True,
 )
 server = app.server
@@ -165,7 +169,7 @@ def _build_recent_changes(changes):
     for row in changes:
         label = "ADDED" if row["action"] == "ADDED" else "REMOVED"
         color = COLORS["positive"] if row["action"] == "ADDED" else COLORS["negative"]
-        text = f"{label} {row['wallet_address'][:8]}...{row['wallet_address'][-4:]}"
+        text = f"{label} {row['wallet_address']}"
         if row["game_filter"]:
             text += f" ({row['game_filter']})"
         items.append(html.Div(text, style={"color": color, "marginBottom": "6px"}))
@@ -226,11 +230,23 @@ def overview_layout():
                         [
                             dbc.Col(html.H4("Daily Breakdown"), md=4),
                             dbc.Col(
-                                dcc.DatePickerRange(
-                                    id="daily-range",
-                                    start_date=week_ago.isoformat(),
-                                    end_date=today.isoformat(),
-                                    display_format="YYYY-MM-DD",
+                                html.Div(
+                                    [
+                                        dbc.Button(
+                                            "Include Wallets Outside Date Range",
+                                            id="btn-outside-range",
+                                            color="secondary",
+                                            outline=True,
+                                            className="me-2",
+                                        ),
+                                        dcc.DatePickerRange(
+                                            id="daily-range",
+                                            start_date=week_ago.isoformat(),
+                                            end_date=today.isoformat(),
+                                            display_format="YYYY-MM-DD",
+                                        ),
+                                    ],
+                                    style={"display": "flex", "justifyContent": "flex-end", "gap": "12px"},
                                 ),
                                 md=8,
                                 style={"textAlign": "right"},
@@ -257,8 +273,24 @@ def overview_layout():
                                 "color": COLORS["text"],
                                 "border": f"1px solid {COLORS['border']}",
                                 "padding": "8px",
-                                "fontFamily": "JetBrains Mono, Menlo, monospace",
+                                "fontFamily": FONT_FAMILY,
+                                "fontSize": "14px",
+                                "lineHeight": "1.4",
+                                "whiteSpace": "normal",
+                                "height": "auto",
                             },
+                            style_cell_conditional=[
+                                {
+                                    "if": {"column_id": "wallet"},
+                                    "minWidth": "340px",
+                                    "width": "340px",
+                                    "maxWidth": "420px",
+                                    "whiteSpace": "nowrap",
+                                },
+                                {"if": {"column_id": "filter"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
+                                {"if": {"column_id": "actual"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
+                            ],
+                            style_table={"overflowX": "auto"},
                             style_data_conditional=[],
                         )
                     ),
@@ -301,6 +333,7 @@ def serve_layout():
             dcc.Store(id="overview-range", data="ALL"),
             dcc.Store(id="wallet-range", data="ALL"),
             dcc.Store(id="show-hidden", data=False),
+            dcc.Store(id="include-outside-range", data=True),
             dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
             dbc.Row(
                 [
@@ -331,6 +364,7 @@ def serve_layout():
             "padding": "24px",
             "backgroundColor": COLORS["background"],
             "color": COLORS["text"],
+            "fontFamily": FONT_FAMILY,
         },
     )
 
@@ -383,6 +417,16 @@ def set_wallet_range(*args):
     prevent_initial_call=True,
 )
 def toggle_hidden(_, current):
+    return not current
+
+
+@callback(
+    Output("include-outside-range", "data"),
+    Input("btn-outside-range", "n_clicks"),
+    State("include-outside-range", "data"),
+    prevent_initial_call=True,
+)
+def toggle_outside_range(_, current):
     return not current
 
 
@@ -443,13 +487,26 @@ def update_overview(_, range_key, __):
         Output("daily-table", "style_data_conditional"),
         Output("daily-totals", "children"),
         Output("btn-hidden", "children"),
+        Output("btn-outside-range", "children"),
     ],
-    [Input("daily-range", "start_date"), Input("daily-range", "end_date"), Input("show-hidden", "data"), Input("refresh-token", "data")],
+    [
+        Input("daily-range", "start_date"),
+        Input("daily-range", "end_date"),
+        Input("show-hidden", "data"),
+        Input("include-outside-range", "data"),
+        Input("refresh-token", "data"),
+    ],
 )
-def update_daily_table(start_date, end_date, show_hidden, _):
+def update_daily_table(start_date, end_date, show_hidden, include_outside_range, _):
     try:
         conn = get_connection()
-        breakdown = get_daily_breakdown(conn, start_date, end_date, include_hidden=show_hidden)
+        breakdown = get_daily_breakdown(
+            conn,
+            start_date,
+            end_date,
+            include_hidden=show_hidden,
+            include_outside_range=include_outside_range,
+        )
         conn.close()
         style = [
             {
@@ -483,6 +540,7 @@ def update_daily_table(start_date, end_date, show_hidden, _):
             },
         ]
         totals_text = (
+            f"Showing {len(breakdown['rows'])} wallets. "
             f"Totals (excluding hidden wallets in table view): Invested {_money(breakdown['totals']['invested'])} | "
             f"Realized {_money(breakdown['totals']['realized'])} | "
             f"Unrealized {_money(breakdown['totals']['unrealized'])} | "
@@ -490,10 +548,15 @@ def update_daily_table(start_date, end_date, show_hidden, _):
             f"True total incl. hidden: {_money(breakdown['true_totals']['total'])}."
         )
         button_label = "Hide Hidden Wallets" if show_hidden else "Show Hidden Wallets"
-        return breakdown["rows"], style, totals_text, button_label
+        range_button_label = (
+            "Hide Wallets Outside Date Range"
+            if include_outside_range
+            else "Include Wallets Outside Date Range"
+        )
+        return breakdown["rows"], style, totals_text, button_label, range_button_label
     except Exception as exc:
         logger.exception("Failed to load daily table")
-        return [], [], f"Daily table unavailable: {exc}", "Show Hidden Wallets"
+        return [], [], f"Daily table unavailable: {exc}", "Show Hidden Wallets", "Include Wallets Outside Date Range"
 
 
 @callback(
@@ -604,7 +667,7 @@ def update_wallet_view(wallet, range_key, _):
             style={"marginTop": "12px"},
         )
         return (
-            _series_figure(series, f"{wallet[:8]}...{wallet[-4:]} P&L"),
+            _series_figure(series, f"{wallet} P&L"),
             _money(current),
             {"fontSize": "34px", "fontWeight": "600", "color": _line_color(current)},
             "All-Time" if range_key == "ALL" else f"Last {range_key}",

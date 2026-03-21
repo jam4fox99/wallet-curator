@@ -46,7 +46,19 @@ def _wallet_meta(conn):
     return wallet_pnl, sim_map
 
 
-def get_daily_breakdown(conn, start_date, end_date, include_hidden=False):
+def _wallet_ids_in_range(invested_map, sells_map, resolutions_in_window):
+    return set(invested_map) | set(sells_map) | set(resolutions_in_window)
+
+
+def _wallet_ids_with_outside_range(filters, wallet_meta, stats_map, wallet_ids):
+    wallet_ids = set(wallet_ids)
+    wallet_ids.update(filters)
+    wallet_ids.update(wallet_meta)
+    wallet_ids.update(stats_map)
+    return wallet_ids
+
+
+def get_daily_breakdown(conn, start_date, end_date, include_hidden=False, include_outside_range=True):
     start_day = _coerce_date(start_date)
     end_day = _coerce_date(end_date)
     start_dt, _ = day_bounds(start_day)
@@ -120,7 +132,9 @@ def get_daily_breakdown(conn, start_date, end_date, include_hidden=False):
         for row in stats_rows
     }
 
-    wallet_ids = set(invested_map) | set(sells_map) | set(resolutions_in_window)
+    wallet_ids = _wallet_ids_in_range(invested_map, sells_map, resolutions_in_window)
+    if include_outside_range:
+        wallet_ids = _wallet_ids_with_outside_range(filters, wallet_meta, stats_map, wallet_ids)
     rows = []
     true_totals = {"invested": 0.0, "realized": 0.0, "unrealized": 0.0, "total": 0.0}
 
@@ -180,7 +194,7 @@ def get_daily_breakdown(conn, start_date, end_date, include_hidden=False):
         rows.append(
             {
                 "hide": "Unhide" if is_hidden else "Hide",
-                "wallet": f"{wallet[:8]}...{wallet[-4:]}",
+                "wallet": wallet,
                 "wallet_address": wallet,
                 "filter": filters.get(wallet, "-"),
                 "actual": meta["game"] if meta and meta["game"] else "-",

@@ -53,7 +53,7 @@ def get_wallet_options(conn):
     options = []
     for row in rows:
         wallet = row["master_wallet"]
-        label = f"{wallet[:8]}...{wallet[-4:]}"
+        label = wallet
         if row["game"]:
             label = f"{label} ({row['game']})"
         options.append({"label": label, "value": wallet})
