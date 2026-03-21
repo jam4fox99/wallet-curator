@@ -68,6 +68,7 @@ if dash_auth and os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWO
     dash_auth.BasicAuth(
         app,
         {os.environ["DASH_USERNAME"]: os.environ["DASH_PASSWORD"]},
+        public_routes=["/healthz"],
     )
 elif os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):
     logger.warning("dash-auth is not installed; dashboard auth disabled")
@@ -75,6 +76,11 @@ else:
     logger.warning("DASH_USERNAME/DASH_PASSWORD not set; dashboard auth disabled")
 
 _scheduler_started = False
+
+
+@server.route("/healthz")
+def healthz():
+    return "ok", 200
 
 
 def start_scheduler():
