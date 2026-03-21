@@ -129,3 +129,148 @@ Then open a Pull Request on GitHub to merge into main.
 - `app.py` — the Dash app, DataTable definition (~line 148), callback (~line 219)
 - `lib/snapshots.py` — `get_combined_dataframe()` builds the DataFrame
 - `requirements.txt` — dependencies
+
+
+Dev Thoughts
+
+## Root Cause Analysis
+
+There are two distinct bugs causing the sort to not stick, and they compound each other:
+
+### Bug 1: DataTable is Recreated on Every Tab Switch (the primary killer)
+
+The tab-switching callback at app.py:192-198 calls pnl_tab_layout() which returns a brand-new dash_table.DataTable component every time:
+
+@callback(Output('tab-content', 'children'), Input('tabs', 'active_tab'))
+def render_tab(tab):
+    if tab == 'tab-pnl':
+        return pnl_tab_layout()  # <-- creates a NEW DataTable from scratch
+
+This is relevant because pnl_tab_layout() at app.py:117-165 hardcodes the initial sort_by:
+
+sort_by=[{'column_id': 'total_pnl', 'direction': 'desc'}],
+
+Every time the tab is rendered, the DataTable is born with that initial sort_by. But more critically, the DataTable has no persistent data or columns -- it starts empty and waits for the update_table callback to populate it. This creates a race where the component initializes, fires sort_by as an Input, and the callback must populate everything from scratch.
+
+This isn't the main sorting bug though (users aren't switching tabs to break it). The real issue is Bug 2.
+
+### Bug 2: Circular Callback Loop via sort_by (the actual sort-snap-back)
+
+The update_table callback at app.py:219-340 has sort_by as an Input alongside three other Inputs. Here's the critical flow when a user clicks a column header:
+
+1. User clicks "Markets" column header
+2. DataTable updates sort_by to [{'column_id': 'markets', 'direction': 'asc'}]
+3. This triggers update_table because sort_by is an Input
+4. The callback correctly detects triggered_id == 'pnl-table' and returns no_update for columns (line 333-335)
+5. BUT it still returns new data (the sorted records)
+6. When Dash's DataTable receives new data, it resets sort_by back to its initial value (total_pnl desc) -- this is a known Dash DataTable behavior where setting data programmatically
+   clears the sort state
+7. The reset sort_by fires the callback again (since sort_by is an Input)
+8. Now sort_by is back to total_pnl desc, the callback sorts by that, returns data again
+9. The table shows total_pnl desc -- the user's sort "didn't stick"
+
+The no_update fix at lines 333-335 was the right instinct but doesn't solve it because returning data alone is enough to reset sort_by in Dash's DataTable component, especially with sort_action='custom'.
+
+### Bug 3 (Minor): The no_update Still Returns Records
+
+Even when the sort trigger is detected (app.py:334), the callback returns the full records as data output. In Dash 4.0, pushing new data to a DataTable with sort_action='custom' can reset the component's internal sort indicator, creating the visual "snap back."
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+## The Fix
+
+There are two approaches, ordered by reliability:
+
+### Approach A: Separate the Sort Callback (Recommended)
+
+Split update_table into two callbacks:
+
+1. Data callback -- triggered by snapshot-select, hidden-visible, refresh-trigger. Returns data, columns, style_data_conditional, summaries. Applies a default sort (total_pnl desc) when
+   building data. Does NOT take sort_by as an input.
+
+2. Sort callback -- triggered ONLY by pnl-table.sort_by. Takes sort_by as Input and current pnl-table.data as State. Re-sorts the existing data client-side in Python and returns only 
+   Output('pnl-table', 'data'). Does NOT touch columns or styles.
+
+@callback(
+    [Output('pnl-table', 'data'),
+     Output('pnl-table', 'columns'),
+     Output('pnl-table', 'style_data_conditional'),
+     Output('summary-bar', 'children'),
+     Output('footnotes', 'children'),
+     Output('btn-hidden', 'children')],
+    [Input('snapshot-select', 'value'),
+     Input('hidden-visible', 'data'),
+     Input('refresh-trigger', 'data')],
+    # NOTE: sort_by is NOT an input here
+)
+def update_table(snapshot_ids, show_hidden, _):
+    # ... build df, default sort by total_pnl desc, return everything ...
+
+
+@callback(
+    Output('pnl-table', 'data', allow_duplicate=True),
+    Input('pnl-table', 'sort_by'),
+    State('pnl-table', 'data'),
+    prevent_initial_call=True,
+)
+def sort_table(sort_by, current_data):
+    if not sort_by or not current_data:
+        return no_update
+    col = sort_by[0]['column_id']
+    direction = sort_by[0].get('direction', 'asc')
+    
+    # Sort the existing records in-place
+    df = pd.DataFrame(current_data)
+    if col in df.columns:
+        # Ensure numeric columns sort numerically
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(df[col])
+        df = df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
+    return df.to_dict('records')
+
+This breaks the circular loop because:
+• The sort callback only outputs data, never columns
+• The data callback never reads sort_by, so it can't create a feedback loop
+• prevent_initial_call=True stops it from firing on page load
+
+### Approach B: Switch to sort_action='native' with Proper Numeric Coercion (Simpler)
+
+The original attempt at native sorting failed because the data was arriving as strings. The fix would be to ensure df.to_dict('records') produces actual Python int/float values (not string representations), which you've already done with pd.to_numeric() at app.py:242-247. 
+
+However, there's a subtle issue: some values might still be strings after to_dict('records') if the DataFrame has mixed types in a column. The fix would be:
+
+1. Set sort_action='native' at app.py:151
+2. Remove sort_by entirely from the callback Inputs (line 229)
+3. Remove the server-side sort logic (lines 317-325)
+4. Remove the triggered_id check (lines 332-337)
+5. After pd.to_numeric, explicitly cast: df[col] = df[col].astype(float) for numeric columns
+
+But I'd recommend Approach A because it gives you full control over sort behavior and avoids any Dash DataTable quirks with native sort and mixed-type columns.
+
+### Bonus: Fix the Tab Recreation Issue
+
+Regardless of which approach you pick, the DataTable being recreated on tab switch is wasteful and loses state. Consider moving the DataTable out of the tab-switching callback and using CSS display toggling instead, or use dcc.Store to persist the current sort state across tab switches.
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+## Summary
+
+┌─────────────────────────────────────────────────┬─────────────────┬──────────────────────────────────────────┐
+│ Issue                                           │ Location        │ Impact                                   │
+├─────────────────────────────────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ sort_by as Input creates circular callback loop │ app.py:229      │ Sort clicks snap back to default         │
+├─────────────────────────────────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ Returning data resets DataTable sort state      │ app.py:327, 335 │ Even the no_update fix doesn't help      │
+├─────────────────────────────────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ DataTable recreated on tab switch               │ app.py:194      │ Loses all sort state when switching tabs │
+└─────────────────────────────────────────────────┴─────────────────┴──────────────────────────────────────────┘
+
+The fix is to separate the sort callback from the data-loading callback so they can't create a feedback loop.
+⏺ [15:10:35] Update Todos 1 item(s)
+
+  󰄵 Research the DataTable sorting bug in app.py
+  󰄵 Examine the callback structure and sort_by handling
+  󰄵 Identify root causes and propose fixes
+
+That's the full analysis. The core issue is the circular callback loop -- sort_by is an Input to the same callback that outputs data, and pushing new data resets sort_by, which triggers the callback again, snapping the sort back to default. The fix is to split it into two independent callbacks. Let me know if you want me to implement it.

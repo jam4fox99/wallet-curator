@@ -215,7 +215,7 @@ def update_status(_):
         return "No data yet"
 
 
-# ─── PnL table ─────────────────────────────────────────────────
+# ─── PnL table: DATA callback (no sort_by input — breaks the circular loop) ───
 @callback(
     [Output('pnl-table', 'data'),
      Output('pnl-table', 'columns'),
@@ -225,10 +225,9 @@ def update_status(_):
      Output('btn-hidden', 'children')],
     [Input('snapshot-select', 'value'),
      Input('hidden-visible', 'data'),
-     Input('refresh-trigger', 'data'),
-     Input('pnl-table', 'sort_by')],
+     Input('refresh-trigger', 'data')],
 )
-def update_table(snapshot_ids, show_hidden, _, sort_by):
+def update_table(snapshot_ids, show_hidden, _):
     if not snapshot_ids:
         return [], [], [], "No snapshots selected", "", "Show Hidden (0)"
 
@@ -268,7 +267,6 @@ def update_table(snapshot_ids, show_hidden, _, sort_by):
         if len(snapshot_ids) == 1:
             columns = list(SINGLE_COLUMNS)
         else:
-            # Build dynamic columns for multi-snapshot view
             columns = [
                 {'name': '👁', 'id': 'hide', 'type': 'text'},
                 {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
@@ -313,31 +311,37 @@ def update_table(snapshot_ids, show_hidden, _, sort_by):
             for _, row in excluded_df.iterrows():
                 footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
 
-        # Server-side sorting
-        if sort_by and len(sort_by) > 0:
-            col_id = sort_by[0]['column_id']
-            direction = sort_by[0].get('direction', 'asc')
-            if col_id in df.columns:
-                df = df.sort_values(
-                    col_id,
-                    ascending=(direction == 'asc'),
-                    na_position='last',
-                )
+        # Default sort by total_pnl desc
+        if 'total_pnl' in df.columns:
+            df = df.sort_values('total_pnl', ascending=False, na_position='last')
 
         records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
-        # Only return columns/styles when NOT triggered by sort
-        # (returning columns resets sort_by, causing a circular reset)
-        triggered = dash.ctx.triggered_id
-        if triggered == 'pnl-table':
-            # Sort click — only update data, keep columns/styles unchanged
-            return records, no_update, no_update, no_update, no_update, no_update
-        else:
-            return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
+        return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
 
     except Exception as e:
         return [], [], [], f"Error: {e}", "", "Show Hidden (0)"
+
+
+# ─── PnL table: SORT callback (separate — no circular loop) ───────────────────
+@callback(
+    Output('pnl-table', 'data', allow_duplicate=True),
+    Input('pnl-table', 'sort_by'),
+    State('pnl-table', 'data'),
+    prevent_initial_call=True,
+)
+def sort_table(sort_by, current_data):
+    if not sort_by or not current_data:
+        return no_update
+    col = sort_by[0]['column_id']
+    direction = sort_by[0].get('direction', 'asc')
+
+    df = pd.DataFrame(current_data)
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(df[col])
+        df = df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
+    return df.to_dict('records')
 
 
 # ─── Ingest button ─────────────────────────────────────────────
