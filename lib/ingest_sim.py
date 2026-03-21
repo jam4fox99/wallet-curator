@@ -140,11 +140,14 @@ def _parse_drl_sheet(wb, sheet_name):
     price_col = col_map.get('Source Price')
     token_col = col_map.get('Token ID')
     market_col = col_map.get('Market ID')
+    side_col = col_map.get('Side')
+    shares_col = col_map.get('Source Shares')
     if price_col is None:
         return None
 
     prices = []
-    market_tokens = {}  # market_id -> set of token_ids
+    # market_id -> {token_id: total_buy_shares}
+    market_buy_shares = {}
 
     for row in all_rows[1:]:
         if row[0] is None:
@@ -157,16 +160,25 @@ def _parse_drl_sheet(wb, sheet_name):
             except (ValueError, TypeError):
                 pass
 
-        # Track market -> tokens for both-sides detection
-        if market_col is not None and token_col is not None:
+        # Track buy shares per token per market for arb detection
+        if market_col is not None and token_col is not None and side_col is not None and shares_col is not None:
             mid = row[market_col] if market_col < len(row) else None
             tid = row[token_col] if token_col < len(row) else None
-            if mid and tid:
+            side = row[side_col] if side_col < len(row) else None
+            shares = row[shares_col] if shares_col < len(row) else None
+
+            if mid and tid and side and str(side).strip().upper() == 'BUY' and shares:
                 mid_str = str(mid).strip()
                 tid_str = str(tid).strip()
-                if mid_str not in market_tokens:
-                    market_tokens[mid_str] = set()
-                market_tokens[mid_str].add(tid_str)
+                try:
+                    share_val = float(shares)
+                except (ValueError, TypeError):
+                    continue
+                if mid_str not in market_buy_shares:
+                    market_buy_shares[mid_str] = {}
+                if tid_str not in market_buy_shares[mid_str]:
+                    market_buy_shares[mid_str][tid_str] = 0.0
+                market_buy_shares[mid_str][tid_str] += share_val
 
     if not prices:
         return None
@@ -177,10 +189,18 @@ def _parse_drl_sheet(wb, sheet_name):
     above_95 = sum(1 for p in prices if p >= 0.95)
     pct_above_95 = above_95 / total_trades
 
-    # Both-sides detection
-    both_sides_markets = sum(1 for tids in market_tokens.values() if len(tids) > 1)
-    total_markets = len(market_tokens)
-    both_sides_pct = both_sides_markets / total_markets if total_markets > 0 else 0
+    # Arb detection: buying both sides of the same market where smaller side >= 50% of larger side
+    arb_markets = 0
+    total_markets = len(market_buy_shares)
+    for mid, token_shares in market_buy_shares.items():
+        if len(token_shares) >= 2:
+            # Has buys on 2+ outcomes — check size ratio
+            sorted_shares = sorted(token_shares.values(), reverse=True)
+            larger = sorted_shares[0]
+            smaller = sorted_shares[1]
+            if larger > 0 and smaller >= larger * 0.5:
+                arb_markets += 1
+    both_sides_pct = arb_markets / total_markets if total_markets > 0 else 0
 
     return {
         'median_entry_price': median_price,
