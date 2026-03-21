@@ -1,0 +1,5 @@
+anthropic
+mem0ai
+pandas
+openpyxl
+requests

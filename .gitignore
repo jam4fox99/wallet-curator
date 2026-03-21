@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+data/curator.db
+data/sharp_logs/ingested_*
+data/sharp_logs/processed_*
+data/sharp_logs/repaired_*
+data/sims/sim_*
+data/malformed/
+reports/*.md
+!reports/.gitkeep
+.env
+*.egg-info/
+.DS_Store
