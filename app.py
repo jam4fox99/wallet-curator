@@ -148,7 +148,7 @@ def pnl_tab_layout():
             children=[
                 dash_table.DataTable(
                     id='pnl-table',
-                    sort_action='native',
+                    sort_action='custom',
                     sort_mode='single',
                     sort_by=[{'column_id': 'total_pnl', 'direction': 'desc'}],
                     style_table={'overflowX': 'auto'},
@@ -225,9 +225,10 @@ def update_status(_):
      Output('btn-hidden', 'children')],
     [Input('snapshot-select', 'value'),
      Input('hidden-visible', 'data'),
-     Input('refresh-trigger', 'data')],
+     Input('refresh-trigger', 'data'),
+     Input('pnl-table', 'sort_by')],
 )
-def update_table(snapshot_ids, show_hidden, _):
+def update_table(snapshot_ids, show_hidden, _, sort_by):
     if not snapshot_ids:
         return [], [], [], "No snapshots selected", "", "Show Hidden (0)"
 
@@ -311,6 +312,17 @@ def update_table(snapshot_ids, show_hidden, _):
             excluded_df = df[df['excluded'] > 0]
             for _, row in excluded_df.iterrows():
                 footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
+
+        # Server-side sorting
+        if sort_by and len(sort_by) > 0:
+            col_id = sort_by[0]['column_id']
+            direction = sort_by[0].get('direction', 'asc')
+            if col_id in df.columns:
+                df = df.sort_values(
+                    col_id,
+                    ascending=(direction == 'asc'),
+                    na_position='last',
+                )
 
         records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
