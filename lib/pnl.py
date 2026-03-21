@@ -318,14 +318,44 @@ def run():
     output = '\n'.join(lines)
     print(output)
 
-    # Save to file
+    # Save CSV (overwrite pnl_latest.csv — no duplicates)
     reports_dir = os.path.join(BASE_DIR, 'reports')
     os.makedirs(reports_dir, exist_ok=True)
-    report_path = os.path.join(
-        reports_dir, f"pnl_{now.strftime('%Y-%m-%d_%H%M%S')}.md"
-    )
-    with open(report_path, 'w') as f:
-        f.write(output + '\n')
-    print(f"\nSaved to {report_path}")
+    csv_path = os.path.join(reports_dir, 'pnl_latest.csv')
+
+    import csv as csv_mod
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv_mod.writer(f)
+        writer.writerow(['Wallet', 'Filter', 'Actual', 'Sim', 'Invested',
+                         'Realized', 'Open Value', 'Open P&L', 'Total P&L',
+                         'Markets', 'Trades', 'In CSV', 'Excluded Positions'])
+        for w in pnl_data:
+            wallet = w['master_wallet']
+            filter_game = active_wallets.get(wallet, '')
+            sim_row = conn.execute(
+                "SELECT MAX(sim_number) as sim FROM sim_snapshots WHERE wallet_address = ?",
+                (wallet,)
+            ).fetchone()
+            sim_num = sim_row['sim'] if sim_row and sim_row['sim'] else ''
+            in_csv_val = 'Yes' if wallet in active_wallets else 'No'
+            open_pnl = w['unrealized_pnl']
+            total_pnl = w['realized_pnl'] + open_pnl
+
+            writer.writerow([
+                wallet,
+                filter_game,
+                w['game'] or '',
+                sim_num,
+                round(w['total_invested'], 2),
+                round(w['realized_pnl'], 2),
+                round(w['unrealized_value'], 2),
+                round(open_pnl, 2),
+                round(total_pnl, 2),
+                w['unique_markets'],
+                w['total_trades'],
+                in_csv_val,
+                w['incomplete_positions'],
+            ])
+    print(f"\nSaved to {csv_path}")
 
     conn.close()

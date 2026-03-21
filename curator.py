@@ -189,6 +189,38 @@ def cmd_repair(args):
     repair_run()
 
 
+def cmd_run(args):
+    """Run the full pipeline: ingest → ingest-sim → pnl."""
+    from lib.file_manager import scan_sharp_logs, scan_sims
+
+    # Only run ingest steps if there are unprocessed files
+    logs = scan_sharp_logs()
+    if logs:
+        print(f"=== Ingest ({len(logs)} file(s)) ===")
+        cmd_ingest(args)
+        print()
+    else:
+        # Still need to resolve + price even if no new files
+        from lib.db import init_db, get_connection, ensure_resolution_entries
+        init_db()
+        conn = get_connection()
+        pos_count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        if pos_count == 0:
+            print("No data yet. Drop CSV files into data/sharp_logs/ first.")
+            conn.close()
+            return
+        conn.close()
+
+    sims = scan_sims()
+    if sims:
+        print(f"=== Ingest Sim ({len(sims)} file(s)) ===")
+        cmd_ingest_sim(args)
+        print()
+
+    print("=== P&L Dashboard ===")
+    cmd_pnl(args)
+
+
 def main():
     setup_logging()
 
@@ -197,6 +229,7 @@ def main():
     )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
+    subparsers.add_parser('run', help='Run full pipeline: ingest + ingest-sim + pnl')
     subparsers.add_parser('ingest', help='Ingest Sharp log CSVs from data/sharp_logs/')
     subparsers.add_parser('ingest-sim', help='Ingest Sharp sim xlsx from data/sims/')
     subparsers.add_parser('pnl', help='Display P&L dashboard')
@@ -211,6 +244,7 @@ def main():
         sys.exit(1)
 
     commands = {
+        'run': cmd_run,
         'ingest': cmd_ingest,
         'ingest-sim': cmd_ingest_sim,
         'pnl': cmd_pnl,
