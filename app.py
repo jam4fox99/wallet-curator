@@ -52,7 +52,24 @@ CELL_STYLE = {
     'fontSize': '13px',
 }
 
-PNL_COLUMNS = ['Realized', 'Open P&L', 'Total P&L', 'Combined']
+SINGLE_COLUMNS = [
+    {'name': '👁', 'id': 'hide', 'type': 'text'},
+    {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
+    {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
+    {'name': 'Filter', 'id': 'filter', 'type': 'text'},
+    {'name': 'Actual', 'id': 'actual', 'type': 'text'},
+    {'name': 'Sim', 'id': 'sim', 'type': 'text'},
+    {'name': 'Invested', 'id': 'invested', 'type': 'numeric'},
+    {'name': 'Realized', 'id': 'realized', 'type': 'numeric'},
+    {'name': 'Open Val', 'id': 'open_val', 'type': 'numeric'},
+    {'name': 'Open P&L', 'id': 'open_pnl', 'type': 'numeric'},
+    {'name': 'Total P&L', 'id': 'total_pnl', 'type': 'numeric'},
+    {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
+    {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
+    {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
+    {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
+]
+PNL_COL_IDS = ['realized', 'open_pnl', 'total_pnl', 'combined']
 GREEN = '#22c55e'
 RED = '#ef4444'
 
@@ -133,7 +150,7 @@ def pnl_tab_layout():
                     id='pnl-table',
                     sort_action='native',
                     sort_mode='single',
-                    sort_by=[{'column_id': 'Total P&L', 'direction': 'desc'}],
+                    sort_by=[{'column_id': 'total_pnl', 'direction': 'desc'}],
                     style_table={'overflowX': 'auto'},
                     style_header=HEADER_STYLE,
                     style_cell=CELL_STYLE,
@@ -238,42 +255,56 @@ def update_table(snapshot_ids, show_hidden, _):
         if df.empty:
             return [], [], [], summary, "", f"Show Hidden ({hidden_count})"
 
-        # Build columns with proper types
-        display_cols = [c for c in df.columns]
-        numeric_keywords = ['Invested', 'Realized', 'Open Val', 'Open P&L', 'Total P&L',
-                            'Markets', 'Trades', 'Excluded', 'Combined', 'Inv', 'Real']
-        columns = []
-        for c in display_cols:
-            col = {'name': c, 'id': c}
-            if any(c == k or c.endswith(k) for k in numeric_keywords):
-                col['type'] = 'numeric'
-            columns.append(col)
+        # Build columns — use static defs for single, dynamic for multi
+        if len(snapshot_ids) == 1:
+            columns = list(SINGLE_COLUMNS)
+        else:
+            # Build dynamic columns for multi-snapshot view
+            columns = [
+                {'name': '👁', 'id': 'hide', 'type': 'text'},
+                {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
+                {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
+                {'name': 'Filter', 'id': 'filter', 'type': 'text'},
+                {'name': 'Actual', 'id': 'actual', 'type': 'text'},
+                {'name': 'Sim', 'id': 'sim', 'type': 'text'},
+            ]
+            for sid in sorted(snapshot_ids):
+                columns.append({'name': f'#{sid} Inv', 'id': f's{sid}_inv', 'type': 'numeric'})
+                columns.append({'name': f'#{sid} Real', 'id': f's{sid}_real', 'type': 'numeric'})
+                columns.append({'name': f'#{sid} Total', 'id': f's{sid}_total', 'type': 'numeric'})
+            columns.extend([
+                {'name': 'Combined', 'id': 'combined', 'type': 'numeric'},
+                {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
+                {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
+                {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
+                {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
+            ])
 
-        # Conditional formatting for P&L columns + cell selection fix
-        pnl_cols = [c for c in display_cols if any(k in c for k in ['Real', 'P&L', 'Total', 'Combined'])]
+        # Conditional formatting + cell selection fix
+        col_ids = [c['id'] for c in columns]
+        pnl_col_ids = [c for c in col_ids if any(c.endswith(k) for k in ['realized', 'open_pnl', 'total_pnl', 'combined', '_real', '_total'])]
         style_cond = [
-            # Fix cell selection highlight (dark theme compatible)
             {'if': {'state': 'active'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
             {'if': {'state': 'selected'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
         ]
-        for col in pnl_cols:
+        for col_id in pnl_col_ids:
             style_cond.append({
-                'if': {'filter_query': f'{{{col}}} > 0', 'column_id': col},
+                'if': {'filter_query': f'{{{col_id}}} > 0', 'column_id': col_id},
                 'color': GREEN,
             })
             style_cond.append({
-                'if': {'filter_query': f'{{{col}}} < 0', 'column_id': col},
+                'if': {'filter_query': f'{{{col_id}}} < 0', 'column_id': col_id},
                 'color': RED,
             })
 
         # Footnotes
         footnotes = []
-        if 'Excluded' in df.columns:
-            excluded = df[df['Excluded'] > 0]
-            for _, row in excluded.iterrows():
-                footnotes.append(f"* {row['Wallet']}: {row['Excluded']} positions excluded (missing buy data)")
+        if 'excluded' in df.columns:
+            excluded_df = df[df['excluded'] > 0]
+            for _, row in excluded_df.iterrows():
+                footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
 
-        records = df[display_cols].to_dict('records')
+        records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
         return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
@@ -390,11 +421,11 @@ def handle_cell_click(active_cell, data):
         return no_update
 
     col = active_cell['column_id']
-    if col != '👁':
+    if col != 'hide':
         return no_update
 
     row = data[active_cell['row']]
-    wallet = row.get('Wallet', '')
+    wallet = row.get('wallet', '')
     if not wallet.startswith('0x'):
         return no_update
 

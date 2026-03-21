@@ -215,21 +215,21 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
             if wallet in hidden:
                 continue
             rows.append({
-                '👁': 'hide',
-                'Wallet': wallet,
-                'Snaps': f"🟢#{snap['snapshot_id']}",
-                'Filter': data.get('filter_game') or '—',
-                'Actual': data.get('game') or '—',
-                'Sim #': f"#{data['sim_number']}" if data.get('sim_number') else '—',
-                'Invested': round(data.get('total_invested') or 0, 2),
-                'Realized': round(data.get('realized_pnl') or 0, 2),
-                'Open Val': round(data.get('unrealized_value') or 0, 2),
-                'Open P&L': round(data.get('unrealized_pnl') or 0, 2),
-                'Total P&L': round(data.get('total_pnl') or 0, 2),
-                'Markets': data.get('unique_markets') or 0,
-                'Trades': data.get('total_trades') or 0,
-                'In CSV': 'Yes' if data.get('in_csv') else 'No',
-                'Excluded': data.get('incomplete_positions') or 0,
+                'hide': '👁',
+                'wallet': wallet,
+                'snaps': f"🟢#{snap['snapshot_id']}",
+                'filter': data.get('filter_game') or '—',
+                'actual': data.get('game') or '—',
+                'sim': f"#{data['sim_number']}" if data.get('sim_number') else '—',
+                'invested': round(data.get('total_invested') or 0, 2),
+                'realized': round(data.get('realized_pnl') or 0, 2),
+                'open_val': round(data.get('unrealized_value') or 0, 2),
+                'open_pnl': round(data.get('unrealized_pnl') or 0, 2),
+                'total_pnl': round(data.get('total_pnl') or 0, 2),
+                'markets': int(data.get('unique_markets') or 0),
+                'trades': int(data.get('total_trades') or 0),
+                'in_csv': 'Yes' if data.get('in_csv') else 'No',
+                'excluded': int(data.get('incomplete_positions') or 0),
             })
         return pd.DataFrame(rows)
 
@@ -247,8 +247,8 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
     rows = []
     for wallet in sorted(all_wallets):
         row = {
-            '👁': 'hide',
-            'Wallet': wallet,
+            'hide': '👁',
+            'wallet': wallet,
         }
 
         # Snapshot presence indicators
@@ -259,7 +259,7 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
                 snap_indicators.append(f"🟢#{sid}")
             else:
                 snap_indicators.append(f"⚫#{sid}")
-        row['Snaps'] = ' '.join(snap_indicators)
+        row['snaps'] = ' '.join(snap_indicators)
 
         # Get latest data for static fields
         latest_data = None
@@ -268,38 +268,34 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
                 latest_data = deltas[snap['snapshot_id']][wallet]
                 break
 
-        row['Filter'] = (latest_data.get('filter_game') or '—') if latest_data else '—'
-        row['Actual'] = (latest_data.get('game') or '—') if latest_data else '—'
-        row['Sim #'] = f"#{latest_data['sim_number']}" if latest_data and latest_data.get('sim_number') else '—'
-        row['In CSV'] = 'Yes' if latest_data and latest_data.get('in_csv') else 'No'
+        row['filter'] = (latest_data.get('filter_game') or '—') if latest_data else '—'
+        row['actual'] = (latest_data.get('game') or '—') if latest_data else '—'
+        row['sim'] = f"#{latest_data['sim_number']}" if latest_data and latest_data.get('sim_number') else '—'
+        row['in_csv'] = 'Yes' if latest_data and latest_data.get('in_csv') else 'No'
 
         # Per-snapshot columns
-        combined_invested = 0
-        combined_realized = 0
         combined_total = 0
         for snap in snapshots:
             sid = snap['snapshot_id']
-            prefix = f"#{sid}"
+            prefix = f"s{sid}"
             if wallet in deltas[sid]:
                 d = deltas[sid][wallet]
                 inv = round(d.get('total_invested') or 0, 2)
                 real = round(d.get('realized_pnl') or 0, 2)
                 total = round(d.get('total_pnl') or 0, 2)
-                row[f'{prefix} Inv'] = inv
-                row[f'{prefix} Real'] = real
-                row[f'{prefix} Total'] = total
-                combined_invested += inv
-                combined_realized += real
+                row[f'{prefix}_inv'] = inv
+                row[f'{prefix}_real'] = real
+                row[f'{prefix}_total'] = total
                 combined_total += total
             else:
-                row[f'{prefix} Inv'] = '—'
-                row[f'{prefix} Real'] = '—'
-                row[f'{prefix} Total'] = '—'
+                row[f'{prefix}_inv'] = None
+                row[f'{prefix}_real'] = None
+                row[f'{prefix}_total'] = None
 
-        row['Combined'] = round(combined_total, 2)
-        row['Markets'] = latest_data.get('unique_markets', 0) if latest_data else 0
-        row['Trades'] = latest_data.get('total_trades', 0) if latest_data else 0
-        row['Excluded'] = latest_data.get('incomplete_positions', 0) if latest_data else 0
+        row['combined'] = round(combined_total, 2)
+        row['markets'] = int(latest_data.get('unique_markets', 0)) if latest_data else 0
+        row['trades'] = int(latest_data.get('total_trades', 0)) if latest_data else 0
+        row['excluded'] = int(latest_data.get('incomplete_positions', 0)) if latest_data else 0
 
         rows.append(row)
 
