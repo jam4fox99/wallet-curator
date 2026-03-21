@@ -1,658 +1,619 @@
 #!/usr/bin/env python3
-"""Wallet Curator — Dash Web UI Dashboard."""
+"""Wallet Curator cloud dashboard."""
 import logging
-import threading
+import os
+from datetime import timedelta
 
 import dash
-from dash import html, dcc, dash_table, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
-import pandas as pd
+import plotly.graph_objects as go
+from dash import Input, Output, State, callback, dash_table, dcc, html, no_update
 
-from lib.db import init_db, get_connection
+try:
+    import dash_auth
+except ModuleNotFoundError:
+    dash_auth = None
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ModuleNotFoundError:
+    BackgroundScheduler = None
+
+from lib.changelog import get_recent_changes
+from lib.charts import get_sync_status_summary, get_time_series, get_wallet_options, get_wallet_stats
+from lib.daily_pnl import get_daily_breakdown
+from lib.db import get_connection, init_db
+from lib.pipeline import run_hourly_pipeline
+from lib.time_utils import now_utc, parse_db_timestamp
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+COLORS = {
+    "background": "#0f0f0f",
+    "card": "#1a1a1a",
+    "text": "#e5e5e5",
+    "text_secondary": "#9ca3af",
+    "positive": "#22c55e",
+    "negative": "#ef4444",
+    "border": "#2a2a2a",
+    "button": "#2563eb",
+}
+
+RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
+TABLE_COLUMNS = [
+    {"name": "Hide", "id": "hide"},
+    {"name": "Wallet", "id": "wallet"},
+    {"name": "Filter", "id": "filter"},
+    {"name": "Actual", "id": "actual"},
+    {"name": "Sim #", "id": "sim"},
+    {"name": "Invested", "id": "invested", "type": "numeric"},
+    {"name": "Realized P&L", "id": "realized_pnl", "type": "numeric"},
+    {"name": "Unrealized", "id": "unrealized_pnl", "type": "numeric"},
+    {"name": "Total P&L", "id": "total_pnl", "type": "numeric"},
+    {"name": "Markets", "id": "markets", "type": "numeric"},
+    {"name": "Trades", "id": "trades", "type": "numeric"},
+    {"name": "In CSV", "id": "in_csv"},
+]
 
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.DARKLY],
     suppress_callback_exceptions=True,
 )
-app.title = "Wallet Curator"
+server = app.server
+app.title = "Wallet Curator Dashboard"
 
-# ─── Custom CSS ────────────────────────────────────────────────
-CUSTOM_CSS = {
-    'fontFamily': 'monospace',
-    'backgroundColor': '#0f0f0f',
-    'minHeight': '100vh',
-    'padding': '20px',
-    'color': '#e5e5e5',
-}
+if dash_auth and os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):
+    dash_auth.BasicAuth(
+        app,
+        {os.environ["DASH_USERNAME"]: os.environ["DASH_PASSWORD"]},
+    )
+elif os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):
+    logger.warning("dash-auth is not installed; dashboard auth disabled")
+else:
+    logger.warning("DASH_USERNAME/DASH_PASSWORD not set; dashboard auth disabled")
 
-TABLE_STYLE = {
-    'backgroundColor': '#1a1a1a',
-    'color': '#e5e5e5',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-HEADER_STYLE = {
-    'backgroundColor': '#1a1a1a',
-    'color': '#e5e5e5',
-    'fontWeight': 'bold',
-    'border': '1px solid #2a2a2a',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-CELL_STYLE = {
-    'backgroundColor': '#0f0f0f',
-    'color': '#e5e5e5',
-    'border': '1px solid #2a2a2a',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-SINGLE_COLUMNS = [
-    {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
-    {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
-    {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
-    {'name': 'Filter', 'id': 'filter', 'type': 'text'},
-    {'name': 'Actual', 'id': 'actual', 'type': 'text'},
-    {'name': 'Sim', 'id': 'sim', 'type': 'text'},
-    {'name': 'Invested', 'id': 'invested', 'type': 'numeric'},
-    {'name': 'Realized', 'id': 'realized', 'type': 'numeric'},
-    {'name': 'Open Val', 'id': 'open_val', 'type': 'numeric'},
-    {'name': 'Open P&L', 'id': 'open_pnl', 'type': 'numeric'},
-    {'name': 'Total P&L', 'id': 'total_pnl', 'type': 'numeric'},
-    {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
-    {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
-    {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
-    {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
-]
-PNL_COL_IDS = ['realized', 'open_pnl', 'total_pnl', 'combined']
-GREEN = '#22c55e'
-RED = '#ef4444'
-DEFAULT_PNL_SORT = [{'column_id': 'total_pnl', 'direction': 'desc'}]
+_scheduler_started = False
 
 
-# ─── Layout ────────────────────────────────────────────────────
-def get_snapshot_options():
-    init_db()
-    conn = get_connection()
-    from lib.snapshots import get_all_snapshots
-    snaps = get_all_snapshots(conn)
-    conn.close()
-    options = []
-    for s in snaps:
-        label = f"Snap #{s['snapshot_id']} — {s['description'] or 'no description'}"
-        options.append({'label': label, 'value': s['snapshot_id']})
-    return options
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started or os.environ.get("DISABLE_SCHEDULER") == "1":
+        return
+    if BackgroundScheduler is None:
+        logger.warning("apscheduler is not installed; hourly scheduler disabled")
+        return
+    scheduler = BackgroundScheduler(daemon=True, timezone="UTC")
+    scheduler.add_job(
+        run_hourly_pipeline,
+        "interval",
+        hours=1,
+        kwargs={"trigger": "scheduled"},
+        id="wallet-curator-hourly-pipeline",
+        replace_existing=True,
+    )
+    scheduler.start()
+    _scheduler_started = True
+    logger.info("Started hourly scheduler")
 
 
-def get_default_snapshot():
-    opts = get_snapshot_options()
-    return [opts[0]['value']] if opts else []
+def _card(children):
+    return dbc.Card(
+        dbc.CardBody(children),
+        style={
+            "backgroundColor": COLORS["card"],
+            "border": f"1px solid {COLORS['border']}",
+            "borderRadius": "16px",
+        },
+    )
 
 
-def get_default_pnl_sort():
-    return [dict(item) for item in DEFAULT_PNL_SORT]
+def _range_buttons(prefix):
+    return dbc.ButtonGroup(
+        [dbc.Button(label, id=f"{prefix}-{label}", size="sm", outline=True, color="secondary") for label in RANGES]
+    )
 
 
-def get_hidden_button_state(hidden_count, show_hidden):
-    label = f"Show Hidden: {'ON' if show_hidden else 'OFF'} ({hidden_count})"
-    if show_hidden:
-        return label, 'warning', False
-    return label, 'dark', True
+def _money(value):
+    if value is None:
+        return "-"
+    return f"${value:,.2f}" if value >= 0 else f"-${abs(value):,.2f}"
 
 
-def build_pnl_columns(snapshot_ids):
-    if len(snapshot_ids) == 1:
-        return list(SINGLE_COLUMNS)
-
-    columns = [
-        {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
-        {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
-        {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
-        {'name': 'Filter', 'id': 'filter', 'type': 'text'},
-        {'name': 'Actual', 'id': 'actual', 'type': 'text'},
-        {'name': 'Sim', 'id': 'sim', 'type': 'text'},
-    ]
-    for sid in sorted(snapshot_ids):
-        columns.append({'name': f'#{sid} Inv', 'id': f's{sid}_inv', 'type': 'numeric'})
-        columns.append({'name': f'#{sid} Real', 'id': f's{sid}_real', 'type': 'numeric'})
-        columns.append({'name': f'#{sid} Total', 'id': f's{sid}_total', 'type': 'numeric'})
-    columns.extend([
-        {'name': 'Combined', 'id': 'combined', 'type': 'numeric'},
-        {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
-        {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
-        {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
-        {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
-    ])
-    return columns
+def _line_color(value):
+    return COLORS["positive"] if value >= 0 else COLORS["negative"]
 
 
-def sanitize_sort_by(sort_by, available_columns):
-    col_ids = {c['id'] for c in available_columns}
-    active_sort = sort_by or get_default_pnl_sort()
-    col = active_sort[0].get('column_id')
-
-    if col in col_ids:
-        return active_sort
-    if 'total_pnl' in col_ids:
-        return get_default_pnl_sort()
-    if 'combined' in col_ids:
-        return [{'column_id': 'combined', 'direction': 'desc'}]
-    return []
-
-
-def sort_dataframe(df, sort_by):
-    if df.empty:
-        return df
-
-    active_sort = sort_by or get_default_pnl_sort()
-    if not active_sort:
-        return df
-
-    col = active_sort[0].get('column_id')
-    direction = active_sort[0].get('direction', 'asc')
-    if col not in df.columns:
-        fallback_sort = sanitize_sort_by(active_sort, [{'id': c} for c in df.columns])
-        if not fallback_sort:
-            return df
-        col = fallback_sort[0]['column_id']
-        direction = fallback_sort[0].get('direction', 'asc')
-
-    sorted_df = df.copy()
-    sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce').fillna(sorted_df[col])
-    return sorted_df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
+def _series_figure(series, title):
+    fig = go.Figure()
+    if series:
+        fig.add_trace(
+            go.Scatter(
+                x=[point["recorded_at"] for point in series],
+                y=[point["total_pnl"] for point in series],
+                mode="lines",
+                line={"width": 3, "color": _line_color(series[-1]["total_pnl"])},
+                hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        template="plotly_dark",
+        height=360,
+        margin={"l": 20, "r": 20, "t": 40, "b": 20},
+        paper_bgcolor=COLORS["card"],
+        plot_bgcolor=COLORS["card"],
+        font={"color": COLORS["text"]},
+        title={"text": title, "x": 0.02},
+        xaxis={"gridcolor": COLORS["border"]},
+        yaxis={"gridcolor": COLORS["border"], "tickprefix": "$"},
+    )
+    return fig
 
 
-app.layout = dbc.Container([
-    dcc.Store(id='refresh-trigger', data=0),
-    dcc.Store(id='hidden-visible', data=False),
-    dcc.Store(id='pnl-sort-state', data=get_default_pnl_sort(), storage_type='session'),
-
-    # Header
-    dbc.Row([
-        dbc.Col(html.H2("Wallet Curator", style={'color': '#e5e5e5', 'margin': '0'}), width=6),
-        dbc.Col(html.Div(id='status-bar', style={'textAlign': 'right', 'color': '#888'}), width=6),
-    ], className='mb-3', align='center'),
-
-    # Navigation
-    dbc.Tabs([
-        dbc.Tab(label="PnL Dashboard", tab_id="tab-pnl"),
-        dbc.Tab(label="Wallet Changes", tab_id="tab-changes"),
-    ], id='tabs', active_tab='tab-pnl', className='mb-3'),
-
-    html.Div(id='tab-content'),
-
-], fluid=True, style=CUSTOM_CSS)
+def _build_recent_changes(changes):
+    if not changes:
+        return html.Div("No wallet changes yet.", style={"color": COLORS["text_secondary"]})
+    items = []
+    for row in changes:
+        label = "ADDED" if row["action"] == "ADDED" else "REMOVED"
+        color = COLORS["positive"] if row["action"] == "ADDED" else COLORS["negative"]
+        text = f"{label} {row['wallet_address'][:8]}...{row['wallet_address'][-4:]}"
+        if row["game_filter"]:
+            text += f" ({row['game_filter']})"
+        items.append(html.Div(text, style={"color": color, "marginBottom": "6px"}))
+    return html.Div(items)
 
 
-def pnl_tab_layout(sort_by=None):
-    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, False)
-    return html.Div([
-        # Action bar
-        dbc.Row([
-            dbc.Col([
-                dbc.Button("Ingest ▶", id='btn-ingest', color='primary', className='me-2', size='sm'),
-                dbc.Button("Refresh 🔄", id='btn-refresh', color='secondary', className='me-2', size='sm'),
-                dbc.Button(hidden_label, id='btn-hidden', color=hidden_color, outline=hidden_outline, size='sm'),
-            ], width=5),
-            dbc.Col([
-                dcc.Dropdown(
-                    id='snapshot-select',
-                    options=get_snapshot_options(),
-                    value=get_default_snapshot(),
-                    multi=True,
-                    placeholder="Select snapshot(s)...",
-                    style={'backgroundColor': '#1a1a1a', 'color': '#000'},
-                ),
-            ], width=7),
-        ], className='mb-3'),
-
-        # Summary bar
-        html.Div(id='summary-bar', style={'color': '#888', 'marginBottom': '10px', 'fontSize': '13px'}),
-
-        # Notification
-        html.Div(id='notification', style={'marginBottom': '10px'}),
-
-        # Loading wrapper
-        dcc.Loading(
-            id='loading-table',
-            type='default',
-            children=[
-                dash_table.DataTable(
-                    id='pnl-table',
-                    sort_action='custom',
-                    sort_mode='single',
-                    sort_by=sort_by or get_default_pnl_sort(),
-                    style_table={'overflowX': 'auto'},
-                    style_header=HEADER_STYLE,
-                    style_cell=CELL_STYLE,
-                    style_data_conditional=[],
-                    page_size=100,
-                ),
-            ],
-        ),
-
-        # Footnotes
-        html.Div(id='footnotes', style={'color': '#888', 'marginTop': '10px', 'fontSize': '12px'}),
-    ])
+def _database_error_layout(message):
+    return dbc.Alert(message, color="danger", className="mb-0")
 
 
-def changes_tab_layout():
-    return html.Div([
-        dbc.Row([
-            dbc.Col([
-                html.H5("CSV Version History", style={'color': '#e5e5e5'}),
-                dcc.Dropdown(
-                    id='csv-version-select',
-                    placeholder="Select a past CSV version...",
-                    style={'backgroundColor': '#1a1a1a', 'color': '#000'},
-                ),
-            ], width=6),
-        ], className='mb-3'),
-
-        html.Div(id='csv-viewer', className='mb-4'),
-
-        html.H5("Full Changelog", style={'color': '#e5e5e5'}),
-        html.Div(id='changelog-content', style={
-            'backgroundColor': '#1a1a1a', 'padding': '15px', 'borderRadius': '8px',
-            'maxHeight': '500px', 'overflowY': 'auto', 'fontSize': '13px',
-        }),
-    ])
-
-
-# ─── Tab switching ─────────────────────────────────────────────
-@callback(Output('tab-content', 'children'), Input('tabs', 'active_tab'), State('pnl-sort-state', 'data'))
-def render_tab(tab, sort_by):
-    if tab == 'tab-pnl':
-        return pnl_tab_layout(sort_by=sort_by)
-    elif tab == 'tab-changes':
-        return changes_tab_layout()
-    return html.Div()
-
-
-# ─── Status bar ────────────────────────────────────────────────
-@callback(Output('status-bar', 'children'), Input('refresh-trigger', 'data'))
-def update_status(_):
-    try:
-        conn = get_connection()
-        trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        res = conn.execute("SELECT resolved, COUNT(*) FROM resolutions GROUP BY resolved").fetchall()
-        res_map = {r[0]: r[1] for r in res}
-        resolved = res_map.get(1, 0) + res_map.get(-1, 0) + res_map.get(2, 0)
-        total = sum(res_map.values())
-        last = conn.execute("SELECT MAX(ingested_at) FROM ingest_registry").fetchone()[0]
-        conn.close()
-        return f"{trades:,} trades | {resolved}/{total} resolved | Last ingest: {last or 'never'}"
-    except Exception:
-        return "No data yet"
-
-
-# ─── PnL table: DATA callback (no sort_by input — breaks the circular loop) ───
-@callback(
-    [Output('pnl-table', 'data'),
-     Output('pnl-table', 'columns'),
-     Output('pnl-table', 'sort_by'),
-     Output('pnl-table', 'style_data_conditional'),
-     Output('summary-bar', 'children'),
-     Output('footnotes', 'children'),
-     Output('btn-hidden', 'children'),
-     Output('btn-hidden', 'color'),
-     Output('btn-hidden', 'outline')],
-    [Input('snapshot-select', 'value'),
-     Input('hidden-visible', 'data'),
-     Input('refresh-trigger', 'data')],
-    State('pnl-sort-state', 'data'),
-)
-def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
-    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, show_hidden)
-    if not snapshot_ids:
-        return [], [], get_default_pnl_sort(), [], "No snapshots selected", "", hidden_label, hidden_color, hidden_outline
-
-    try:
-        conn = get_connection()
-        from lib.snapshots import get_combined_dataframe, get_all_snapshots
-
-        df = get_combined_dataframe(conn, snapshot_ids, include_hidden=show_hidden)
-
-        # Force numeric columns to proper numeric types
-        numeric_cols = [c for c in df.columns if c in
-                        ['invested', 'realized', 'open_val', 'open_pnl', 'total_pnl',
-                         'markets', 'trades', 'excluded', 'combined']
-                        or c.endswith('_inv') or c.endswith('_real') or c.endswith('_total')]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # Hidden count
-        hidden_count = conn.execute("SELECT COUNT(*) FROM hidden_wallets").fetchone()[0]
-        hidden_label, hidden_color, hidden_outline = get_hidden_button_state(hidden_count, show_hidden)
-
-        # Summary bar
-        snaps = get_all_snapshots(conn)
-        snap_map = {s['snapshot_id']: s for s in snaps}
-        parts = []
-        for sid in sorted(snapshot_ids):
-            if sid in snap_map:
-                s = snap_map[sid]
-                parts.append(f"Snap #{sid} ({s['new_trades_since_last']:,} trades, {s['description'] or ''})")
-        summary = " + ".join(parts)
-
-        conn.close()
-
-        if df.empty:
-            columns = build_pnl_columns(snapshot_ids)
-            sort_by = sanitize_sort_by(stored_sort_by, columns)
-            return [], columns, sort_by, [], summary, "", hidden_label, hidden_color, hidden_outline
-
-        columns = build_pnl_columns(snapshot_ids)
-        sort_by = sanitize_sort_by(stored_sort_by, columns)
-
-        # Conditional formatting + cell selection fix
-        col_ids = [c['id'] for c in columns]
-        pnl_col_ids = [c for c in col_ids if any(c.endswith(k) for k in ['realized', 'open_pnl', 'total_pnl', 'combined', '_real', '_total'])]
-        style_cond = [
-            {'if': {'state': 'active'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
-            {'if': {'state': 'selected'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
-            {'if': {'filter_query': '{hide} = "Yes"'}, 'backgroundColor': '#141414', 'color': '#999'},
-            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'hide'}, 'color': '#f59e0b', 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'wallet'}, 'textDecoration': 'line-through'},
-            {'if': {'filter_query': '{hide} = "No"', 'column_id': 'hide'}, 'color': '#888'},
+def overview_layout():
+    today = now_utc().date()
+    week_ago = today - timedelta(days=6)
+    return html.Div(
+        [
+            dbc.Row(
+                [
+                    dbc.Col(
+                        _card(
+                            [
+                                dbc.Row(
+                                    [
+                                        dbc.Col(html.H4("Portfolio P&L", className="mb-1"), md=7),
+                                        dbc.Col(_range_buttons("overview-range"), md=5, style={"textAlign": "right"}),
+                                    ],
+                                    align="center",
+                                ),
+                                html.Div(id="overview-current-pnl", style={"fontSize": "40px", "fontWeight": "600"}),
+                                html.Div(id="overview-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
+                                dcc.Graph(id="overview-chart", config={"displayModeBar": False}),
+                            ]
+                        ),
+                        lg=8,
+                    ),
+                    dbc.Col(
+                        _card(
+                            [
+                                html.Div(
+                                    [
+                                        dbc.Button("Refresh P&L", id="btn-refresh", color="primary", className="me-2"),
+                                        dbc.Button("Show Hidden Wallets", id="btn-hidden", color="secondary", outline=True),
+                                    ],
+                                    className="mb-3",
+                                ),
+                                html.Div(id="refresh-message", className="mb-3"),
+                                html.H5("Recent Changes"),
+                                html.Div(id="recent-changes"),
+                            ]
+                        ),
+                        lg=4,
+                    ),
+                ],
+                className="g-4 mb-4",
+            ),
+            _card(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(html.H4("Daily Breakdown"), md=4),
+                            dbc.Col(
+                                dcc.DatePickerRange(
+                                    id="daily-range",
+                                    start_date=week_ago.isoformat(),
+                                    end_date=today.isoformat(),
+                                    display_format="YYYY-MM-DD",
+                                ),
+                                md=8,
+                                style={"textAlign": "right"},
+                            ),
+                        ],
+                        align="center",
+                        className="mb-3",
+                    ),
+                    html.Div(id="daily-totals", style={"color": COLORS["text_secondary"], "marginBottom": "10px"}),
+                    dcc.Loading(
+                        dash_table.DataTable(
+                            id="daily-table",
+                            columns=TABLE_COLUMNS,
+                            data=[],
+                            sort_action="native",
+                            page_size=30,
+                            style_header={
+                                "backgroundColor": COLORS["card"],
+                                "color": COLORS["text"],
+                                "border": f"1px solid {COLORS['border']}",
+                            },
+                            style_cell={
+                                "backgroundColor": COLORS["background"],
+                                "color": COLORS["text"],
+                                "border": f"1px solid {COLORS['border']}",
+                                "padding": "8px",
+                                "fontFamily": "JetBrains Mono, Menlo, monospace",
+                            },
+                            style_data_conditional=[],
+                        )
+                    ),
+                ]
+            ),
         ]
-        for col_id in pnl_col_ids:
-            style_cond.append({
-                'if': {'filter_query': f'{{{col_id}}} > 0', 'column_id': col_id},
-                'color': GREEN,
-            })
-            style_cond.append({
-                'if': {'filter_query': f'{{{col_id}}} < 0', 'column_id': col_id},
-                'color': RED,
-            })
+    )
 
-        # Footnotes
-        footnotes = []
-        if 'excluded' in df.columns:
-            excluded_df = df[df['excluded'] > 0]
-            for _, row in excluded_df.iterrows():
-                footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
 
-        df = sort_dataframe(df, sort_by)
+def wallet_layout():
+    return html.Div(
+        [
+            _card(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                dcc.Dropdown(id="wallet-dropdown", placeholder="Select wallet..."),
+                                lg=7,
+                            ),
+                            dbc.Col(_range_buttons("wallet-range"), lg=5, style={"textAlign": "right"}),
+                        ],
+                        className="mb-3",
+                        align="center",
+                    ),
+                    html.Div(id="wallet-current-pnl", style={"fontSize": "34px", "fontWeight": "600"}),
+                    html.Div(id="wallet-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
+                    dcc.Graph(id="wallet-chart", config={"displayModeBar": False}),
+                    html.Div(id="wallet-stats"),
+                ]
+            )
+        ]
+    )
 
-        records = df.to_dict('records')
-        fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
-        return records, columns, sort_by, style_cond, summary, fn_text, hidden_label, hidden_color, hidden_outline
+def serve_layout():
+    return dbc.Container(
+        [
+            dcc.Store(id="refresh-token", data=0),
+            dcc.Store(id="overview-range", data="ALL"),
+            dcc.Store(id="wallet-range", data="ALL"),
+            dcc.Store(id="show-hidden", data=False),
+            dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
+            dbc.Row(
+                [
+                    dbc.Col(html.H2("Wallet Curator Dashboard", style={"margin": 0}), md=6),
+                    dbc.Col(
+                        html.Div(id="status-bar", style={"textAlign": "right", "color": COLORS["text_secondary"]}),
+                        md=6,
+                    ),
+                ],
+                className="mb-4",
+                align="center",
+            ),
+            dbc.Tabs(
+                [
+                    dbc.Tab(label="Portfolio Overview", tab_id="overview"),
+                    dbc.Tab(label="Per-Wallet Charts", tab_id="wallets"),
+                ],
+                id="tabs",
+                active_tab="overview",
+                className="mb-4",
+            ),
+            html.Div(id="overview-container", children=overview_layout()),
+            html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
+        ],
+        fluid=True,
+        style={
+            "minHeight": "100vh",
+            "padding": "24px",
+            "backgroundColor": COLORS["background"],
+            "color": COLORS["text"],
+        },
+    )
 
-    except Exception as e:
-        return [], [], get_default_pnl_sort(), [], f"Error: {e}", "", hidden_label, hidden_color, hidden_outline
+
+app.layout = serve_layout
 
 
 @callback(
-    Output('pnl-sort-state', 'data'),
-    Input('pnl-table', 'sort_by'),
-    prevent_initial_call=True,
+    [Output("overview-container", "style"), Output("wallet-container", "style")],
+    Input("tabs", "active_tab"),
 )
-def persist_table_sort(sort_by):
-    return sort_by or get_default_pnl_sort()
+def render_tab(active_tab):
+    if active_tab == "wallets":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
 
 
-# ─── PnL table: SORT callback (separate — no circular loop) ───────────────────
 @callback(
-    Output('pnl-table', 'data', allow_duplicate=True),
-    Input('pnl-table', 'sort_by'),
-    State('pnl-table', 'data'),
+    Output("overview-range", "data"),
+    [Input(f"overview-range-{label}", "n_clicks") for label in RANGES],
+    State("overview-range", "data"),
     prevent_initial_call=True,
 )
-def sort_table(sort_by, current_data):
-    if not sort_by or not current_data:
-        return no_update
-    df = pd.DataFrame(current_data)
-    return sort_dataframe(df, sort_by).to_dict('records')
+def set_overview_range(*args):
+    current = args[-1]
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return current
+    return triggered.split("-")[-1]
 
 
-# ─── Ingest button ─────────────────────────────────────────────
 @callback(
-    [Output('notification', 'children'),
-     Output('refresh-trigger', 'data', allow_duplicate=True),
-     Output('snapshot-select', 'options', allow_duplicate=True),
-     Output('snapshot-select', 'value', allow_duplicate=True)],
-    Input('btn-ingest', 'n_clicks'),
+    Output("wallet-range", "data"),
+    [Input(f"wallet-range-{label}", "n_clicks") for label in RANGES],
+    State("wallet-range", "data"),
     prevent_initial_call=True,
 )
-def run_ingest(n_clicks):
-    if not n_clicks:
-        return no_update, no_update, no_update, no_update
-
-    try:
-        conn = get_connection()
-
-        # Run ingest pipeline
-        from lib.ingest_sharp import run as ingest_run
-        from lib.db import rebuild_positions, ensure_resolution_entries
-        from lib.resolver import check_resolutions
-        from lib.pricing import fetch_prices
-        from lib.pnl import compute_wallet_pnl
-        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
-        from lib.changelog import detect_changes
-
-        excluded = ingest_run()
-        if excluded is None:
-            excluded = {}
-
-        conn = get_connection()
-        ensure_resolution_entries(conn)
-        resolved = check_resolutions(conn)
-        prices = fetch_prices(conn)
-        compute_wallet_pnl(conn, excluded, current_prices=prices)
-
-        new_trades = conn.execute("SELECT SUM(new_trades) FROM ingest_registry").fetchone()[0] or 0
-        snap_id = maybe_create_snapshot(conn, new_trade_count=new_trades)
-        save_csv_if_changed(conn)
-        detect_changes(conn)
-        conn.close()
-
-        msg = dbc.Alert(f"Ingest complete. {resolved} tokens resolved. Snapshot #{snap_id} updated.",
-                        color='success', duration=5000)
-        opts = get_snapshot_options()
-        default = [opts[0]['value']] if opts else []
-        return msg, dash.callback_context.triggered[0]['prop_id'], opts, default
-
-    except Exception as e:
-        return dbc.Alert(f"Ingest failed: {e}", color='danger', duration=8000), no_update, no_update, no_update
+def set_wallet_range(*args):
+    current = args[-1]
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return current
+    return triggered.split("-")[-1]
 
 
-# ─── Refresh button ────────────────────────────────────────────
 @callback(
-    [Output('notification', 'children', allow_duplicate=True),
-     Output('refresh-trigger', 'data', allow_duplicate=True)],
-    Input('btn-refresh', 'n_clicks'),
+    Output("show-hidden", "data"),
+    Input("btn-hidden", "n_clicks"),
+    State("show-hidden", "data"),
     prevent_initial_call=True,
 )
-def run_refresh(n_clicks):
-    if not n_clicks:
-        return no_update, no_update
-
-    try:
-        conn = get_connection()
-        from lib.db import ensure_resolution_entries
-        from lib.resolver import check_resolutions
-        from lib.pricing import fetch_prices
-        from lib.pnl import compute_wallet_pnl
-        from lib.snapshots import maybe_create_snapshot
-
-        ensure_resolution_entries(conn)
-        resolved = check_resolutions(conn)
-        prices = fetch_prices(conn)
-        compute_wallet_pnl(conn, current_prices=prices)
-        maybe_create_snapshot(conn)
-        conn.close()
-
-        msg = dbc.Alert(f"Refresh complete. {resolved} tokens resolved. Prices updated.",
-                        color='info', duration=5000)
-        return msg, dash.callback_context.triggered[0]['prop_id']
-
-    except Exception as e:
-        return dbc.Alert(f"Refresh failed: {e}", color='danger', duration=8000), no_update
-
-
-# ─── Hide/Show toggle ──────────────────────────────────────────
-@callback(
-    Output('hidden-visible', 'data'),
-    Input('btn-hidden', 'n_clicks'),
-    State('hidden-visible', 'data'),
-    prevent_initial_call=True,
-)
-def toggle_hidden(n_clicks, current):
-    if not n_clicks:
-        return no_update
+def toggle_hidden(_, current):
     return not current
 
 
-# ─── Hide wallet (via 👁 column click) ─────────────────────────
 @callback(
-    Output('refresh-trigger', 'data', allow_duplicate=True),
-    Input('pnl-table', 'active_cell'),
-    State('pnl-table', 'data'),
+    [
+        Output("status-bar", "children"),
+        Output("overview-chart", "figure"),
+        Output("overview-current-pnl", "children"),
+        Output("overview-current-pnl", "style"),
+        Output("overview-range-label", "children"),
+        Output("recent-changes", "children"),
+    ],
+    [Input("refresh-token", "data"), Input("overview-range", "data"), Input("status-poll", "n_intervals")],
+)
+def update_overview(_, range_key, __):
+    try:
+        conn = get_connection()
+        summary = get_sync_status_summary(conn)
+        series = get_time_series(conn, wallet=None, range_key=range_key)
+        sync = summary["sync"]
+        latest = series[-1]["total_pnl"] if series else 0.0
+        figure = _series_figure(series, "Portfolio P&L")
+        if sync:
+            last_sync = parse_db_timestamp(sync["last_sync_at"]).strftime("%Y-%m-%d %H:%M UTC")
+            status = (
+                f"Syncing from: {sync['current_version_folder'] or 'unknown'} | "
+                f"Last sync: {last_sync} | Trades: {summary['total_trades']:,}"
+            )
+        else:
+            status = f"Trades: {summary['total_trades']:,} | Waiting for first VPS sync"
+        if summary["latest_pipeline"] and summary["latest_pipeline"]["error"]:
+            status += f" | Pipeline warning: {summary['latest_pipeline']['error']}"
+        changes = _build_recent_changes(get_recent_changes(conn, limit=8))
+        conn.close()
+        return (
+            status,
+            figure,
+            _money(latest),
+            {"fontSize": "40px", "fontWeight": "600", "color": _line_color(latest)},
+            "All-Time" if range_key == "ALL" else f"Last {range_key}",
+            changes,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load overview")
+        return (
+            f"Database unavailable: {exc}",
+            _series_figure([], "Portfolio P&L"),
+            "Database unavailable",
+            {"fontSize": "32px", "fontWeight": "600", "color": COLORS["negative"]},
+            "",
+            _database_error_layout(str(exc)),
+        )
+
+
+@callback(
+    [
+        Output("daily-table", "data"),
+        Output("daily-table", "style_data_conditional"),
+        Output("daily-totals", "children"),
+        Output("btn-hidden", "children"),
+    ],
+    [Input("daily-range", "start_date"), Input("daily-range", "end_date"), Input("show-hidden", "data"), Input("refresh-token", "data")],
+)
+def update_daily_table(start_date, end_date, show_hidden, _):
+    try:
+        conn = get_connection()
+        breakdown = get_daily_breakdown(conn, start_date, end_date, include_hidden=show_hidden)
+        conn.close()
+        style = [
+            {
+                "if": {"filter_query": "{realized_pnl} > 0", "column_id": "realized_pnl"},
+                "color": COLORS["positive"],
+            },
+            {
+                "if": {"filter_query": "{realized_pnl} < 0", "column_id": "realized_pnl"},
+                "color": COLORS["negative"],
+            },
+            {
+                "if": {"filter_query": "{unrealized_pnl} > 0", "column_id": "unrealized_pnl"},
+                "color": COLORS["positive"],
+            },
+            {
+                "if": {"filter_query": "{unrealized_pnl} < 0", "column_id": "unrealized_pnl"},
+                "color": COLORS["negative"],
+            },
+            {
+                "if": {"filter_query": "{total_pnl} > 0", "column_id": "total_pnl"},
+                "color": COLORS["positive"],
+            },
+            {
+                "if": {"filter_query": "{total_pnl} < 0", "column_id": "total_pnl"},
+                "color": COLORS["negative"],
+            },
+            {
+                "if": {"filter_query": "{hidden} = true"},
+                "backgroundColor": "#141414",
+                "color": COLORS["text_secondary"],
+            },
+        ]
+        totals_text = (
+            f"Totals (excluding hidden wallets in table view): Invested {_money(breakdown['totals']['invested'])} | "
+            f"Realized {_money(breakdown['totals']['realized'])} | "
+            f"Unrealized {_money(breakdown['totals']['unrealized'])} | "
+            f"Total {_money(breakdown['totals']['total'])}. "
+            f"True total incl. hidden: {_money(breakdown['true_totals']['total'])}."
+        )
+        button_label = "Hide Hidden Wallets" if show_hidden else "Show Hidden Wallets"
+        return breakdown["rows"], style, totals_text, button_label
+    except Exception as exc:
+        logger.exception("Failed to load daily table")
+        return [], [], f"Daily table unavailable: {exc}", "Show Hidden Wallets"
+
+
+@callback(
+    Output("refresh-token", "data", allow_duplicate=True),
+    Input("daily-table", "active_cell"),
+    State("daily-table", "data"),
+    State("refresh-token", "data"),
     prevent_initial_call=True,
 )
-def handle_cell_click(active_cell, data):
-    if not active_cell or not data:
+def toggle_hidden_wallet(active_cell, rows, refresh_token):
+    if not active_cell or not rows:
         return no_update
-
-    col = active_cell['column_id']
-    if col != 'hide':
+    if active_cell["column_id"] != "hide":
         return no_update
-
-    row = data[active_cell['row']]
-    wallet = row.get('wallet', '')
-    if not wallet.startswith('0x'):
+    wallet = rows[active_cell["row"]].get("wallet_address")
+    if not wallet:
         return no_update
 
     conn = get_connection()
     existing = conn.execute(
-        "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?", (wallet,)
+        "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?",
+        (wallet,),
     ).fetchone()
     if existing:
         conn.execute("DELETE FROM hidden_wallets WHERE wallet_address = ?", (wallet,))
     else:
-        conn.execute("INSERT OR IGNORE INTO hidden_wallets (wallet_address) VALUES (?)", (wallet,))
+        conn.execute("INSERT INTO hidden_wallets (wallet_address) VALUES (?)", (wallet,))
     conn.commit()
     conn.close()
-    return 'hide-toggle'
-
-
-# ─── Wallet Changes tab ───────────────────────────────────────
-@callback(
-    Output('csv-version-select', 'options'),
-    Input('tabs', 'active_tab'),
-)
-def load_csv_versions(tab):
-    if tab != 'tab-changes':
-        return no_update
-    try:
-        conn = get_connection()
-        versions = conn.execute(
-            "SELECT id, saved_at, wallet_count, changes_summary FROM csv_history ORDER BY id DESC"
-        ).fetchall()
-        conn.close()
-        return [
-            {'label': f"{v['saved_at']} — {v['wallet_count']} wallets ({v['changes_summary'] or ''})",
-             'value': v['id']}
-            for v in versions
-        ]
-    except Exception:
-        return []
+    return refresh_token + 1
 
 
 @callback(
-    Output('csv-viewer', 'children'),
-    Input('csv-version-select', 'value'),
+    [Output("refresh-message", "children"), Output("refresh-token", "data", allow_duplicate=True)],
+    Input("btn-refresh", "n_clicks"),
+    State("refresh-token", "data"),
+    prevent_initial_call=True,
 )
-def show_csv_version(version_id):
-    if not version_id:
-        return html.Div("Select a CSV version to view", style={'color': '#888'})
-    try:
-        conn = get_connection()
-        row = conn.execute("SELECT * FROM csv_history WHERE id = ?", (version_id,)).fetchone()
-        conn.close()
-        if not row:
-            return html.Div("Version not found", style={'color': '#888'})
-
-        import csv as csv_mod
-        import io
-        reader = csv_mod.DictReader(io.StringIO(row['csv_content']))
-        rows_data = list(reader)
-        if not rows_data:
-            return html.Div("Empty CSV", style={'color': '#888'})
-
-        df = pd.DataFrame(rows_data)
-        # Only show address and market_whitelist
-        show_cols = ['address', 'market_whitelist']
-        show_cols = [c for c in show_cols if c in df.columns]
-        if show_cols:
-            df = df[show_cols]
-        df = df[df['address'] != '__global__'] if 'address' in df.columns else df
-
-        return dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': c, 'id': c} for c in df.columns],
-            style_header=HEADER_STYLE,
-            style_cell=CELL_STYLE,
-            page_size=50,
+def refresh_pipeline(n_clicks, refresh_token):
+    if not n_clicks:
+        return no_update, no_update
+    result = run_hourly_pipeline(trigger="manual-refresh")
+    if result["status"] == "ok":
+        message = dbc.Alert(
+            f"Pipeline complete. {result['positions_rebuilt']} positions, "
+            f"{result['tokens_resolved']} newly resolved tokens.",
+            color="success",
         )
-    except Exception as e:
-        return html.Div(f"Error: {e}", style={'color': RED})
+    elif result["status"] == "busy":
+        message = dbc.Alert(result["message"], color="warning")
+    else:
+        message = dbc.Alert(result.get("error", "Pipeline failed"), color="danger")
+    return message, refresh_token + 1
 
 
 @callback(
-    Output('changelog-content', 'children'),
-    Input('tabs', 'active_tab'),
+    [Output("wallet-dropdown", "options"), Output("wallet-dropdown", "value")],
+    Input("refresh-token", "data"),
+    State("wallet-dropdown", "value"),
 )
-def load_changelog(tab):
-    if tab != 'tab-changes':
-        return no_update
+def load_wallet_options(_, current_wallet):
     try:
         conn = get_connection()
-        changes = conn.execute(
-            "SELECT * FROM wallet_changes ORDER BY change_date DESC LIMIT 50"
-        ).fetchall()
+        options = get_wallet_options(conn)
         conn.close()
-
-        if not changes:
-            return html.Div("No wallet changes recorded yet.", style={'color': '#888'})
-
-        items = []
-        for c in changes:
-            icon = "✅" if c['action'] == 'ADDED' else "🔴"
-            addr = c['wallet_address']
-            short = addr[:10] + '...' + addr[-4:]
-            game = c['game_filter'] or '?'
-            date = c['change_date']
-            items.append(html.Div(
-                f"{icon} {c['action']} {short} ({game}) — {date}",
-                style={'marginBottom': '4px'}
-            ))
-        return html.Div(items)
+        values = {option["value"] for option in options}
+        value = current_wallet if current_wallet in values else (options[0]["value"] if options else None)
+        return options, value
     except Exception:
-        return html.Div("Error loading changelog", style={'color': RED})
+        return [], None
 
 
-# ─── Run ───────────────────────────────────────────────────────
-if __name__ == '__main__':
+@callback(
+    [
+        Output("wallet-chart", "figure"),
+        Output("wallet-current-pnl", "children"),
+        Output("wallet-current-pnl", "style"),
+        Output("wallet-range-label", "children"),
+        Output("wallet-stats", "children"),
+    ],
+    [Input("wallet-dropdown", "value"), Input("wallet-range", "data"), Input("refresh-token", "data")],
+)
+def update_wallet_view(wallet, range_key, _):
+    if not wallet:
+        return _series_figure([], "Wallet P&L"), "Select a wallet", {"fontSize": "28px"}, "", ""
+    try:
+        conn = get_connection()
+        series = get_time_series(conn, wallet=wallet, range_key=range_key)
+        stats = get_wallet_stats(conn, wallet)
+        conn.close()
+        if not stats:
+            return _series_figure([], "Wallet P&L"), "No data", {"fontSize": "28px"}, "", ""
+
+        current = series[-1]["total_pnl"] if series else stats["total"]
+        stat_block = html.Div(
+            [
+                html.Div(
+                    f"Invested: {_money(stats['invested'])} | Realized: {_money(stats['realized'])} | "
+                    f"Unrealized: {_money(stats['unrealized'])}",
+                    className="mb-1",
+                ),
+                html.Div(
+                    f"Filter: {stats['filter']} | Actual: {stats['game']} | Markets: {stats['markets']} | "
+                    f"Trades: {stats['trades']} | Excluded positions: {stats['excluded_positions']}",
+                    style={"color": COLORS["text_secondary"]},
+                ),
+            ],
+            style={"marginTop": "12px"},
+        )
+        return (
+            _series_figure(series, f"{wallet[:8]}...{wallet[-4:]} P&L"),
+            _money(current),
+            {"fontSize": "34px", "fontWeight": "600", "color": _line_color(current)},
+            "All-Time" if range_key == "ALL" else f"Last {range_key}",
+            stat_block,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load wallet view")
+        return _series_figure([], "Wallet P&L"), str(exc), {"fontSize": "28px"}, "", ""
+
+
+start_scheduler()
+try:
     init_db()
+except Exception as exc:
+    logger.warning("Initial database bootstrap failed: %s", exc)
 
-    # Create initial snapshot if none exist
-    conn = get_connection()
-    snap_count = conn.execute("SELECT COUNT(*) FROM pnl_snapshots").fetchone()[0]
-    trade_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    if snap_count == 0 and trade_count > 0:
-        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
-        maybe_create_snapshot(conn)
-        save_csv_if_changed(conn)
-    conn.close()
-
-    print("\n  Wallet Curator Dashboard")
-    print("  http://localhost:5050\n")
-    app.run(debug=False, port=5050)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8050"))
+    app.run(host="0.0.0.0", port=port, debug=False)
