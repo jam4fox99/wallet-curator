@@ -327,7 +327,14 @@ def update_table(snapshot_ids, show_hidden, _, sort_by):
         records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
-        return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
+        # Only return columns/styles when NOT triggered by sort
+        # (returning columns resets sort_by, causing a circular reset)
+        triggered = dash.ctx.triggered_id
+        if triggered == 'pnl-table':
+            # Sort click — only update data, keep columns/styles unchanged
+            return records, no_update, no_update, no_update, no_update, no_update
+        else:
+            return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
 
     except Exception as e:
         return [], [], [], f"Error: {e}", "", "Show Hidden (0)"
