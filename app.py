@@ -72,6 +72,7 @@ SINGLE_COLUMNS = [
 PNL_COL_IDS = ['realized', 'open_pnl', 'total_pnl', 'combined']
 GREEN = '#22c55e'
 RED = '#ef4444'
+DEFAULT_PNL_SORT = [{'column_id': 'total_pnl', 'direction': 'desc'}]
 
 
 # ─── Layout ────────────────────────────────────────────────────
@@ -93,9 +94,76 @@ def get_default_snapshot():
     return [opts[0]['value']] if opts else []
 
 
+def get_default_pnl_sort():
+    return [dict(item) for item in DEFAULT_PNL_SORT]
+
+
+def build_pnl_columns(snapshot_ids):
+    if len(snapshot_ids) == 1:
+        return list(SINGLE_COLUMNS)
+
+    columns = [
+        {'name': '👁', 'id': 'hide', 'type': 'text'},
+        {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
+        {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
+        {'name': 'Filter', 'id': 'filter', 'type': 'text'},
+        {'name': 'Actual', 'id': 'actual', 'type': 'text'},
+        {'name': 'Sim', 'id': 'sim', 'type': 'text'},
+    ]
+    for sid in sorted(snapshot_ids):
+        columns.append({'name': f'#{sid} Inv', 'id': f's{sid}_inv', 'type': 'numeric'})
+        columns.append({'name': f'#{sid} Real', 'id': f's{sid}_real', 'type': 'numeric'})
+        columns.append({'name': f'#{sid} Total', 'id': f's{sid}_total', 'type': 'numeric'})
+    columns.extend([
+        {'name': 'Combined', 'id': 'combined', 'type': 'numeric'},
+        {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
+        {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
+        {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
+        {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
+    ])
+    return columns
+
+
+def sanitize_sort_by(sort_by, available_columns):
+    col_ids = {c['id'] for c in available_columns}
+    active_sort = sort_by or get_default_pnl_sort()
+    col = active_sort[0].get('column_id')
+
+    if col in col_ids:
+        return active_sort
+    if 'total_pnl' in col_ids:
+        return get_default_pnl_sort()
+    if 'combined' in col_ids:
+        return [{'column_id': 'combined', 'direction': 'desc'}]
+    return []
+
+
+def sort_dataframe(df, sort_by):
+    if df.empty:
+        return df
+
+    active_sort = sort_by or get_default_pnl_sort()
+    if not active_sort:
+        return df
+
+    col = active_sort[0].get('column_id')
+    direction = active_sort[0].get('direction', 'asc')
+    if col not in df.columns:
+        fallback_sort = sanitize_sort_by(active_sort, [{'id': c} for c in df.columns])
+        if not fallback_sort:
+            return df
+        col = fallback_sort[0]['column_id']
+        direction = fallback_sort[0].get('direction', 'asc')
+
+    sorted_df = df.copy()
+    sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce').fillna(sorted_df[col])
+    return sorted_df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
+
+
 app.layout = dbc.Container([
     dcc.Store(id='refresh-trigger', data=0),
     dcc.Store(id='hidden-visible', data=False),
+    dcc.Store(id='pnl-sort-state', data=get_default_pnl_sort(), storage_type='session'),
 
     # Header
     dbc.Row([
@@ -114,7 +182,7 @@ app.layout = dbc.Container([
 ], fluid=True, style=CUSTOM_CSS)
 
 
-def pnl_tab_layout():
+def pnl_tab_layout(sort_by=None):
     return html.Div([
         # Action bar
         dbc.Row([
@@ -150,7 +218,7 @@ def pnl_tab_layout():
                     id='pnl-table',
                     sort_action='custom',
                     sort_mode='single',
-                    sort_by=[{'column_id': 'total_pnl', 'direction': 'desc'}],
+                    sort_by=sort_by or get_default_pnl_sort(),
                     style_table={'overflowX': 'auto'},
                     style_header=HEADER_STYLE,
                     style_cell=CELL_STYLE,
@@ -189,10 +257,10 @@ def changes_tab_layout():
 
 
 # ─── Tab switching ─────────────────────────────────────────────
-@callback(Output('tab-content', 'children'), Input('tabs', 'active_tab'))
-def render_tab(tab):
+@callback(Output('tab-content', 'children'), Input('tabs', 'active_tab'), State('pnl-sort-state', 'data'))
+def render_tab(tab, sort_by):
     if tab == 'tab-pnl':
-        return pnl_tab_layout()
+        return pnl_tab_layout(sort_by=sort_by)
     elif tab == 'tab-changes':
         return changes_tab_layout()
     return html.Div()
@@ -219,6 +287,7 @@ def update_status(_):
 @callback(
     [Output('pnl-table', 'data'),
      Output('pnl-table', 'columns'),
+     Output('pnl-table', 'sort_by'),
      Output('pnl-table', 'style_data_conditional'),
      Output('summary-bar', 'children'),
      Output('footnotes', 'children'),
@@ -226,10 +295,11 @@ def update_status(_):
     [Input('snapshot-select', 'value'),
      Input('hidden-visible', 'data'),
      Input('refresh-trigger', 'data')],
+    State('pnl-sort-state', 'data'),
 )
-def update_table(snapshot_ids, show_hidden, _):
+def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
     if not snapshot_ids:
-        return [], [], [], "No snapshots selected", "", "Show Hidden (0)"
+        return [], [], get_default_pnl_sort(), [], "No snapshots selected", "", "Show Hidden (0)"
 
     try:
         conn = get_connection()
@@ -261,31 +331,12 @@ def update_table(snapshot_ids, show_hidden, _):
         conn.close()
 
         if df.empty:
-            return [], [], [], summary, "", f"Show Hidden ({hidden_count})"
+            columns = build_pnl_columns(snapshot_ids)
+            sort_by = sanitize_sort_by(stored_sort_by, columns)
+            return [], columns, sort_by, [], summary, "", f"Show Hidden ({hidden_count})"
 
-        # Build columns — use static defs for single, dynamic for multi
-        if len(snapshot_ids) == 1:
-            columns = list(SINGLE_COLUMNS)
-        else:
-            columns = [
-                {'name': '👁', 'id': 'hide', 'type': 'text'},
-                {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
-                {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
-                {'name': 'Filter', 'id': 'filter', 'type': 'text'},
-                {'name': 'Actual', 'id': 'actual', 'type': 'text'},
-                {'name': 'Sim', 'id': 'sim', 'type': 'text'},
-            ]
-            for sid in sorted(snapshot_ids):
-                columns.append({'name': f'#{sid} Inv', 'id': f's{sid}_inv', 'type': 'numeric'})
-                columns.append({'name': f'#{sid} Real', 'id': f's{sid}_real', 'type': 'numeric'})
-                columns.append({'name': f'#{sid} Total', 'id': f's{sid}_total', 'type': 'numeric'})
-            columns.extend([
-                {'name': 'Combined', 'id': 'combined', 'type': 'numeric'},
-                {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
-                {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
-                {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
-                {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
-            ])
+        columns = build_pnl_columns(snapshot_ids)
+        sort_by = sanitize_sort_by(stored_sort_by, columns)
 
         # Conditional formatting + cell selection fix
         col_ids = [c['id'] for c in columns]
@@ -311,17 +362,24 @@ def update_table(snapshot_ids, show_hidden, _):
             for _, row in excluded_df.iterrows():
                 footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
 
-        # Default sort by total_pnl desc
-        if 'total_pnl' in df.columns:
-            df = df.sort_values('total_pnl', ascending=False, na_position='last')
+        df = sort_dataframe(df, sort_by)
 
         records = df.to_dict('records')
         fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
 
-        return records, columns, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
+        return records, columns, sort_by, style_cond, summary, fn_text, f"Show Hidden ({hidden_count})"
 
     except Exception as e:
-        return [], [], [], f"Error: {e}", "", "Show Hidden (0)"
+        return [], [], get_default_pnl_sort(), [], f"Error: {e}", "", "Show Hidden (0)"
+
+
+@callback(
+    Output('pnl-sort-state', 'data'),
+    Input('pnl-table', 'sort_by'),
+    prevent_initial_call=True,
+)
+def persist_table_sort(sort_by):
+    return sort_by or get_default_pnl_sort()
 
 
 # ─── PnL table: SORT callback (separate — no circular loop) ───────────────────
@@ -334,14 +392,8 @@ def update_table(snapshot_ids, show_hidden, _):
 def sort_table(sort_by, current_data):
     if not sort_by or not current_data:
         return no_update
-    col = sort_by[0]['column_id']
-    direction = sort_by[0].get('direction', 'asc')
-
     df = pd.DataFrame(current_data)
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(df[col])
-        df = df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
-    return df.to_dict('records')
+    return sort_dataframe(df, sort_by).to_dict('records')
 
 
 # ─── Ingest button ─────────────────────────────────────────────
