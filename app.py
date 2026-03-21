@@ -6,8 +6,7 @@ from datetime import timedelta
 
 import dash
 import dash_bootstrap_components as dbc
-import plotly.graph_objects as go
-from dash import Input, Output, State, callback, dash_table, dcc, html, no_update
+from dash import Input, Output, State, callback, clientside_callback, dash_table, dcc, html, no_update
 
 try:
     import dash_auth
@@ -20,7 +19,7 @@ except ModuleNotFoundError:
     BackgroundScheduler = None
 
 from lib.changelog import get_recent_changes
-from lib.charts import get_sync_status_summary, get_time_series, get_wallet_options, get_wallet_stats
+from lib.charts import get_chart_payload, get_sync_status_summary, get_wallet_options, get_wallet_stats
 from lib.daily_pnl import get_daily_breakdown
 from lib.db import get_connection, init_db
 from lib.pipeline import run_hourly_pipeline
@@ -52,8 +51,8 @@ TABLE_COLUMNS = [
     {"name": "Realized P&L", "id": "realized_pnl", "type": "numeric"},
     {"name": "Unrealized", "id": "unrealized_pnl", "type": "numeric"},
     {"name": "Total P&L", "id": "total_pnl", "type": "numeric"},
-    {"name": "Markets", "id": "markets", "type": "numeric"},
-    {"name": "Trades", "id": "trades", "type": "numeric"},
+    {"name": "Markets In Range", "id": "markets", "type": "numeric"},
+    {"name": "Trades In Range", "id": "trades", "type": "numeric"},
     {"name": "In CSV", "id": "in_csv"},
 ]
 
@@ -136,30 +135,29 @@ def _line_color(value):
     return COLORS["positive"] if value >= 0 else COLORS["negative"]
 
 
-def _series_figure(series, title):
-    fig = go.Figure()
-    if series:
-        fig.add_trace(
-            go.Scatter(
-                x=[point["recorded_at"] for point in series],
-                y=[point["total_pnl"] for point in series],
-                mode="lines",
-                line={"width": 3, "color": _line_color(series[-1]["total_pnl"])},
-                hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
-            )
+def _chart_mount(container_id):
+    return html.Div(id=container_id, className="lightweight-chart")
+
+
+def _format_chart_range_label(payload, range_key):
+    if not payload or not payload.get("series"):
+        return "Waiting for chart history"
+
+    start_at = parse_db_timestamp(payload.get("start_at"))
+    end_at = parse_db_timestamp(payload.get("end_at"))
+    if not start_at or not end_at:
+        return "Waiting for chart history"
+
+    if range_key == "ALL":
+        return (
+            f"Rebased from zero | {start_at.strftime('%b %d, %Y %H:%M')} UTC "
+            f"to {end_at.strftime('%b %d, %Y %H:%M')} UTC"
         )
-    fig.update_layout(
-        template="plotly_dark",
-        height=360,
-        margin={"l": 20, "r": 20, "t": 40, "b": 20},
-        paper_bgcolor=COLORS["card"],
-        plot_bgcolor=COLORS["card"],
-        font={"color": COLORS["text"]},
-        title={"text": title, "x": 0.02},
-        xaxis={"gridcolor": COLORS["border"]},
-        yaxis={"gridcolor": COLORS["border"], "tickprefix": "$"},
+
+    return (
+        f"{range_key} change from zero | {start_at.strftime('%b %d, %H:%M')} UTC "
+        f"to {end_at.strftime('%b %d, %H:%M')} UTC"
     )
-    return fig
 
 
 def _build_recent_changes(changes):
@@ -199,7 +197,7 @@ def overview_layout():
                                 ),
                                 html.Div(id="overview-current-pnl", style={"fontSize": "40px", "fontWeight": "600"}),
                                 html.Div(id="overview-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
-                                dcc.Graph(id="overview-chart", config={"displayModeBar": False}),
+                                _chart_mount("overview-chart-container"),
                             ]
                         ),
                         lg=8,
@@ -244,6 +242,7 @@ def overview_layout():
                                             start_date=week_ago.isoformat(),
                                             end_date=today.isoformat(),
                                             display_format="YYYY-MM-DD",
+                                            className="daily-date-picker",
                                         ),
                                     ],
                                     style={"display": "flex", "justifyContent": "flex-end", "gap": "12px"},
@@ -262,7 +261,8 @@ def overview_layout():
                             columns=TABLE_COLUMNS,
                             data=[],
                             sort_action="native",
-                            page_size=30,
+                            page_action="none",
+                            fixed_rows={"headers": True},
                             style_header={
                                 "backgroundColor": COLORS["card"],
                                 "color": COLORS["text"],
@@ -290,7 +290,7 @@ def overview_layout():
                                 {"if": {"column_id": "filter"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
                                 {"if": {"column_id": "actual"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
                             ],
-                            style_table={"overflowX": "auto"},
+                            style_table={"overflowX": "auto", "overflowY": "auto", "height": "560px", "maxHeight": "560px"},
                             style_data_conditional=[],
                         )
                     ),
@@ -318,7 +318,7 @@ def wallet_layout():
                     ),
                     html.Div(id="wallet-current-pnl", style={"fontSize": "34px", "fontWeight": "600"}),
                     html.Div(id="wallet-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
-                    dcc.Graph(id="wallet-chart", config={"displayModeBar": False}),
+                    _chart_mount("wallet-chart-container"),
                     html.Div(id="wallet-stats"),
                 ]
             )
@@ -333,8 +333,12 @@ def serve_layout():
             dcc.Store(id="overview-range", data="ALL"),
             dcc.Store(id="wallet-range", data="ALL"),
             dcc.Store(id="show-hidden", data=False),
-            dcc.Store(id="include-outside-range", data=True),
+            dcc.Store(id="include-outside-range", data=False),
+            dcc.Store(id="overview-chart-data"),
+            dcc.Store(id="wallet-chart-data"),
             dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
+            html.Div(id="overview-chart-signal", style={"display": "none"}),
+            html.Div(id="wallet-chart-signal", style={"display": "none"}),
             dbc.Row(
                 [
                     dbc.Col(html.H2("Wallet Curator Dashboard", style={"margin": 0}), md=6),
@@ -370,6 +374,38 @@ def serve_layout():
 
 
 app.layout = serve_layout
+
+
+clientside_callback(
+    """
+    function(payload, activeTab) {
+        if (activeTab !== "overview" || !window.walletCuratorCharts) {
+            return window.dash_clientside.no_update;
+        }
+        window.walletCuratorCharts.renderChart("overview-chart-container", payload);
+        return String(Date.now());
+    }
+    """,
+    Output("overview-chart-signal", "children"),
+    Input("overview-chart-data", "data"),
+    Input("tabs", "active_tab"),
+)
+
+
+clientside_callback(
+    """
+    function(payload, activeTab) {
+        if (activeTab !== "wallets" || !window.walletCuratorCharts) {
+            return window.dash_clientside.no_update;
+        }
+        window.walletCuratorCharts.renderChart("wallet-chart-container", payload);
+        return String(Date.now());
+    }
+    """,
+    Output("wallet-chart-signal", "children"),
+    Input("wallet-chart-data", "data"),
+    Input("tabs", "active_tab"),
+)
 
 
 @callback(
@@ -433,7 +469,7 @@ def toggle_outside_range(_, current):
 @callback(
     [
         Output("status-bar", "children"),
-        Output("overview-chart", "figure"),
+        Output("overview-chart-data", "data"),
         Output("overview-current-pnl", "children"),
         Output("overview-current-pnl", "style"),
         Output("overview-range-label", "children"),
@@ -445,10 +481,9 @@ def update_overview(_, range_key, __):
     try:
         conn = get_connection()
         summary = get_sync_status_summary(conn)
-        series = get_time_series(conn, wallet=None, range_key=range_key)
+        payload = get_chart_payload(conn, wallet=None, range_key=range_key)
         sync = summary["sync"]
-        latest = series[-1]["total_pnl"] if series else 0.0
-        figure = _series_figure(series, "Portfolio P&L")
+        latest = payload["current_delta_pnl"]
         if sync:
             last_sync = parse_db_timestamp(sync["last_sync_at"]).strftime("%Y-%m-%d %H:%M UTC")
             status = (
@@ -463,17 +498,17 @@ def update_overview(_, range_key, __):
         conn.close()
         return (
             status,
-            figure,
+            payload,
             _money(latest),
             {"fontSize": "40px", "fontWeight": "600", "color": _line_color(latest)},
-            "All-Time" if range_key == "ALL" else f"Last {range_key}",
+            _format_chart_range_label(payload, range_key),
             changes,
         )
     except Exception as exc:
         logger.exception("Failed to load overview")
         return (
             f"Database unavailable: {exc}",
-            _series_figure([], "Portfolio P&L"),
+            None,
             "Database unavailable",
             {"fontSize": "32px", "fontWeight": "600", "color": COLORS["negative"]},
             "",
@@ -539,13 +574,16 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
                 "color": COLORS["text_secondary"],
             },
         ]
+        roster_label = "Outside-range wallets included" if include_outside_range else "In-range wallets only"
         totals_text = (
-            f"Showing {len(breakdown['rows'])} wallets. "
+            f"Date range: {start_date} to {end_date} UTC | "
+            f"Showing {len(breakdown['rows'])} wallets | {roster_label}. "
             f"Totals (excluding hidden wallets in table view): Invested {_money(breakdown['totals']['invested'])} | "
             f"Realized {_money(breakdown['totals']['realized'])} | "
             f"Unrealized {_money(breakdown['totals']['unrealized'])} | "
             f"Total {_money(breakdown['totals']['total'])}. "
-            f"True total incl. hidden: {_money(breakdown['true_totals']['total'])}."
+            f"True total incl. hidden: {_money(breakdown['true_totals']['total'])}. "
+            f"Trades and markets columns are range-scoped; the header trade count is all-time."
         )
         button_label = "Hide Hidden Wallets" if show_hidden else "Show Hidden Wallets"
         range_button_label = (
@@ -631,7 +669,7 @@ def load_wallet_options(_, current_wallet):
 
 @callback(
     [
-        Output("wallet-chart", "figure"),
+        Output("wallet-chart-data", "data"),
         Output("wallet-current-pnl", "children"),
         Output("wallet-current-pnl", "style"),
         Output("wallet-range-label", "children"),
@@ -641,16 +679,16 @@ def load_wallet_options(_, current_wallet):
 )
 def update_wallet_view(wallet, range_key, _):
     if not wallet:
-        return _series_figure([], "Wallet P&L"), "Select a wallet", {"fontSize": "28px"}, "", ""
+        return None, "Select a wallet", {"fontSize": "28px"}, "", ""
     try:
         conn = get_connection()
-        series = get_time_series(conn, wallet=wallet, range_key=range_key)
+        payload = get_chart_payload(conn, wallet=wallet, range_key=range_key)
         stats = get_wallet_stats(conn, wallet)
         conn.close()
         if not stats:
-            return _series_figure([], "Wallet P&L"), "No data", {"fontSize": "28px"}, "", ""
+            return None, "No data", {"fontSize": "28px"}, "", ""
 
-        current = series[-1]["total_pnl"] if series else stats["total"]
+        current = payload["current_delta_pnl"]
         stat_block = html.Div(
             [
                 html.Div(
@@ -667,15 +705,15 @@ def update_wallet_view(wallet, range_key, _):
             style={"marginTop": "12px"},
         )
         return (
-            _series_figure(series, f"{wallet} P&L"),
+            payload,
             _money(current),
             {"fontSize": "34px", "fontWeight": "600", "color": _line_color(current)},
-            "All-Time" if range_key == "ALL" else f"Last {range_key}",
+            _format_chart_range_label(payload, range_key),
             stat_block,
         )
     except Exception as exc:
         logger.exception("Failed to load wallet view")
-        return _series_figure([], "Wallet P&L"), str(exc), {"fontSize": "28px"}, "", ""
+        return None, str(exc), {"fontSize": "28px"}, "", ""
 
 
 start_scheduler()

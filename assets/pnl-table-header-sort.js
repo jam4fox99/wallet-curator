@@ -1,6 +1,6 @@
 (function () {
   function handleHeaderClick(event) {
-    var header = event.target.closest('#pnl-table th[data-dash-column]');
+    var header = event.target.closest('#daily-table th[data-dash-column]');
     if (!header) {
       return;
     }

@@ -1,8 +1,8 @@
-#pnl-table th[data-dash-column] {
+#daily-table th[data-dash-column] {
   cursor: pointer;
 }
 
-#pnl-table th[data-dash-column] .column-header-name,
-#pnl-table th[data-dash-column] .column-header--sort {
+#daily-table th[data-dash-column] .column-header-name,
+#daily-table th[data-dash-column] .column-header--sort {
   cursor: pointer;
 }

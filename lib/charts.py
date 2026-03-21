@@ -13,28 +13,23 @@ RANGE_DELTAS = {
 }
 
 
-def get_time_series(conn, wallet=None, range_key="ALL"):
-    range_key = range_key if range_key in RANGE_DELTAS else "ALL"
-    cutoff = None
-    if RANGE_DELTAS[range_key] is not None:
-        cutoff = now_utc() - RANGE_DELTAS[range_key]
-
-    where_clauses = []
+def _load_series_rows(conn, wallet=None):
     params = []
     if wallet is None:
-        where_clauses.append("master_wallet IS NULL")
+        where = "master_wallet IS NULL"
     else:
-        where_clauses.append("master_wallet = ?")
+        where = "master_wallet = ?"
         params.append(wallet)
-    if cutoff is not None:
-        where_clauses.append("recorded_at >= ?")
-        params.append(to_db_timestamp(cutoff))
 
-    sql = (
-        "SELECT recorded_at, total_pnl, realized_pnl, unrealized_pnl "
-        f"FROM pnl_history WHERE {' AND '.join(where_clauses)} ORDER BY recorded_at"
-    )
-    rows = conn.execute(sql, tuple(params)).fetchall()
+    rows = conn.execute(
+        f"""
+        SELECT recorded_at, total_pnl, realized_pnl, unrealized_pnl
+        FROM pnl_history
+        WHERE {where}
+        ORDER BY recorded_at
+        """,
+        tuple(params),
+    ).fetchall()
     return [
         {
             "recorded_at": parse_db_timestamp(row["recorded_at"]),
@@ -44,6 +39,84 @@ def get_time_series(conn, wallet=None, range_key="ALL"):
         }
         for row in rows
     ]
+
+
+def _select_visible_window(points, range_key):
+    if not points:
+        return None, [], None, None
+
+    range_key = range_key if range_key in RANGE_DELTAS else "ALL"
+    end_at = points[-1]["recorded_at"]
+
+    if range_key == "ALL":
+        return points[0], list(points), points[0]["recorded_at"], end_at
+
+    cutoff = now_utc() - RANGE_DELTAS[range_key]
+    baseline = None
+    visible = []
+
+    for point in points:
+        if point["recorded_at"] <= cutoff:
+            baseline = point
+        if point["recorded_at"] >= cutoff:
+            visible.append(point)
+
+    if not visible:
+        visible = [points[-1]]
+
+    if baseline is None:
+        baseline = visible[0]
+
+    if visible[0]["recorded_at"] > cutoff:
+        visible = [
+            {
+                "recorded_at": cutoff,
+                "total_pnl": baseline["total_pnl"],
+                "realized_pnl": baseline["realized_pnl"],
+                "unrealized_pnl": baseline["unrealized_pnl"],
+            }
+        ] + visible
+
+    return baseline, visible, cutoff, end_at
+
+
+def get_chart_payload(conn, wallet=None, range_key="ALL"):
+    points = _load_series_rows(conn, wallet=wallet)
+    baseline, visible, start_at, end_at = _select_visible_window(points, range_key)
+
+    if not visible or baseline is None:
+        return {
+            "range_key": range_key,
+            "series": [],
+            "start_at": None,
+            "end_at": None,
+            "baseline_total_pnl": 0.0,
+            "current_delta_pnl": 0.0,
+            "current_total_pnl": 0.0,
+        }
+
+    baseline_total = baseline["total_pnl"]
+    current_total = points[-1]["total_pnl"]
+
+    series = []
+    for point in visible:
+        series.append(
+            {
+                "time": int(point["recorded_at"].timestamp()),
+                "value": round(point["total_pnl"] - baseline_total, 2),
+                "absolute_value": round(point["total_pnl"], 2),
+            }
+        )
+
+    return {
+        "range_key": range_key,
+        "series": series,
+        "start_at": to_db_timestamp(start_at),
+        "end_at": to_db_timestamp(end_at),
+        "baseline_total_pnl": round(baseline_total, 2),
+        "current_delta_pnl": round(current_total - baseline_total, 2),
+        "current_total_pnl": round(current_total, 2),
+    }
 
 
 def get_wallet_options(conn):
