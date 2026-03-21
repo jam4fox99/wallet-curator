@@ -1,5 +1,6 @@
-anthropic
-mem0ai
+dash
+dash-bootstrap-components
 pandas
 openpyxl
 requests
+anthropic

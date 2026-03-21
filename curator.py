@@ -45,6 +45,15 @@ def cmd_ingest(args):
     except Exception as e:
         print(f"⚠️ P&L computation failed: {e}")
 
+    # Create/update snapshot
+    try:
+        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
+        from lib.ingest_sharp import run as _dummy  # noqa - just to check new_trade_count
+        maybe_create_snapshot(conn, new_trade_count=0)
+        save_csv_if_changed(conn)
+    except Exception as e:
+        print(f"⚠️ Snapshot creation failed: {e}")
+
     # Run changelog
     try:
         from lib.changelog import detect_changes
@@ -169,19 +178,12 @@ def cmd_status(args):
                 total_malformed_rows += max(0, sum(1 for _ in mf) - 1)  # subtract header
         print(f"Malformed rows awaiting repair: {total_malformed_rows} (in data/malformed/)")
 
-    # Mem0
-    try:
-        import mem0  # noqa: F401
-        print("Mem0: configured")
-    except ImportError:
-        print("Mem0: not configured")
+    # Snapshots
+    snap_count = conn.execute("SELECT COUNT(*) FROM pnl_snapshots").fetchone()[0]
+    if snap_count:
+        print(f"PnL snapshots: {snap_count}")
 
     conn.close()
-
-
-def cmd_evaluate(args):
-    from lib.evaluator import run as eval_run
-    eval_run()
 
 
 def cmd_repair(args):
@@ -234,7 +236,6 @@ def main():
     subparsers.add_parser('ingest-sim', help='Ingest Sharp sim xlsx from data/sims/')
     subparsers.add_parser('pnl', help='Display P&L dashboard')
     subparsers.add_parser('status', help='Show system status')
-    subparsers.add_parser('evaluate', help='Run wallet evaluation (requires API keys)')
     subparsers.add_parser('repair', help='Repair malformed rows (requires API key)')
 
     args = parser.parse_args()
@@ -249,7 +250,6 @@ def main():
         'ingest-sim': cmd_ingest_sim,
         'pnl': cmd_pnl,
         'status': cmd_status,
-        'evaluate': cmd_evaluate,
         'repair': cmd_repair,
     }
 

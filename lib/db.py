@@ -204,19 +204,63 @@ def init_db():
             report_path TEXT,
             raw_response TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS pnl_snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            trade_count INTEGER NOT NULL,
+            new_trades_since_last INTEGER NOT NULL,
+            trades_date_from TEXT,
+            trades_date_to TEXT,
+            description TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS pnl_snapshot_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            master_wallet TEXT NOT NULL,
+            game TEXT,
+            filter_game TEXT,
+            total_invested REAL,
+            realized_pnl REAL,
+            unrealized_value REAL,
+            unrealized_pnl REAL,
+            total_pnl REAL,
+            unique_markets INTEGER,
+            total_trades INTEGER,
+            in_csv INTEGER,
+            incomplete_positions INTEGER,
+            sim_number INTEGER,
+            FOREIGN KEY (snapshot_id) REFERENCES pnl_snapshots(snapshot_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_snapshot_data ON pnl_snapshot_data(snapshot_id);
+
+        CREATE TABLE IF NOT EXISTS hidden_wallets (
+            wallet_address TEXT PRIMARY KEY,
+            hidden_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS csv_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            saved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            wallet_count INTEGER NOT NULL,
+            csv_content TEXT NOT NULL,
+            changes_summary TEXT
+        );
     """)
 
     conn.commit()
 
-    # Migration: add columns to existing wallet_pnl tables
-    try:
-        conn.execute("ALTER TABLE wallet_pnl ADD COLUMN unrealized_value REAL NOT NULL DEFAULT 0")
-    except Exception:
-        pass  # column already exists
-    try:
-        conn.execute("ALTER TABLE wallet_pnl ADD COLUMN unrealized_pnl REAL NOT NULL DEFAULT 0")
-    except Exception:
-        pass  # column already exists
+    # Migrations for existing databases
+    migrations = [
+        "ALTER TABLE wallet_pnl ADD COLUMN unrealized_value REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE wallet_pnl ADD COLUMN unrealized_pnl REAL NOT NULL DEFAULT 0",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
     conn.commit()
 
     conn.close()
