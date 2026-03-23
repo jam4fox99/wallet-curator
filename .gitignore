@@ -13,3 +13,4 @@ reports/*.csv
 *.egg-info/
 .DS_Store
 active_wallets.csv
+scratch/

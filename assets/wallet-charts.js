@@ -15,12 +15,12 @@
   function createSeries(chart) {
     const baselineOptions = {
       baseValue: { type: "price", price: 0 },
-      topLineColor: "#23c26b",
-      topFillColor1: "rgba(35, 194, 107, 0.35)",
-      topFillColor2: "rgba(35, 194, 107, 0.05)",
-      bottomLineColor: "#ff5b5b",
-      bottomFillColor1: "rgba(255, 91, 91, 0.22)",
-      bottomFillColor2: "rgba(255, 91, 91, 0.04)",
+      topLineColor: "#2ed47a",
+      topFillColor1: "rgba(46, 212, 122, 0.18)",
+      topFillColor2: "rgba(46, 212, 122, 0.03)",
+      bottomLineColor: "#ff5a67",
+      bottomFillColor1: "rgba(255, 90, 103, 0.16)",
+      bottomFillColor2: "rgba(255, 90, 103, 0.03)",
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: false,
@@ -64,34 +64,35 @@
     const chart = window.LightweightCharts.createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: "solid", color: "#1a1a1a" },
-        textColor: "#9ca3af",
-        fontFamily: '"Manrope", "Avenir Next", "Segoe UI", sans-serif',
+        background: { type: "solid", color: "#12161f" },
+        textColor: "#97a3b7",
+        fontFamily: '"Inter", "Segoe UI", sans-serif',
         attributionLogo: false,
       },
       grid: {
-        vertLines: { color: "rgba(255, 255, 255, 0.06)" },
-        horzLines: { color: "rgba(255, 255, 255, 0.06)" },
+        vertLines: { color: "rgba(255, 255, 255, 0.035)" },
+        horzLines: { color: "rgba(255, 255, 255, 0.035)" },
       },
       rightPriceScale: {
         borderVisible: false,
-        scaleMargins: { top: 0.18, bottom: 0.12 },
+        scaleMargins: { top: 0.14, bottom: 0.1 },
       },
       leftPriceScale: { visible: false },
       timeScale: {
         borderVisible: false,
         timeVisible: true,
         secondsVisible: false,
-        rightOffset: 4,
+        rightOffset: 6,
+        barSpacing: 14,
       },
       crosshair: {
         vertLine: {
-          color: "rgba(148, 163, 184, 0.3)",
-          labelBackgroundColor: "#2563eb",
+          color: "rgba(151, 163, 183, 0.22)",
+          labelBackgroundColor: "#4f8cff",
         },
         horzLine: {
-          color: "rgba(148, 163, 184, 0.3)",
-          labelBackgroundColor: "#2563eb",
+          color: "rgba(151, 163, 183, 0.22)",
+          labelBackgroundColor: "#4f8cff",
         },
       },
       handleScale: {
@@ -146,12 +147,12 @@
       : [];
 
     chartEntry.series.setData(data);
-    chartEntry.chart.applyOptions({
+      chartEntry.chart.applyOptions({
       watermark: {
         visible: data.length === 0,
         text: data.length === 0 ? "No history yet" : "",
-        color: "rgba(255, 255, 255, 0.18)",
-        fontSize: 14,
+        color: "rgba(255, 255, 255, 0.14)",
+        fontSize: 13,
         horzAlign: "center",
         vertAlign: "center",
       },

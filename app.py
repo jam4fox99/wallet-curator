@@ -29,16 +29,19 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 COLORS = {
-    "background": "#0f0f0f",
-    "card": "#1a1a1a",
-    "text": "#e5e5e5",
-    "text_secondary": "#9ca3af",
-    "positive": "#22c55e",
-    "negative": "#ef4444",
-    "border": "#2a2a2a",
-    "button": "#2563eb",
+    "background": "#090b10",
+    "card": "#12161f",
+    "card_alt": "#171c27",
+    "surface_soft": "#0f131b",
+    "text": "#f4f6fb",
+    "text_secondary": "#97a3b7",
+    "positive": "#2ed47a",
+    "negative": "#ff5a67",
+    "border": "#232a36",
+    "border_soft": "#1a202b",
+    "button": "#4f8cff",
 }
-FONT_FAMILY = '"Manrope", "Avenir Next", "Segoe UI", sans-serif'
+FONT_FAMILY = '"Inter", "Segoe UI", sans-serif'
 READ_ONLY_UI = os.environ.get("READ_ONLY_UI") == "1"
 
 RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
@@ -61,7 +64,7 @@ app = dash.Dash(
     __name__,
     external_stylesheets=[
         dbc.themes.DARKLY,
-        "https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap",
+        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap",
     ],
     suppress_callback_exceptions=True,
 )
@@ -109,20 +112,17 @@ def start_scheduler():
     logger.info("Started hourly scheduler")
 
 
-def _card(children):
-    return dbc.Card(
-        dbc.CardBody(children),
-        style={
-            "backgroundColor": COLORS["card"],
-            "border": f"1px solid {COLORS['border']}",
-            "borderRadius": "16px",
-        },
-    )
+def _card(children, class_name=""):
+    classes = "pm-surface"
+    if class_name:
+        classes = f"{classes} {class_name}"
+    return html.Div(children, className=classes)
 
 
 def _range_buttons(prefix):
-    return dbc.ButtonGroup(
-        [dbc.Button(label, id=f"{prefix}-{label}", size="sm", outline=True, color="secondary") for label in RANGES]
+    return html.Div(
+        [html.Button(label, id=f"{prefix}-{label}", className="pm-range-pill", n_clicks=0) for label in RANGES],
+        className="pm-range-pill-group",
     )
 
 
@@ -134,6 +134,42 @@ def _money(value):
 
 def _line_color(value):
     return COLORS["positive"] if value >= 0 else COLORS["negative"]
+
+
+def _status_chip(text, tone="default"):
+    class_name = "pm-status-chip"
+    if tone != "default":
+        class_name = f"{class_name} pm-status-chip--{tone}"
+    return html.Span(text, className=class_name)
+
+
+def _stat_tile(label, value, tone="default"):
+    class_name = "pm-stat-tile"
+    if tone != "default":
+        class_name = f"{class_name} {class_name}--{tone}"
+    return html.Div(
+        [
+            html.Div(label, className="pm-stat-tile__label"),
+            html.Div(value, className="pm-stat-tile__value"),
+        ],
+        className=class_name,
+    )
+
+
+def _brand():
+    return html.Div(
+        [
+            html.Div([html.Span(), html.Span()], className="pm-brand-mark"),
+            html.Div(
+                [
+                    html.Div("Wallet Curator", className="pm-brand-title"),
+                    html.Div("Cloud Portfolio", className="pm-brand-subtitle"),
+                ],
+                className="pm-brand-copy",
+            ),
+        ],
+        className="pm-brand",
+    )
 
 
 def _chart_mount(container_id):
@@ -150,29 +186,46 @@ def _format_chart_range_label(payload, range_key):
         return "Waiting for chart history"
 
     if range_key == "ALL":
-        return (
-            f"Rebased from zero | {start_at.strftime('%b %d, %Y %H:%M')} UTC "
-            f"to {end_at.strftime('%b %d, %Y %H:%M')} UTC"
-        )
+        return f"All-time performance rebased to zero from {start_at.strftime('%b %d, %Y %H:%M')} UTC"
 
     return (
-        f"{range_key} change from zero | {start_at.strftime('%b %d, %H:%M')} UTC "
+        f"{range_key} performance rebased to zero | {start_at.strftime('%b %d, %H:%M')} UTC "
         f"to {end_at.strftime('%b %d, %H:%M')} UTC"
     )
 
 
 def _build_recent_changes(changes):
     if not changes:
-        return html.Div("No wallet changes yet.", style={"color": COLORS["text_secondary"]})
+        return html.Div(
+            [
+                html.Div("No wallet changes yet.", className="pm-empty-state__title"),
+                html.Div(
+                    "The change feed will populate as synced wallets move in or out of the roster.",
+                    className="pm-empty-state__copy",
+                ),
+            ],
+            className="pm-empty-state",
+        )
     items = []
     for row in changes:
         label = "ADDED" if row["action"] == "ADDED" else "REMOVED"
-        color = COLORS["positive"] if row["action"] == "ADDED" else COLORS["negative"]
-        text = f"{label} {row['wallet_address']}"
-        if row["game_filter"]:
-            text += f" ({row['game_filter']})"
-        items.append(html.Div(text, style={"color": color, "marginBottom": "6px"}))
-    return html.Div(items)
+        tone = "positive" if row["action"] == "ADDED" else "negative"
+        items.append(
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span(label, className=f"pm-change-badge pm-change-badge--{tone}"),
+                            html.Span(row["game_filter"] or "No filter", className="pm-change-meta"),
+                        ],
+                        className="pm-change-top",
+                    ),
+                    html.Div(row["wallet_address"], className="pm-change-wallet"),
+                ],
+                className="pm-change-row",
+            )
+        )
+    return html.Div(items, className="pm-changes-list")
 
 
 def _database_error_layout(message):
@@ -183,159 +236,250 @@ def overview_layout():
     today = now_utc().date()
     week_ago = today - timedelta(days=6)
     return html.Div(
-        [
-            dbc.Row(
-                [
-                    dbc.Col(
-                        _card(
-                            [
-                                dbc.Row(
-                                    [
-                                        dbc.Col(html.H4("Portfolio P&L", className="mb-1"), md=7),
-                                        dbc.Col(_range_buttons("overview-range"), md=5, style={"textAlign": "right"}),
-                                    ],
-                                    align="center",
-                                ),
-                                html.Div(id="overview-current-pnl", style={"fontSize": "40px", "fontWeight": "600"}),
-                                html.Div(id="overview-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
-                                _chart_mount("overview-chart-container"),
-                            ]
-                        ),
-                        lg=8,
+        className="pm-page-stack",
+        children=[
+            html.Div(
+                className="pm-overview-grid",
+                children=[
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Portfolio", className="pm-kicker"),
+                                            html.H2("Overview", className="pm-section-title"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    _range_buttons("overview-range"),
+                                ],
+                                className="pm-card-head",
+                            ),
+                            html.Div("Selected Range P&L", className="pm-metric-label"),
+                            html.Div(id="overview-current-pnl", className="pm-metric-value"),
+                            html.Div(id="overview-range-label", className="pm-range-copy"),
+                            html.Div(_chart_mount("overview-chart-container"), className="pm-chart-shell"),
+                        ],
+                        class_name="pm-overview-hero",
                     ),
-                    dbc.Col(
-                        _card(
-                            [
-                                html.Div(
-                                    [
-                                        dbc.Button("Refresh P&L", id="btn-refresh", color="primary", className="me-2"),
-                                        dbc.Button("Show Hidden Wallets", id="btn-hidden", color="secondary", outline=True),
-                                    ],
-                                    className="mb-3",
-                                ),
-                                dbc.Alert(
-                                    "Read-only local UI mode is enabled. Refresh P&L and hide/unhide writes are disabled.",
-                                    color="secondary",
-                                    className="mb-3",
-                                    style={"display": "block" if READ_ONLY_UI else "none"},
-                                ),
-                                html.Div(id="refresh-message", className="mb-3"),
-                                html.H5("Recent Changes"),
-                                html.Div(id="recent-changes"),
-                            ]
-                        ),
-                        lg=4,
+                    html.Div(
+                        className="pm-side-rail",
+                        children=[
+                            _card(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Workspace", className="pm-kicker"),
+                                            html.H3("Controls & Feed", className="pm-side-title"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Button(
+                                                "Refresh P&L",
+                                                id="btn-refresh",
+                                                className="pm-button pm-button--primary",
+                                                n_clicks=0,
+                                            ),
+                                            html.Button(
+                                                "Show Hidden Wallets",
+                                                id="btn-hidden",
+                                                className="pm-button pm-button--secondary",
+                                                n_clicks=0,
+                                            ),
+                                        ],
+                                        className="pm-action-row",
+                                    ),
+                                    dbc.Alert(
+                                        "Read-only local UI mode is enabled. Refresh P&L and hide/unhide writes are disabled.",
+                                        color="secondary",
+                                        className="pm-readonly-alert",
+                                        style={"display": "block" if READ_ONLY_UI else "none"},
+                                    ),
+                                    html.Div(id="refresh-message", className="pm-inline-message"),
+                                    html.Div("Recent changes", className="pm-side-section-title"),
+                                    html.Div(id="recent-changes"),
+                                ],
+                                class_name="pm-side-card",
+                            )
+                        ],
                     ),
                 ],
-                className="g-4 mb-4",
             ),
             _card(
                 [
-                    dbc.Row(
+                    html.Div(
                         [
-                            dbc.Col(html.H4("Daily Breakdown"), md=4),
-                            dbc.Col(
-                                html.Div(
-                                    [
-                                        dbc.Button(
-                                            "Include Wallets Outside Date Range",
-                                            id="btn-outside-range",
-                                            color="secondary",
-                                            outline=True,
-                                            className="me-2",
-                                        ),
-                                        dcc.DatePickerRange(
-                                            id="daily-range",
-                                            start_date=week_ago.isoformat(),
-                                            end_date=today.isoformat(),
-                                            display_format="YYYY-MM-DD",
-                                            className="daily-date-picker",
-                                        ),
-                                    ],
-                                    style={"display": "flex", "justifyContent": "flex-end", "gap": "12px"},
-                                ),
-                                md=8,
-                                style={"textAlign": "right"},
+                            html.Div(
+                                [
+                                    html.Div("Holdings", className="pm-kicker"),
+                                    html.H3("Daily Breakdown", className="pm-section-title"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "Include Wallets Outside Date Range",
+                                        id="btn-outside-range",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Div(
+                                        [
+                                            dcc.Input(
+                                                id="daily-range-start",
+                                                type="date",
+                                                value=week_ago.isoformat(),
+                                                className="pm-date-input",
+                                            ),
+                                            html.Span("\u2192", className="pm-date-range-arrow"),
+                                            dcc.Input(
+                                                id="daily-range-end",
+                                                type="date",
+                                                value=today.isoformat(),
+                                                className="pm-date-input",
+                                            ),
+                                        ],
+                                        className="pm-date-range",
+                                    ),
+                                ],
+                                className="pm-breakdown-controls",
                             ),
                         ],
-                        align="center",
-                        className="mb-3",
+                        className="pm-card-head pm-card-head--tight",
                     ),
-                    html.Div(id="daily-totals", style={"color": COLORS["text_secondary"], "marginBottom": "10px"}),
-                    dcc.Loading(
-                        dash_table.DataTable(
-                            id="daily-table",
-                            columns=TABLE_COLUMNS,
-                            data=[],
-                            sort_action="native",
-                            page_action="none",
-                            fixed_rows={"headers": True},
-                            style_header={
-                                "backgroundColor": COLORS["card"],
-                                "color": COLORS["text"],
-                                "border": f"1px solid {COLORS['border']}",
-                            },
-                            style_cell={
-                                "backgroundColor": COLORS["background"],
-                                "color": COLORS["text"],
-                                "border": f"1px solid {COLORS['border']}",
-                                "padding": "8px",
-                                "fontFamily": FONT_FAMILY,
-                                "fontSize": "14px",
-                                "lineHeight": "1.4",
-                                "whiteSpace": "normal",
-                                "height": "auto",
-                            },
-                            style_cell_conditional=[
-                                {
-                                    "if": {"column_id": "wallet"},
-                                    "minWidth": "340px",
-                                    "width": "340px",
-                                    "maxWidth": "420px",
-                                    "whiteSpace": "nowrap",
-                                },
-                                {"if": {"column_id": "filter"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
-                                {"if": {"column_id": "actual"}, "minWidth": "110px", "width": "110px", "maxWidth": "140px"},
-                            ],
-                            style_table={"overflowX": "auto", "overflowY": "auto", "height": "560px", "maxHeight": "560px"},
-                            style_data_conditional=[],
-                        )
+                    html.Div(id="daily-totals", className="pm-breakdown-summary"),
+                    html.Div(
+                        className="pm-table-shell",
+                        children=[
+                            dcc.Loading(
+                                dash_table.DataTable(
+                                    id="daily-table",
+                                    columns=TABLE_COLUMNS,
+                                    data=[],
+                                    sort_action="native",
+                                    page_action="none",
+                                    fixed_rows={"headers": True},
+                                    style_header={
+                                        "backgroundColor": COLORS["card"],
+                                        "color": COLORS["text_secondary"],
+                                        "border": f"1px solid {COLORS['border']}",
+                                        "fontWeight": "600",
+                                        "textTransform": "uppercase",
+                                        "fontSize": "12px",
+                                        "letterSpacing": "0.04em",
+                                        "whiteSpace": "normal",
+                                        "height": "auto",
+                                    },
+                                    style_cell={
+                                        "backgroundColor": COLORS["surface_soft"],
+                                        "color": COLORS["text"],
+                                        "border": f"1px solid {COLORS['border_soft']}",
+                                        "padding": "14px 12px",
+                                        "fontFamily": FONT_FAMILY,
+                                        "fontSize": "13px",
+                                        "lineHeight": "1.45",
+                                        "whiteSpace": "normal",
+                                        "height": "auto",
+                                    },
+                                    style_cell_conditional=[
+                                        {
+                                            "if": {"column_id": "wallet"},
+                                            "minWidth": "460px",
+                                            "width": "460px",
+                                            "maxWidth": "560px",
+                                            "whiteSpace": "nowrap",
+                                        },
+                                        {"if": {"column_id": "sim"}, "minWidth": "82px", "width": "82px", "maxWidth": "82px"},
+                                        {"if": {"column_id": "filter"}, "minWidth": "132px", "width": "132px", "maxWidth": "150px"},
+                                        {"if": {"column_id": "actual"}, "minWidth": "132px", "width": "132px", "maxWidth": "150px"},
+                                        {"if": {"column_id": "hide"}, "minWidth": "88px", "width": "88px", "maxWidth": "88px"},
+                                        {"if": {"column_id": "invested"}, "minWidth": "150px", "width": "150px", "maxWidth": "170px"},
+                                        {"if": {"column_id": "realized_pnl"}, "minWidth": "160px", "width": "160px", "maxWidth": "176px"},
+                                        {"if": {"column_id": "unrealized_pnl"}, "minWidth": "150px", "width": "150px", "maxWidth": "166px"},
+                                        {"if": {"column_id": "total_pnl"}, "minWidth": "142px", "width": "142px", "maxWidth": "156px"},
+                                        {"if": {"column_id": "markets"}, "minWidth": "140px", "width": "140px", "maxWidth": "150px"},
+                                        {"if": {"column_id": "trades"}, "minWidth": "158px", "width": "158px", "maxWidth": "168px"},
+                                        {"if": {"column_id": "in_csv"}, "minWidth": "96px", "width": "96px", "maxWidth": "96px"},
+                                    ],
+                                    style_table={"overflowX": "auto", "overflowY": "auto", "height": "760px", "maxHeight": "760px"},
+                                    style_data_conditional=[],
+                                )
+                            )
+                        ],
                     ),
-                ]
+                ],
+                class_name="pm-breakdown-card",
             ),
-        ]
+        ],
     )
 
 
 def wallet_layout():
     return html.Div(
-        [
-            _card(
-                [
-                    dbc.Row(
+        className="pm-page-stack",
+        children=[
+            html.Div(
+                className="pm-wallet-grid",
+                children=[
+                    _card(
                         [
-                            dbc.Col(
-                                dcc.Dropdown(id="wallet-dropdown", placeholder="Select wallet..."),
-                                lg=7,
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Wallets", className="pm-kicker"),
+                                            html.H2("Per-Wallet Performance", className="pm-section-title"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    _range_buttons("wallet-range"),
+                                ],
+                                className="pm-card-head",
                             ),
-                            dbc.Col(_range_buttons("wallet-range"), lg=5, style={"textAlign": "right"}),
+                            html.Div(
+                                [
+                                    html.Div("Wallet", className="pm-field-label"),
+                                    html.Div(
+                                        dcc.Dropdown(id="wallet-dropdown", placeholder="Select wallet..."),
+                                        className="pm-wallet-dropdown",
+                                    ),
+                                ],
+                                className="pm-wallet-picker-block",
+                            ),
+                            html.Div("Selected Range P&L", className="pm-metric-label"),
+                            html.Div(id="wallet-current-pnl", className="pm-metric-value pm-metric-value--wallet"),
+                            html.Div(id="wallet-range-label", className="pm-range-copy"),
+                            html.Div(_chart_mount("wallet-chart-container"), className="pm-chart-shell"),
                         ],
-                        className="mb-3",
-                        align="center",
+                        class_name="pm-wallet-hero",
                     ),
-                    html.Div(id="wallet-current-pnl", style={"fontSize": "34px", "fontWeight": "600"}),
-                    html.Div(id="wallet-range-label", style={"color": COLORS["text_secondary"], "marginBottom": "12px"}),
-                    _chart_mount("wallet-chart-container"),
-                    html.Div(id="wallet-stats"),
-                ]
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Wallet Summary", className="pm-kicker"),
+                                    html.H3("Position Context", className="pm-side-title"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(id="wallet-stats"),
+                        ],
+                        class_name="pm-wallet-side",
+                    ),
+                ],
             )
-        ]
+        ],
     )
 
 
 def serve_layout():
-    return dbc.Container(
-        [
+    return html.Div(
+        className="pm-app-shell",
+        children=[
             dcc.Store(id="refresh-token", data=0),
             dcc.Store(id="overview-range", data="ALL"),
             dcc.Store(id="wallet-range", data="ALL"),
@@ -346,33 +490,68 @@ def serve_layout():
             dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
             html.Div(id="overview-chart-signal", style={"display": "none"}),
             html.Div(id="wallet-chart-signal", style={"display": "none"}),
-            dbc.Row(
-                [
-                    dbc.Col(html.H2("Wallet Curator Dashboard", style={"margin": 0}), md=6),
-                    dbc.Col(
-                        html.Div(id="status-bar", style={"textAlign": "right", "color": COLORS["text_secondary"]}),
-                        md=6,
-                    ),
+            html.Header(
+                className="pm-topbar",
+                children=[
+                    html.Div(
+                        [
+                            _brand(),
+                            html.Div(
+                                [
+                                    html.Div("Live Cloud Portfolio", className="pm-header-title"),
+                                    html.Div(
+                                        "Railway-hosted dashboard with VPS trade sync and live wallet performance.",
+                                        className="pm-header-copy",
+                                    ),
+                                ],
+                                className="pm-header-center",
+                            ),
+                            html.Div(id="status-bar", className="pm-status-bar"),
+                        ],
+                        className="pm-topbar-inner",
+                    )
                 ],
-                className="mb-4",
-                align="center",
             ),
-            dbc.Tabs(
-                [
-                    dbc.Tab(label="Portfolio Overview", tab_id="overview"),
-                    dbc.Tab(label="Per-Wallet Charts", tab_id="wallets"),
+            html.Div(
+                className="pm-tab-rail",
+                children=[
+                    dcc.Tabs(
+                        id="tabs",
+                        value="overview",
+                        parent_className="pm-tabs-parent",
+                        className="pm-tabs-shell",
+                        children=[
+                            dcc.Tab(
+                                label="Portfolio Overview",
+                                value="overview",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Per-Wallet Charts",
+                                value="wallets",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                        ],
+                    )
                 ],
-                id="tabs",
-                active_tab="overview",
-                className="mb-4",
             ),
-            html.Div(id="overview-container", children=overview_layout()),
-            html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
+            html.Main(
+                className="pm-main-shell",
+                children=[
+                    html.Div(
+                        className="pm-main-column",
+                        children=[
+                            html.Div(id="overview-container", children=overview_layout()),
+                            html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
+                        ],
+                    )
+                ],
+            ),
         ],
-        fluid=True,
         style={
             "minHeight": "100vh",
-            "padding": "24px",
             "backgroundColor": COLORS["background"],
             "color": COLORS["text"],
             "fontFamily": FONT_FAMILY,
@@ -395,7 +574,7 @@ clientside_callback(
     """,
     Output("overview-chart-signal", "children"),
     Input("overview-chart-data", "data"),
-    Input("tabs", "active_tab"),
+    Input("tabs", "value"),
 )
 
 
@@ -411,13 +590,13 @@ clientside_callback(
     """,
     Output("wallet-chart-signal", "children"),
     Input("wallet-chart-data", "data"),
-    Input("tabs", "active_tab"),
+    Input("tabs", "value"),
 )
 
 
 @callback(
     [Output("overview-container", "style"), Output("wallet-container", "style")],
-    Input("tabs", "active_tab"),
+    Input("tabs", "value"),
 )
 def render_tab(active_tab):
     if active_tab == "wallets":
@@ -451,6 +630,28 @@ def set_wallet_range(*args):
     if not triggered:
         return current
     return triggered.split("-")[-1]
+
+
+@callback(
+    [Output(f"overview-range-{label}", "className") for label in RANGES],
+    Input("overview-range", "data"),
+)
+def style_overview_range_buttons(active_range):
+    return [
+        "pm-range-pill pm-range-pill--active" if label == active_range else "pm-range-pill"
+        for label in RANGES
+    ]
+
+
+@callback(
+    [Output(f"wallet-range-{label}", "className") for label in RANGES],
+    Input("wallet-range", "data"),
+)
+def style_wallet_range_buttons(active_range):
+    return [
+        "pm-range-pill pm-range-pill--active" if label == active_range else "pm-range-pill"
+        for label in RANGES
+    ]
 
 
 @callback(
@@ -491,35 +692,51 @@ def update_overview(_, range_key, __):
         payload = get_chart_payload(conn, wallet=None, range_key=range_key)
         sync = summary["sync"]
         latest = payload["current_delta_pnl"]
+        status_chips = []
         if sync:
-            last_sync = parse_db_timestamp(sync["last_sync_at"]).strftime("%Y-%m-%d %H:%M UTC")
-            status = (
-                f"Syncing from: {sync['current_version_folder'] or 'unknown'} | "
-                f"Last sync: {last_sync} | Trades: {summary['total_trades']:,}"
+            last_sync_at = parse_db_timestamp(sync["last_sync_at"])
+            last_sync = last_sync_at.strftime("%Y-%m-%d %H:%M UTC") if last_sync_at else "Unknown"
+            status_chips.extend(
+                [
+                    _status_chip(f"Sync source {sync['current_version_folder'] or 'unknown'}"),
+                    _status_chip(f"Last sync {last_sync}"),
+                    _status_chip(f"{summary['total_trades']:,} trades"),
+                ]
             )
         else:
-            status = f"Trades: {summary['total_trades']:,} | Waiting for first VPS sync"
+            status_chips.extend(
+                [
+                    _status_chip("Waiting for first VPS sync", tone="warning"),
+                    _status_chip(f"{summary['total_trades']:,} trades"),
+                ]
+            )
         if READ_ONLY_UI:
-            status += " | Local read-only mode"
-        if summary["latest_pipeline"] and summary["latest_pipeline"]["error"]:
-            status += f" | Pipeline warning: {summary['latest_pipeline']['error']}"
+            status_chips.append(_status_chip("Local read-only", tone="info"))
+        latest_pipeline = summary["latest_pipeline"]
+        if latest_pipeline and latest_pipeline["error"]:
+            status_chips.append(_status_chip(f"Pipeline warning {latest_pipeline['error']}", tone="danger"))
+        elif latest_pipeline:
+            status_chips.append(_status_chip("Pipeline healthy", tone="success"))
         changes = _build_recent_changes(get_recent_changes(conn, limit=8))
         conn.close()
         return (
-            status,
+            html.Div(status_chips, className="pm-status-chip-row"),
             payload,
             _money(latest),
-            {"fontSize": "40px", "fontWeight": "600", "color": _line_color(latest)},
+            {"color": _line_color(latest)},
             _format_chart_range_label(payload, range_key),
             changes,
         )
     except Exception as exc:
         logger.exception("Failed to load overview")
         return (
-            f"Database unavailable: {exc}",
+            html.Div(
+                [_status_chip("Database unavailable", tone="danger"), html.Span(str(exc), className="pm-status-error")],
+                className="pm-status-chip-row",
+            ),
             None,
             "Database unavailable",
-            {"fontSize": "32px", "fontWeight": "600", "color": COLORS["negative"]},
+            {"color": COLORS["negative"]},
             "",
             _database_error_layout(str(exc)),
         )
@@ -534,8 +751,8 @@ def update_overview(_, range_key, __):
         Output("btn-outside-range", "children"),
     ],
     [
-        Input("daily-range", "start_date"),
-        Input("daily-range", "end_date"),
+        Input("daily-range-start", "value"),
+        Input("daily-range-end", "value"),
         Input("show-hidden", "data"),
         Input("include-outside-range", "data"),
         Input("refresh-token", "data"),
@@ -584,15 +801,19 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
             },
         ]
         roster_label = "Outside-range wallets included" if include_outside_range else "In-range wallets only"
-        totals_text = (
-            f"Date range: {start_date} to {end_date} UTC | "
-            f"Showing {len(breakdown['rows'])} wallets | {roster_label}. "
-            f"Totals (excluding hidden wallets in table view): Invested {_money(breakdown['totals']['invested'])} | "
-            f"Realized {_money(breakdown['totals']['realized'])} | "
-            f"Unrealized {_money(breakdown['totals']['unrealized'])} | "
-            f"Total {_money(breakdown['totals']['total'])}. "
-            f"True total incl. hidden: {_money(breakdown['true_totals']['total'])}. "
-            f"Trades and markets columns are range-scoped; the header trade count is all-time."
+        totals_text = html.Div(
+            [
+                html.Span(f"Date range {start_date} to {end_date} UTC"),
+                html.Span(f"Showing {len(breakdown['rows'])} wallets"),
+                html.Span(roster_label),
+                html.Span(f"Invested {_money(breakdown['totals']['invested'])}"),
+                html.Span(f"Realized {_money(breakdown['totals']['realized'])}"),
+                html.Span(f"Unrealized {_money(breakdown['totals']['unrealized'])}"),
+                html.Span(f"Table total {_money(breakdown['totals']['total'])}"),
+                html.Span(f"True total incl. hidden {_money(breakdown['true_totals']['total'])}"),
+                html.Span("Trades and markets columns are range-scoped"),
+            ],
+            className="pm-summary-strip",
         )
         button_label = "Hide Hidden Wallets" if show_hidden else "Show Hidden Wallets"
         range_button_label = (
@@ -603,7 +824,7 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
         return breakdown["rows"], style, totals_text, button_label, range_button_label
     except Exception as exc:
         logger.exception("Failed to load daily table")
-        return [], [], f"Daily table unavailable: {exc}", "Show Hidden Wallets", "Include Wallets Outside Date Range"
+        return [], [], html.Div(f"Daily table unavailable: {exc}"), "Show Hidden Wallets", "Include Wallets Outside Date Range"
 
 
 @callback(
@@ -693,41 +914,54 @@ def load_wallet_options(_, current_wallet):
 )
 def update_wallet_view(wallet, range_key, _):
     if not wallet:
-        return None, "Select a wallet", {"fontSize": "28px"}, "", ""
+        return None, "Select a wallet", {"color": COLORS["text_secondary"]}, "", ""
     try:
         conn = get_connection()
         payload = get_chart_payload(conn, wallet=wallet, range_key=range_key)
         stats = get_wallet_stats(conn, wallet)
         conn.close()
         if not stats:
-            return None, "No data", {"fontSize": "28px"}, "", ""
+            return None, "No data", {"color": COLORS["text_secondary"]}, "", ""
 
         current = payload["current_delta_pnl"]
+        realized_tone = "positive" if stats["realized"] > 0 else "negative" if stats["realized"] < 0 else "default"
+        unrealized_tone = "positive" if stats["unrealized"] > 0 else "negative" if stats["unrealized"] < 0 else "default"
         stat_block = html.Div(
             [
                 html.Div(
-                    f"Invested: {_money(stats['invested'])} | Realized: {_money(stats['realized'])} | "
-                    f"Unrealized: {_money(stats['unrealized'])}",
-                    className="mb-1",
+                    [
+                        _stat_tile("Wallet", stats["wallet"]),
+                        _stat_tile("Filter", stats["filter"]),
+                        _stat_tile("Actual", stats["game"]),
+                        _stat_tile("Invested", _money(stats["invested"])),
+                        _stat_tile("Realized", _money(stats["realized"]), tone=realized_tone),
+                        _stat_tile("Unrealized", _money(stats["unrealized"]), tone=unrealized_tone),
+                        _stat_tile("Markets", f"{stats['markets']}"),
+                        _stat_tile("Trades", f"{stats['trades']}"),
+                        _stat_tile("Excluded", f"{stats['excluded_positions']}"),
+                    ],
+                    className="pm-wallet-stat-grid",
                 ),
                 html.Div(
-                    f"Filter: {stats['filter']} | Actual: {stats['game']} | Markets: {stats['markets']} | "
-                    f"Trades: {stats['trades']} | Excluded positions: {stats['excluded_positions']}",
-                    style={"color": COLORS["text_secondary"]},
+                    [
+                        html.Span(f"First trade {stats['first_trade'] or '-'}"),
+                        html.Span(f"Last trade {stats['last_trade'] or '-'}"),
+                    ],
+                    className="pm-wallet-meta-strip",
                 ),
             ],
-            style={"marginTop": "12px"},
+            className="pm-wallet-summary",
         )
         return (
             payload,
             _money(current),
-            {"fontSize": "34px", "fontWeight": "600", "color": _line_color(current)},
+            {"color": _line_color(current)},
             _format_chart_range_label(payload, range_key),
             stat_block,
         )
     except Exception as exc:
         logger.exception("Failed to load wallet view")
-        return None, str(exc), {"fontSize": "28px"}, "", ""
+        return None, str(exc), {"color": COLORS["negative"]}, "", ""
 
 
 start_scheduler()
