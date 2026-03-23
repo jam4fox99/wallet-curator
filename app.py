@@ -846,13 +846,14 @@ def wallet_management_layout():
             html.Div(id="wallet-management-sections", className="pm-page-stack"),
             dbc.Modal(
                 [
-                    dbc.ModalHeader(dbc.ModalTitle("Add New Wallet")),
+                    dbc.ModalHeader(dbc.ModalTitle("Add Wallets")),
                     dbc.ModalBody(
                         [
-                            html.Div("Paste full Sharp CSV line", className="pm-field-label"),
+                            html.Div("Paste Sharp CSV lines (one wallet per line)", className="pm-field-label"),
                             dcc.Textarea(
                                 id="add-wallet-line",
                                 className="pm-textarea",
+                                placeholder="0xabc123...,true,true,true,200,...\n0xdef456...,true,true,true,200,...",
                                 style={"width": "100%", "minHeight": "160px"},
                             ),
                             html.Div("Assign tier", className="pm-field-label"),
@@ -873,7 +874,7 @@ def wallet_management_layout():
                     dbc.ModalFooter(
                         [
                             html.Button("Cancel", id="btn-cancel-add-wallet", className="pm-button pm-button--secondary", n_clicks=0),
-                            html.Button("Queue Wallet", id="btn-submit-add-wallet", className="pm-button pm-button--primary", n_clicks=0),
+                            html.Button("Queue Wallets", id="btn-submit-add-wallet", className="pm-button pm-button--primary", n_clicks=0),
                         ]
                     ),
                 ],
@@ -1557,7 +1558,7 @@ def handle_remove_pending_change(clicks, wallet_admin_token):
     ],
     prevent_initial_call=True,
 )
-def handle_add_wallet_modal(_, __, submit_clicks, is_open, raw_line, tier_name, wallet_admin_token):
+def handle_add_wallet_modal(_, __, submit_clicks, is_open, raw_lines, tier_name, wallet_admin_token):
     triggered = dash.callback_context.triggered_id
     if triggered == "btn-open-add-wallet":
         return True, "", no_update, no_update
@@ -1568,19 +1569,40 @@ def handle_add_wallet_modal(_, __, submit_clicks, is_open, raw_line, tier_name, 
             return True, dbc.Alert("Wallet writes are disabled in local read-only mode.", color="secondary"), no_update, no_update
         if not submit_clicks:
             return is_open, no_update, no_update, no_update
-        try:
-            conn = get_connection()
-            result = add_wallet_from_csv_line(conn, raw_line or "", tier_name)
-            conn.close()
-            return (
-                False,
-                dbc.Alert(f"Queued new wallet {result['wallet_address']} at {result['to_tier'].replace('_', ' ').title()}.", color="success"),
-                "",
-                wallet_admin_token + 1,
-            )
-        except Exception as exc:
-            logger.exception("Failed to add wallet")
-            return True, dbc.Alert(str(exc), color="danger"), no_update, no_update
+
+        lines = [l.strip() for l in (raw_lines or "").split("\n") if l.strip()]
+        if not lines:
+            return True, dbc.Alert("Paste at least one CSV line.", color="warning"), no_update, no_update
+
+        added = []
+        errors = []
+        conn = get_connection()
+        for line in lines:
+            try:
+                result = add_wallet_from_csv_line(conn, line, tier_name)
+                added.append(result["wallet_address"][:12] + "...")
+            except Exception as exc:
+                errors.append(f"{line[:20]}...: {exc}")
+        conn.close()
+
+        messages = []
+        if added:
+            messages.append(dbc.Alert(
+                f"Queued {len(added)} wallet(s) at {tier_name.replace('_', ' ').title()}: {', '.join(added)}",
+                color="success",
+            ))
+        if errors:
+            messages.append(dbc.Alert(
+                html.Div([html.Div(e) for e in errors]),
+                color="danger",
+            ))
+
+        return (
+            False if not errors else True,
+            html.Div(messages),
+            "" if not errors else no_update,
+            wallet_admin_token + 1 if added else no_update,
+        )
     return is_open, no_update, no_update, no_update
 
 

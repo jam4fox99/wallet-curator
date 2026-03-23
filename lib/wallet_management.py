@@ -520,6 +520,11 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
         )
 
     # Removed wallets from promotion history
+    # Build a fallback game lookup from wallet_pnl for removed wallets
+    pnl_games = {}
+    for r in conn.execute("SELECT master_wallet, game FROM wallet_pnl WHERE game IS NOT NULL").fetchall():
+        pnl_games[r["master_wallet"]] = r["game"]
+
     removed_rows = conn.execute(
         """
         SELECT wallet_address, from_tier, action_at,
@@ -534,8 +539,10 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
     removed_wallets = []
     for row in removed_rows:
         removed_at = parse_db_timestamp(row["action_at"]) if row["action_at"] else now_utc()
+        wallet = row["wallet_address"]
+        game = game_filters.get(wallet) or pnl_games.get(wallet) or "UNKNOWN"
         removed_wallets.append({
-            "wallet_address": row["wallet_address"],
+            "wallet_address": wallet,
             "from_tier": row["from_tier"],
             "removed_at": removed_at.strftime("%Y-%m-%d %H:%M UTC"),
             "total_pnl": round(float(row["total_pnl_at_action"] or 0), 2),
@@ -543,7 +550,7 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
             "total_trades": int(row["total_trades_at_action"] or 0),
             "unique_markets": int(row["unique_markets_at_action"] or 0),
             "days_active": int(row["days_active_at_action"] or 0),
-            "game_filter": game_filters.get(row["wallet_address"], "UNKNOWN"),
+            "game_filter": game,
         })
 
     return {
