@@ -336,58 +336,112 @@ def _pending_change_card(change, removable=False, render_token=None):
     )
 
 
-def _render_management_wallet(wallet, tier_name, render_token):
-    total_tone = "positive" if wallet["total_pnl"] > 0 else "negative" if wallet["total_pnl"] < 0 else "default"
-    since_tone = "positive" if (wallet["since_promo_pnl"] or 0) > 0 else "negative" if (wallet["since_promo_pnl"] or 0) < 0 else "default"
+def _pnl_cell(value):
+    """Format a P&L value with color."""
+    if value is None:
+        return html.Td("—", className="pm-tier-table__cell")
+    color = "#22c55e" if value > 0 else "#ef4444" if value < 0 else "#e5e5e5"
+    return html.Td(f"${value:,.2f}", style={"color": color}, className="pm-tier-table__cell")
+
+
+def _render_wallet_row(wallet, tier_name, render_token):
+    """Render a single wallet as a table row with inline action buttons."""
     actions = []
     if tier_name != "high_conviction":
-        actions.append(_wallet_action_button("Promote ▲", "promote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
+        actions.append(_wallet_action_button("▲", "promote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
     if tier_name != "test":
-        actions.append(_wallet_action_button("Demote ▼", "demote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
-    actions.append(_wallet_action_button("Remove ✕", "remove", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
+        actions.append(_wallet_action_button("▼", "demote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
+    actions.append(_wallet_action_button("✕", "remove", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
 
-    chips = [
-        _metric_chip("Game", wallet["game"]),
-        _metric_chip("All-Time P&L", _money(wallet["total_pnl"]), tone=total_tone),
-        _metric_chip("Markets", str(wallet["unique_markets"])),
-        _metric_chip("Trades", str(wallet["total_trades"])),
-        _metric_chip("Days Active", str(wallet["days_active"])),
-    ]
-    if tier_name != "test":
-        chips.extend(
-            [
-                _metric_chip("Since Tier", _money(wallet["since_promo_pnl"] or 0), tone=since_tone),
-                _metric_chip("At Tier Entry", _money(wallet["at_promo_pnl"] or 0)),
-                _metric_chip("Days In Tier", str(wallet["days_in_tier"])),
-            ]
-        )
+    since_promo = wallet.get("since_promo_pnl")
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(wallet["wallet_address"], className="pm-wallet-admin-card__wallet"),
-                    html.Div(wallet["game_filter"], className="pm-wallet-admin-card__filter"),
-                ],
-                className="pm-wallet-admin-card__header",
-            ),
-            html.Div(chips, className="pm-wallet-admin-card__metrics"),
-            html.Div(actions, className="pm-wallet-admin-card__actions"),
-        ],
-        className="pm-wallet-admin-card",
+    return html.Tr([
+        html.Td(wallet["wallet_address"], className="pm-tier-table__cell pm-tier-table__wallet"),
+        html.Td(wallet["game_filter"], className="pm-tier-table__cell"),
+        _pnl_cell(wallet["total_pnl"]),
+        _pnl_cell(since_promo),
+        html.Td(str(wallet["days_active"]), className="pm-tier-table__cell"),
+        html.Td(str(wallet["days_in_tier"]), className="pm-tier-table__cell"),
+        html.Td(str(wallet["unique_markets"]), className="pm-tier-table__cell"),
+        html.Td(str(wallet["total_trades"]), className="pm-tier-table__cell"),
+        html.Td(html.Div(actions, style={"display": "flex", "gap": "4px"}), className="pm-tier-table__cell"),
+    ], className="pm-tier-table__row")
+
+
+def _sortable_th(label, sort_type="text"):
+    """Create a sortable table header."""
+    props = {"data-sortable": "true", "data-sort-dir": "none"}
+    if sort_type == "number":
+        props["data-sort-type"] = "number"
+    return html.Th(label, className="pm-tier-table__th", **props)
+
+
+def _tier_table(wallets, tier_name, render_token):
+    """Build an HTML table for a tier's wallets."""
+    header = html.Tr([
+        _sortable_th("Wallet"),
+        _sortable_th("Game"),
+        _sortable_th("All-Time P&L", "number"),
+        _sortable_th("Since Promo", "number"),
+        _sortable_th("Days Active", "number"),
+        _sortable_th("Days In Tier", "number"),
+        _sortable_th("Markets", "number"),
+        _sortable_th("Trades", "number"),
+        html.Th("Actions", className="pm-tier-table__th"),
+    ])
+    rows = [_render_wallet_row(w, tier_name, render_token) for w in wallets]
+    return html.Table(
+        [html.Thead(header), html.Tbody(rows)],
+        className="pm-tier-table",
     )
+
+
+def _render_removed_section(removed_wallets):
+    """Render the Removed wallets section."""
+    header = html.Tr([
+        _sortable_th("Wallet"),
+        _sortable_th("Game"),
+        _sortable_th("Was In Tier"),
+        _sortable_th("P&L At Removal", "number"),
+        _sortable_th("Days Active", "number"),
+        _sortable_th("Markets", "number"),
+        _sortable_th("Trades", "number"),
+        _sortable_th("Removed At"),
+    ])
+    rows = []
+    for w in removed_wallets:
+        rows.append(html.Tr([
+            html.Td(w["wallet_address"], className="pm-tier-table__cell pm-tier-table__wallet"),
+            html.Td(w["game_filter"], className="pm-tier-table__cell"),
+            html.Td((w["from_tier"] or "").replace("_", " ").title(), className="pm-tier-table__cell"),
+            _pnl_cell(w["total_pnl"]),
+            html.Td(str(w["days_active"]), className="pm-tier-table__cell"),
+            html.Td(str(w["unique_markets"]), className="pm-tier-table__cell"),
+            html.Td(str(w["total_trades"]), className="pm-tier-table__cell"),
+            html.Td(w["removed_at"], className="pm-tier-table__cell"),
+        ], className="pm-tier-table__row"))
+
+    table = html.Table([html.Thead(header), html.Tbody(rows)], className="pm-tier-table") if rows else html.Div("No removed wallets.", className="pm-empty-state__copy")
+
+    return _card([
+        html.Div([
+            html.Div([
+                html.Div("History", className="pm-kicker"),
+                html.H3("Removed", className="pm-section-title"),
+            ], className="pm-card-title-block"),
+            html.Div(f"{len(removed_wallets)} wallets", className="pm-section-side-note"),
+        ], className="pm-card-head pm-card-head--tight"),
+        table,
+    ], class_name="pm-admin-card")
 
 
 def _render_management_sections(snapshot):
     render_token = snapshot.get("render_token", "stable")
     sections = []
     for tier in snapshot["tiers"]:
-        rows = tier["wallets"]
-        if rows:
-            body = html.Div(
-                [_render_management_wallet(wallet, tier["tier_name"], render_token) for wallet in rows],
-                className="pm-wallet-admin-grid",
-            )
+        wallets = tier["wallets"]
+        if wallets:
+            body = _tier_table(wallets, tier["tier_name"], render_token)
         else:
             body = html.Div("No wallets in this tier.", className="pm-empty-state__copy")
         sections.append(
@@ -405,7 +459,7 @@ def _render_management_sections(snapshot):
                                 ],
                                 className="pm-card-title-block",
                             ),
-                            html.Div(f"{len(rows)} wallets", className="pm-section-side-note"),
+                            html.Div(f"{len(wallets)} wallets", className="pm-section-side-note"),
                         ],
                         className="pm-card-head pm-card-head--tight",
                     ),
@@ -414,6 +468,12 @@ def _render_management_sections(snapshot):
                 class_name="pm-admin-card",
             )
         )
+
+    # Removed wallets section
+    removed = snapshot.get("removed_wallets", [])
+    if removed:
+        sections.append(_render_removed_section(removed))
+
     return sections
 
 

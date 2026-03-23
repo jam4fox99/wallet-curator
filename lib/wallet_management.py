@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 from lib.csv_builder import load_current_csv_state, row_to_line, set_row_copy_percentage, validate_wallet_csv_line
 from lib.normalizers import normalize_game, normalize_wallet
@@ -7,10 +7,22 @@ from lib.time_utils import now_utc, parse_db_timestamp, to_db_timestamp
 
 TIERS = ["test", "promoted", "high_conviction"]
 ENTRY_ACTIONS = {"added", "promoted", "demoted"}
+CHANGE_TO_HISTORY_ACTION = {
+    "promote": "promoted",
+    "demote": "demoted",
+    "add": "added",
+    "remove": "removed",
+}
 
 
 def _json_dump(value):
-    return json.dumps(value, sort_keys=True)
+    return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+def _json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def _json_load(value):
@@ -41,11 +53,50 @@ def get_tier_map(conn):
     return {row["tier_name"]: row for row in get_tier_configs(conn)}
 
 
+def _canonical_wallet_rows(conn):
+    csv_state = load_current_csv_state(conn)
+    rows = []
+    for index, row in enumerate(csv_state.get("wallet_rows") or []):
+        wallet_address = normalize_wallet(row.get("address", ""))
+        if not wallet_address or wallet_address == "__global__":
+            continue
+        whitelist = row.get("market_whitelist", "") or ""
+        rows.append(
+            {
+                "wallet_address": wallet_address,
+                "market_whitelist": whitelist,
+                "game_filter": normalize_game(whitelist, source="whitelist"),
+                "row_order": index,
+                "copy_percentage": parse_float_or_none(row.get("copy_percentage")),
+                "copy_percentage_enabled": 1
+                if str(row.get("copy_percentage_enabled", "")).strip().lower() == "true"
+                else 0,
+                "raw_csv_line": row_to_line(csv_state["header"], row) if csv_state.get("header") else "",
+            }
+        )
+    return rows
+
+
+def parse_float_or_none(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _get_game_filter_map(conn):
     rows = conn.execute(
         "SELECT wallet_address, game_filter FROM synced_active_wallets ORDER BY wallet_address"
     ).fetchall()
-    return {row["wallet_address"]: row["game_filter"] or "UNKNOWN" for row in rows}
+    mapping = {row["wallet_address"]: row["game_filter"] or "UNKNOWN" for row in rows}
+    for row in _canonical_wallet_rows(conn):
+        mapping.setdefault(row["wallet_address"], row["game_filter"] or "UNKNOWN")
+    return mapping
 
 
 def _wallet_snapshot(conn, wallet_address):
@@ -238,7 +289,7 @@ def _insert_pending_change(conn, wallet_address, change_type, details, created_a
         (wallet_address, change_type, _json_dump(details), created_at),
     )
     pending_change_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
-    if pending_change_id is None:
+    if not pending_change_id:
         pending_change_id = conn.execute("SELECT MAX(id) FROM pending_changes").fetchone()[0]
     return pending_change_id, created_at
 
@@ -292,9 +343,13 @@ def bootstrap_existing_wallet_tiers(conn):
     if existing:
         return 0
 
-    rows = conn.execute(
-        "SELECT wallet_address FROM synced_active_wallets ORDER BY COALESCE(row_order, 999999), wallet_address"
-    ).fetchall()
+    canonical_rows = _canonical_wallet_rows(conn)
+    rows = canonical_rows or [
+        {"wallet_address": row["wallet_address"]}
+        for row in conn.execute(
+            "SELECT wallet_address FROM synced_active_wallets ORDER BY COALESCE(row_order, 999999), wallet_address"
+        ).fetchall()
+    ]
     if not rows:
         return 0
 
@@ -349,6 +404,42 @@ def get_pending_changes(conn, only_unpushed=True):
             }
         )
     return pending
+
+
+def reconstruct_pre_pending_state(current_wallet_tiers, current_tier_config, pending):
+    wallet_map = {row["wallet_address"]: dict(row) for row in current_wallet_tiers}
+    tier_map = {row["tier_name"]: dict(row) for row in current_tier_config}
+
+    for change in reversed(pending):
+        details = change["details"] or {}
+        wallet = change["wallet_address"]
+        change_type = change["change_type"]
+
+        if change_type == "add":
+            wallet_map.pop(wallet, None)
+            continue
+
+        if change_type == "remove":
+            previous = details.get("previous_wallet_tier")
+            if previous:
+                wallet_map[wallet] = dict(previous)
+            continue
+
+        if change_type in {"promote", "demote"}:
+            previous = details.get("previous_wallet_tier")
+            if previous:
+                wallet_map[wallet] = dict(previous)
+            continue
+
+        if change_type == "update_tier_config":
+            tier_name = details["tier_name"]
+            if tier_name in tier_map:
+                tier_map[tier_name]["copy_percentage"] = float(details["old_copy_pct"])
+
+    return (
+        sorted(wallet_map.values(), key=lambda row: row["wallet_address"]),
+        sorted(tier_map.values(), key=lambda row: (row["sort_order"], row["tier_name"])),
+    )
 
 
 def get_wallet_management_snapshot(conn, bootstrap=True):
@@ -428,13 +519,166 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
             }
         )
 
+    # Removed wallets from promotion history
+    removed_rows = conn.execute(
+        """
+        SELECT wallet_address, from_tier, action_at,
+               total_pnl_at_action, realized_pnl_at_action, unrealized_pnl_at_action,
+               total_invested_at_action, total_trades_at_action, unique_markets_at_action,
+               days_active_at_action
+        FROM promotion_history
+        WHERE action = 'removed'
+        ORDER BY action_at DESC
+        """
+    ).fetchall()
+    removed_wallets = []
+    for row in removed_rows:
+        removed_at = parse_db_timestamp(row["action_at"]) if row["action_at"] else now_utc()
+        removed_wallets.append({
+            "wallet_address": row["wallet_address"],
+            "from_tier": row["from_tier"],
+            "removed_at": removed_at.strftime("%Y-%m-%d %H:%M UTC"),
+            "total_pnl": round(float(row["total_pnl_at_action"] or 0), 2),
+            "realized_pnl": round(float(row["realized_pnl_at_action"] or 0), 2),
+            "total_trades": int(row["total_trades_at_action"] or 0),
+            "unique_markets": int(row["unique_markets_at_action"] or 0),
+            "days_active": int(row["days_active_at_action"] or 0),
+            "game_filter": game_filters.get(row["wallet_address"], "UNKNOWN"),
+        })
+
     return {
         "tiers": tier_sections,
         "pending_changes": pending,
         "pending_count": len(pending),
         "pending_push": pending_push,
         "bootstrap_count": bootstrap_count,
+        "render_token": to_db_timestamp(now_utc()),
+        "removed_wallets": removed_wallets,
     }
+
+
+def _replay_pending_change(conn, change):
+    details = change["details"] or {}
+    wallet_address = normalize_wallet(change["wallet_address"])
+    change_type = change["change_type"]
+    created_at = to_db_timestamp(change["created_at"] or now_utc())
+    pending_change_id, created_at = _insert_pending_change(
+        conn,
+        wallet_address,
+        change_type,
+        details,
+        created_at=created_at,
+    )
+
+    if change_type == "add":
+        conn.execute(
+            """
+            INSERT INTO wallet_tiers (wallet_address, tier_name, assigned_at, assigned_from)
+            VALUES (?, ?, ?, 'new')
+            """,
+            (wallet_address, details["to_tier"], created_at),
+        )
+        _insert_promotion_history(
+            conn,
+            wallet_address,
+            "added",
+            None,
+            details["to_tier"],
+            details.get("snapshot") or _wallet_snapshot(conn, wallet_address),
+            None,
+            details["new_copy_pct"],
+            created_at,
+            pending_change_id=pending_change_id,
+        )
+        return
+
+    if change_type == "remove":
+        conn.execute("DELETE FROM wallet_tiers WHERE wallet_address = ?", (wallet_address,))
+        _insert_promotion_history(
+            conn,
+            wallet_address,
+            "removed",
+            details.get("from_tier"),
+            None,
+            details.get("snapshot") or _wallet_snapshot(conn, wallet_address),
+            details.get("old_copy_pct"),
+            None,
+            created_at,
+            pending_change_id=pending_change_id,
+        )
+        return
+
+    if change_type in {"promote", "demote"}:
+        conn.execute(
+            """
+            UPDATE wallet_tiers
+            SET tier_name = ?, assigned_at = ?, assigned_from = ?
+            WHERE wallet_address = ?
+            """,
+            (details["to_tier"], created_at, details["from_tier"], wallet_address),
+        )
+        _insert_promotion_history(
+            conn,
+            wallet_address,
+            CHANGE_TO_HISTORY_ACTION[change_type],
+            details.get("from_tier"),
+            details.get("to_tier"),
+            details.get("snapshot") or _wallet_snapshot(conn, wallet_address),
+            details.get("old_copy_pct"),
+            details.get("new_copy_pct"),
+            created_at,
+            pending_change_id=pending_change_id,
+        )
+        return
+
+    if change_type == "update_tier_config":
+        conn.execute(
+            "UPDATE tier_config SET copy_percentage = ?, updated_at = ? WHERE tier_name = ?",
+            (details["new_copy_pct"], to_db_timestamp(now_utc()), details["tier_name"]),
+        )
+        return
+
+    raise ValueError(f"Unsupported pending change type: {change_type}")
+
+
+def remove_pending_change(conn, pending_change_id):
+    pending = get_pending_changes(conn, only_unpushed=True)
+    target = next((change for change in pending if int(change["id"]) == int(pending_change_id)), None)
+    if not target:
+        raise ValueError("Queued change not found.")
+
+    current_wallet_tiers = serialize_wallet_tiers_snapshot(conn)
+    current_tier_config = serialize_tier_config_snapshot(conn)
+    baseline_wallet_tiers, baseline_tier_config = reconstruct_pre_pending_state(
+        current_wallet_tiers,
+        current_tier_config,
+        pending,
+    )
+
+    pending_ids = [int(change["id"]) for change in pending]
+    if pending_ids:
+        placeholders = ",".join(["?"] * len(pending_ids))
+        conn.execute(
+            f"DELETE FROM promotion_history WHERE pending_change_id IN ({placeholders})",
+            tuple(pending_ids),
+        )
+        conn.execute(
+            f"DELETE FROM pending_changes WHERE id IN ({placeholders})",
+            tuple(pending_ids),
+        )
+
+    restore_wallet_tiers_snapshot(conn, baseline_wallet_tiers)
+    restore_tier_config_snapshot(conn, baseline_tier_config)
+
+    remaining = []
+    for change in pending:
+        if int(change["id"]) == int(pending_change_id):
+            continue
+        _replay_pending_change(conn, change)
+        remaining.append(change)
+
+    conn.commit()
+    return {"removed_change": target, "remaining_count": len(remaining)}
 
 
 def promote_or_demote_wallet(conn, wallet_address, direction):

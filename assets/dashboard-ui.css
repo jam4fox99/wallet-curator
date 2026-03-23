@@ -459,6 +459,18 @@ a {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.pm-button--danger {
+  color: #ffb4bc;
+  background: rgba(255, 90, 103, 0.08);
+  border-color: rgba(255, 90, 103, 0.22);
+}
+
+.pm-button--danger:hover {
+  color: #ffd7dc;
+  background: rgba(255, 90, 103, 0.14);
+  border-color: rgba(255, 90, 103, 0.34);
+}
+
 .pm-inline-message {
   margin-top: 14px;
 }
@@ -980,6 +992,20 @@ input.pm-date-input,
   align-items: center;
 }
 
+.pm-history-row__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pm-history-row__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
 .pm-history-row__meta {
   color: var(--pm-text-secondary);
   font-size: 12px;
@@ -1084,4 +1110,73 @@ input.pm-date-input,
   .pm-metric-value {
     font-size: 42px;
   }
+}
+
+/* ── Tier Tables (Wallet Management) ── */
+.pm-tier-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 13px;
+}
+
+.pm-tier-table__th {
+  padding: 10px 12px;
+  text-align: left;
+  color: var(--pm-text-secondary);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--pm-border);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pm-tier-table__th:hover {
+  color: var(--pm-text);
+}
+
+.pm-tier-table__th::after {
+  content: " ⇅";
+  opacity: 0.3;
+  font-size: 10px;
+}
+
+.pm-tier-table__th.pm-sort-asc::after {
+  content: " ▲";
+  opacity: 1;
+}
+
+.pm-tier-table__th.pm-sort-desc::after {
+  content: " ▼";
+  opacity: 1;
+}
+
+.pm-tier-table__row {
+  border-bottom: 1px solid var(--pm-border-soft);
+  transition: background 0.15s;
+}
+
+.pm-tier-table__row:hover {
+  background: var(--pm-surface-alt);
+}
+
+.pm-tier-table__cell {
+  padding: 10px 12px;
+  color: var(--pm-text);
+  white-space: nowrap;
+}
+
+.pm-tier-table__wallet {
+  font-size: 12px;
+  cursor: text;
+  user-select: all;
+}
+
+.pm-tier-table__cell .pm-button--inline {
+  padding: 2px 8px;
+  font-size: 12px;
+  min-width: unset;
 }

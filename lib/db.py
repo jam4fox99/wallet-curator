@@ -453,11 +453,15 @@ def init_db():
         VALUES (?, ?, ?, ?)
         """,
         [
-            ("test", "Test", 4.0, 1),
+            ("high_conviction", "High Conviction", 20.0, 1),
             ("promoted", "Promoted", 10.0, 2),
-            ("high_conviction", "High Conviction", 20.0, 3),
+            ("test", "Test", 4.0, 3),
         ],
     )
+    # Migration: reorder tiers (high_conviction first, test last)
+    conn.execute("UPDATE tier_config SET sort_order = 1 WHERE tier_name = 'high_conviction'")
+    conn.execute("UPDATE tier_config SET sort_order = 2 WHERE tier_name = 'promoted'")
+    conn.execute("UPDATE tier_config SET sort_order = 3 WHERE tier_name = 'test'")
     conn.execute(
         """
         INSERT OR IGNORE INTO synced_csv_state (id, header_row, global_row, csv_content)
