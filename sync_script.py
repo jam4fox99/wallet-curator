@@ -484,7 +484,10 @@ def check_pending_push(conn):
             LIMIT 1
             """
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "new_csv": row[1], "reverts_push_id": row[2]}
 
 
 def apply_csv_changes(conn, push, wallets_path):
