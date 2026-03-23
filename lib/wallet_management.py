@@ -399,7 +399,7 @@ def get_pending_changes(conn, only_unpushed=True):
                 "wallet_address": row["wallet_address"],
                 "change_type": row["change_type"],
                 "details": details,
-                "created_at": row["created_at"],
+                "created_at": str(row["created_at"]) if row["created_at"] else None,
                 "push_id": row["push_id"],
             }
         )
@@ -501,7 +501,7 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
                     "unique_markets": int(row["unique_markets"] or 0),
                     "total_trades": int(row["total_trades"] or 0),
                     "days_active": days_active,
-                    "assigned_at": row["assigned_at"],
+                    "assigned_at": str(row["assigned_at"]) if row["assigned_at"] else None,
                     "days_in_tier": days_in_tier,
                     "since_promo_pnl": since_promo["total"],
                     "since_promo_realized": since_promo["realized"],
