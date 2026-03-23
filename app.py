@@ -39,6 +39,7 @@ COLORS = {
     "button": "#2563eb",
 }
 FONT_FAMILY = '"Manrope", "Avenir Next", "Segoe UI", sans-serif'
+READ_ONLY_UI = os.environ.get("READ_ONLY_UI") == "1"
 
 RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
 TABLE_COLUMNS = [
@@ -211,6 +212,12 @@ def overview_layout():
                                         dbc.Button("Show Hidden Wallets", id="btn-hidden", color="secondary", outline=True),
                                     ],
                                     className="mb-3",
+                                ),
+                                dbc.Alert(
+                                    "Read-only local UI mode is enabled. Refresh P&L and hide/unhide writes are disabled.",
+                                    color="secondary",
+                                    className="mb-3",
+                                    style={"display": "block" if READ_ONLY_UI else "none"},
                                 ),
                                 html.Div(id="refresh-message", className="mb-3"),
                                 html.H5("Recent Changes"),
@@ -492,6 +499,8 @@ def update_overview(_, range_key, __):
             )
         else:
             status = f"Trades: {summary['total_trades']:,} | Waiting for first VPS sync"
+        if READ_ONLY_UI:
+            status += " | Local read-only mode"
         if summary["latest_pipeline"] and summary["latest_pipeline"]["error"]:
             status += f" | Pipeline warning: {summary['latest_pipeline']['error']}"
         changes = _build_recent_changes(get_recent_changes(conn, limit=8))
@@ -605,6 +614,8 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
     prevent_initial_call=True,
 )
 def toggle_hidden_wallet(active_cell, rows, refresh_token):
+    if READ_ONLY_UI:
+        return no_update
     if not active_cell or not rows:
         return no_update
     if active_cell["column_id"] != "hide":
@@ -636,6 +647,9 @@ def toggle_hidden_wallet(active_cell, rows, refresh_token):
 def refresh_pipeline(n_clicks, refresh_token):
     if not n_clicks:
         return no_update, no_update
+    if READ_ONLY_UI:
+        message = dbc.Alert("Refresh is disabled in local read-only mode.", color="secondary")
+        return message, no_update
     result = run_hourly_pipeline(trigger="manual-refresh")
     if result["status"] == "ok":
         message = dbc.Alert(
