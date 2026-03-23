@@ -191,8 +191,90 @@ def init_db():
                 wallet_address TEXT PRIMARY KEY,
                 market_whitelist TEXT,
                 game_filter TEXT,
+                raw_csv_line TEXT,
+                row_order INTEGER,
+                copy_percentage REAL,
+                copy_percentage_enabled INTEGER NOT NULL DEFAULT 0,
                 synced_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS synced_csv_state (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                header_row TEXT NOT NULL DEFAULT '',
+                global_row TEXT NOT NULL DEFAULT '',
+                csv_content TEXT NOT NULL DEFAULT '',
+                synced_at TEXT NOT NULL DEFAULT (datetime('now')),
+                source_path TEXT,
+                CHECK (id = 1)
+            );
+
+            CREATE TABLE IF NOT EXISTS tier_config (
+                tier_name TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                copy_percentage REAL NOT NULL,
+                sort_order INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_tiers (
+                wallet_address TEXT PRIMARY KEY,
+                tier_name TEXT NOT NULL REFERENCES tier_config(tier_name),
+                assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                assigned_from TEXT,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS promotion_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                action TEXT NOT NULL,
+                from_tier TEXT,
+                to_tier TEXT,
+                action_at TEXT NOT NULL DEFAULT (datetime('now')),
+                realized_pnl_at_action REAL,
+                unrealized_pnl_at_action REAL,
+                total_pnl_at_action REAL,
+                total_invested_at_action REAL,
+                unique_markets_at_action INTEGER,
+                total_trades_at_action INTEGER,
+                days_active_at_action INTEGER,
+                roi_pct_at_action REAL,
+                old_copy_pct REAL,
+                new_copy_pct REAL,
+                push_id INTEGER,
+                pending_change_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_promo_wallet ON promotion_history(wallet_address);
+            CREATE INDEX IF NOT EXISTS idx_promo_action_at ON promotion_history(action_at);
+
+            CREATE TABLE IF NOT EXISTS pending_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                push_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_changes(created_at);
+            CREATE INDEX IF NOT EXISTS idx_pending_push ON pending_changes(push_id);
+
+            CREATE TABLE IF NOT EXISTS csv_push_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pushed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                applied_at TEXT,
+                change_count INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                old_csv TEXT NOT NULL,
+                new_csv TEXT NOT NULL,
+                changes TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                old_wallet_tiers TEXT,
+                new_wallet_tiers TEXT,
+                old_tier_config TEXT,
+                new_tier_config TEXT,
+                reverts_push_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_push_status ON csv_push_history(status);
 
             CREATE TABLE IF NOT EXISTS last_known_wallets (
                 wallet_address TEXT PRIMARY KEY,
@@ -348,12 +430,40 @@ def init_db():
         "ALTER TABLE trades ADD COLUMN ingest_batch INTEGER",
         "ALTER TABLE trades ADD COLUMN ingested_at TEXT NOT NULL DEFAULT (datetime('now'))",
         "ALTER TABLE trades ADD COLUMN synced_at TEXT NOT NULL DEFAULT (datetime('now'))",
+        "ALTER TABLE synced_active_wallets ADD COLUMN raw_csv_line TEXT",
+        "ALTER TABLE synced_active_wallets ADD COLUMN row_order INTEGER",
+        "ALTER TABLE synced_active_wallets ADD COLUMN copy_percentage REAL",
+        "ALTER TABLE synced_active_wallets ADD COLUMN copy_percentage_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE promotion_history ADD COLUMN pending_change_id INTEGER",
+        "ALTER TABLE csv_push_history ADD COLUMN old_wallet_tiers TEXT",
+        "ALTER TABLE csv_push_history ADD COLUMN new_wallet_tiers TEXT",
+        "ALTER TABLE csv_push_history ADD COLUMN old_tier_config TEXT",
+        "ALTER TABLE csv_push_history ADD COLUMN new_tier_config TEXT",
+        "ALTER TABLE csv_push_history ADD COLUMN reverts_push_id INTEGER",
     ]
     for sql in migrations:
         try:
             conn.execute(sql)
         except Exception:
             pass
+
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO tier_config (tier_name, display_name, copy_percentage, sort_order)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            ("test", "Test", 4.0, 1),
+            ("promoted", "Promoted", 10.0, 2),
+            ("high_conviction", "High Conviction", 20.0, 3),
+        ],
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO synced_csv_state (id, header_row, global_row, csv_content)
+        VALUES (1, '', '', '')
+        """
+    )
     conn.commit()
     conn.close()
     logger.info("SQLite database initialized at %s", DB_PATH)

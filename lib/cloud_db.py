@@ -167,9 +167,97 @@ POSTGRES_SCHEMA = [
         wallet_address TEXT PRIMARY KEY,
         market_whitelist TEXT,
         game_filter TEXT,
+        raw_csv_line TEXT,
+        row_order INTEGER,
+        copy_percentage DOUBLE PRECISION,
+        copy_percentage_enabled INTEGER NOT NULL DEFAULT 0,
         synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS synced_csv_state (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        header_row TEXT NOT NULL DEFAULT '',
+        global_row TEXT NOT NULL DEFAULT '',
+        csv_content TEXT NOT NULL DEFAULT '',
+        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        source_path TEXT,
+        CHECK (id = 1)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tier_config (
+        tier_name TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        copy_percentage DOUBLE PRECISION NOT NULL,
+        sort_order INTEGER NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS wallet_tiers (
+        wallet_address TEXT PRIMARY KEY,
+        tier_name TEXT NOT NULL REFERENCES tier_config(tier_name),
+        assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        assigned_from TEXT,
+        notes TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS promotion_history (
+        id SERIAL PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        action TEXT NOT NULL,
+        from_tier TEXT,
+        to_tier TEXT,
+        action_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        realized_pnl_at_action DOUBLE PRECISION,
+        unrealized_pnl_at_action DOUBLE PRECISION,
+        total_pnl_at_action DOUBLE PRECISION,
+        total_invested_at_action DOUBLE PRECISION,
+        unique_markets_at_action INTEGER,
+        total_trades_at_action INTEGER,
+        days_active_at_action INTEGER,
+        roi_pct_at_action DOUBLE PRECISION,
+        old_copy_pct DOUBLE PRECISION,
+        new_copy_pct DOUBLE PRECISION,
+        push_id INTEGER,
+        pending_change_id INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_promo_wallet ON promotion_history(wallet_address)",
+    "CREATE INDEX IF NOT EXISTS idx_promo_action_at ON promotion_history(action_at)",
+    """
+    CREATE TABLE IF NOT EXISTS pending_changes (
+        id SERIAL PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        change_type TEXT NOT NULL,
+        details JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        push_id INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_changes(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_push ON pending_changes(push_id)",
+    """
+    CREATE TABLE IF NOT EXISTS csv_push_history (
+        id SERIAL PRIMARY KEY,
+        pushed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        applied_at TIMESTAMPTZ,
+        change_count INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        old_csv TEXT NOT NULL,
+        new_csv TEXT NOT NULL,
+        changes JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        old_wallet_tiers JSONB,
+        new_wallet_tiers JSONB,
+        old_tier_config JSONB,
+        new_tier_config JSONB,
+        reverts_push_id INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_push_status ON csv_push_history(status)",
     """
     CREATE TABLE IF NOT EXISTS last_known_wallets (
         wallet_address TEXT PRIMARY KEY,
@@ -331,6 +419,16 @@ POSTGRES_MIGRATIONS = [
     "ALTER TABLE resolutions ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ",
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS ingest_batch INTEGER",
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS raw_csv_line TEXT",
+    "ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS row_order INTEGER",
+    "ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS copy_percentage DOUBLE PRECISION",
+    "ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS copy_percentage_enabled INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE promotion_history ADD COLUMN IF NOT EXISTS pending_change_id INTEGER",
+    "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS old_wallet_tiers JSONB",
+    "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS new_wallet_tiers JSONB",
+    "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS old_tier_config JSONB",
+    "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS new_tier_config JSONB",
+    "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS reverts_push_id INTEGER",
 ]
 
 
@@ -340,5 +438,24 @@ def init_postgres_schema(conn: CloudConnection):
         cursor.execute(statement)
     for statement in POSTGRES_MIGRATIONS:
         cursor.execute(statement)
+    cursor.executemany(
+        """
+        INSERT INTO tier_config (tier_name, display_name, copy_percentage, sort_order)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (tier_name) DO NOTHING
+        """,
+        [
+            ("test", "Test", 4.0, 1),
+            ("promoted", "Promoted", 10.0, 2),
+            ("high_conviction", "High Conviction", 20.0, 3),
+        ],
+    )
+    cursor.execute(
+        """
+        INSERT INTO synced_csv_state (id, header_row, global_row, csv_content)
+        VALUES (1, '', '', '')
+        ON CONFLICT (id) DO NOTHING
+        """
+    )
     conn.commit()
     logger.info("Postgres schema initialized")

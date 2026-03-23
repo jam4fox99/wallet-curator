@@ -204,6 +204,38 @@ def read_csv_safely(filepath):
     return list(reader)
 
 
+def read_valid_csv_text(filepath):
+    raw_text = filepath.read_text(encoding="utf-8", errors="replace")
+    lines = raw_text.splitlines()
+    if not lines:
+        return "", []
+
+    header_fields = next(csv.reader([lines[0]]))
+    expected_columns = len(header_fields)
+    valid_lines = [lines[0]]
+
+    for index, line in enumerate(lines[1:], start=2):
+        if not line.strip():
+            continue
+        try:
+            fields = next(csv.reader([line]))
+        except Exception:
+            fields = []
+        if len(fields) != expected_columns:
+            if index == len(lines):
+                print(f"WARNING: dropping partial last CSV row from {filepath.name}")
+            else:
+                print(f"WARNING: skipping malformed CSV row {index} in {filepath.name}")
+            continue
+        valid_lines.append(line)
+
+    csv_text = "\n".join(valid_lines)
+    if csv_text and not csv_text.endswith("\n"):
+        csv_text += "\n"
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    return csv_text, rows
+
+
 def load_last_synced_hash():
     if LAST_SYNC_PATH.exists():
         return LAST_SYNC_PATH.read_text(encoding="utf-8").strip() or None
@@ -260,7 +292,44 @@ def ensure_tables(conn):
                 wallet_address TEXT PRIMARY KEY,
                 market_whitelist TEXT,
                 game_filter TEXT,
+                raw_csv_line TEXT,
+                row_order INTEGER,
+                copy_percentage DOUBLE PRECISION,
+                copy_percentage_enabled INTEGER NOT NULL DEFAULT 0,
                 synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS synced_csv_state (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                header_row TEXT NOT NULL DEFAULT '',
+                global_row TEXT NOT NULL DEFAULT '',
+                csv_content TEXT NOT NULL DEFAULT '',
+                synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                source_path TEXT,
+                CHECK (id = 1)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS csv_push_history (
+                id SERIAL PRIMARY KEY,
+                pushed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                applied_at TIMESTAMPTZ,
+                change_count INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                old_csv TEXT NOT NULL,
+                new_csv TEXT NOT NULL,
+                changes JSONB NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                old_wallet_tiers JSONB,
+                new_wallet_tiers JSONB,
+                old_tier_config JSONB,
+                new_tier_config JSONB,
+                reverts_push_id INTEGER
             )
             """
         )
@@ -276,6 +345,12 @@ def ensure_tables(conn):
                 CHECK (id = 1)
             )
             """
+        )
+        cursor.execute("ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS raw_csv_line TEXT")
+        cursor.execute("ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS row_order INTEGER")
+        cursor.execute("ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS copy_percentage DOUBLE PRECISION")
+        cursor.execute(
+            "ALTER TABLE synced_active_wallets ADD COLUMN IF NOT EXISTS copy_percentage_enabled INTEGER NOT NULL DEFAULT 0"
         )
     conn.commit()
 
@@ -321,14 +396,50 @@ def push_trades(conn, trades):
 
 
 def sync_active_wallets(conn, wallets_path):
-    rows = read_csv_safely(wallets_path)
+    csv_text, rows = read_valid_csv_text(wallets_path)
+    if not rows:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO synced_csv_state (id, header_row, global_row, csv_content, synced_at, source_path)
+                VALUES (1, '', '', '', NOW(), %s)
+                ON CONFLICT (id) DO UPDATE
+                SET header_row = EXCLUDED.header_row,
+                    global_row = EXCLUDED.global_row,
+                    csv_content = EXCLUDED.csv_content,
+                    synced_at = EXCLUDED.synced_at,
+                    source_path = EXCLUDED.source_path
+                """,
+                (str(wallets_path),),
+            )
+        conn.commit()
+        return 0
+
+    raw_lines = csv_text.splitlines()
+    header_row = raw_lines[0] if raw_lines else ""
+    global_row = raw_lines[1] if len(raw_lines) > 1 else ""
     wallets = []
-    for row in rows:
+    row_order = 0
+    for index, row in enumerate(rows, start=1):
         address = normalize_wallet(row.get("address", ""))
         if not address or address == "__global__":
             continue
         whitelist = (row.get("market_whitelist") or "").strip()
-        wallets.append((address, whitelist, parse_game_from_whitelist(whitelist)))
+        raw_line = raw_lines[index] if index < len(raw_lines) else ""
+        copy_percentage = parse_float_or_none(row.get("copy_percentage"))
+        copy_percentage_enabled = 1 if str(row.get("copy_percentage_enabled", "")).strip().lower() == "true" else 0
+        wallets.append(
+            (
+                address,
+                whitelist,
+                parse_game_from_whitelist(whitelist),
+                raw_line,
+                row_order,
+                copy_percentage,
+                copy_percentage_enabled,
+            )
+        )
+        row_order += 1
 
     with conn.cursor() as cursor:
         cursor.execute("TRUNCATE TABLE synced_active_wallets")
@@ -336,14 +447,75 @@ def sync_active_wallets(conn, wallets_path):
             execute_values(
                 cursor,
                 """
-                INSERT INTO synced_active_wallets (wallet_address, market_whitelist, game_filter)
+                INSERT INTO synced_active_wallets (
+                    wallet_address, market_whitelist, game_filter, raw_csv_line,
+                    row_order, copy_percentage, copy_percentage_enabled
+                )
                 VALUES %s
                 """,
                 wallets,
                 page_size=250,
             )
+        cursor.execute(
+            """
+            INSERT INTO synced_csv_state (id, header_row, global_row, csv_content, synced_at, source_path)
+            VALUES (1, %s, %s, %s, NOW(), %s)
+            ON CONFLICT (id) DO UPDATE
+            SET header_row = EXCLUDED.header_row,
+                global_row = EXCLUDED.global_row,
+                csv_content = EXCLUDED.csv_content,
+                synced_at = EXCLUDED.synced_at,
+                source_path = EXCLUDED.source_path
+            """,
+            (header_row, global_row, csv_text, str(wallets_path)),
+        )
     conn.commit()
     return len(wallets)
+
+
+def check_pending_push(conn):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id, new_csv, reverts_push_id
+            FROM csv_push_history
+            WHERE status = 'pending'
+            ORDER BY pushed_at ASC, id ASC
+            LIMIT 1
+            """
+        )
+        return cursor.fetchone()
+
+
+def apply_csv_changes(conn, push, wallets_path):
+    push_id = push["id"]
+    temp_path = wallets_path.with_suffix(wallets_path.suffix + ".tmp")
+    print(f"Applying pending CSV push #{push_id} to {wallets_path}")
+    temp_path.write_text(push["new_csv"], encoding="utf-8")
+    temp_path.replace(wallets_path)
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE csv_push_history
+            SET status = 'applied', applied_at = NOW()
+            WHERE id = %s
+            """,
+            (push_id,),
+        )
+        if push["reverts_push_id"]:
+            cursor.execute(
+                """
+                UPDATE csv_push_history
+                SET status = 'reverted'
+                WHERE id = %s AND status = 'applied'
+                """,
+                (push["reverts_push_id"],),
+            )
+    conn.commit()
+    wallet_count = sync_active_wallets(conn, wallets_path)
+    print(f"Applied push #{push_id}; synced {wallet_count} wallet rows from rewritten CSV")
+    return wallet_count
 
 
 def update_sync_status(conn, version_folder, synced_count, error_message=None):
@@ -452,6 +624,19 @@ def main():
                 else:
                     print(
                         "WARNING: active_wallets.csv not found. Verify the exact path before relying on wallet sync: "
+                        f"{wallets_path}"
+                    )
+            else:
+                wallets_path = sharp_folder / sharp_wallets_subpath / sharp_wallets_filename
+
+            pending_push = check_pending_push(conn)
+            if pending_push:
+                if wallets_path.exists():
+                    apply_csv_changes(conn, pending_push, wallets_path)
+                    last_wallet_sync_at = time.time()
+                else:
+                    raise RuntimeError(
+                        "Cannot apply pending CSV push because active_wallets.csv was not found at "
                         f"{wallets_path}"
                     )
             conn.close()
