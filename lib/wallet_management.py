@@ -43,7 +43,7 @@ def get_tier_configs(conn):
             "display_name": row["display_name"],
             "copy_percentage": float(row["copy_percentage"] or 0),
             "sort_order": int(row["sort_order"] or 0),
-            "updated_at": row["updated_at"],
+            "updated_at": str(row["updated_at"]) if row["updated_at"] else None,
         }
         for row in rows
     ]

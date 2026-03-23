@@ -1,9 +1,11 @@
 import json
+from datetime import date, datetime
 
 from lib.csv_builder import apply_pending_changes, load_current_csv_state, summarize_changes
 from lib.time_utils import now_utc, to_db_timestamp
 from lib.wallet_management import (
     get_pending_changes,
+    reconstruct_pre_pending_state,
     restore_tier_config_snapshot,
     restore_wallet_tiers_snapshot,
     serialize_tier_config_snapshot,
@@ -12,7 +14,13 @@ from lib.wallet_management import (
 
 
 def _json_dump(value):
-    return json.dumps(value, sort_keys=True)
+    return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+def _json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def _json_load(value):
@@ -30,42 +38,6 @@ def _pending_push_exists(conn):
     return bool(row)
 
 
-def _reconstruct_old_state(current_wallet_tiers, current_tier_config, pending):
-    wallet_map = {row["wallet_address"]: dict(row) for row in current_wallet_tiers}
-    tier_map = {row["tier_name"]: dict(row) for row in current_tier_config}
-
-    for change in reversed(pending):
-        details = change["details"]
-        wallet = change["wallet_address"]
-        change_type = change["change_type"]
-
-        if change_type == "add":
-            wallet_map.pop(wallet, None)
-            continue
-
-        if change_type == "remove":
-            previous = details.get("previous_wallet_tier")
-            if previous:
-                wallet_map[wallet] = dict(previous)
-            continue
-
-        if change_type in {"promote", "demote"}:
-            previous = details.get("previous_wallet_tier")
-            if previous:
-                wallet_map[wallet] = dict(previous)
-            continue
-
-        if change_type == "update_tier_config":
-            tier_name = details["tier_name"]
-            if tier_name in tier_map:
-                tier_map[tier_name]["copy_percentage"] = float(details["old_copy_pct"])
-
-    return (
-        sorted(wallet_map.values(), key=lambda row: row["wallet_address"]),
-        sorted(tier_map.values(), key=lambda row: (row["sort_order"], row["tier_name"])),
-    )
-
-
 def create_push_from_pending_changes(conn):
     pending = get_pending_changes(conn, only_unpushed=True)
     if not pending:
@@ -80,7 +52,7 @@ def create_push_from_pending_changes(conn):
 
     new_wallet_tiers = serialize_wallet_tiers_snapshot(conn)
     new_tier_config = serialize_tier_config_snapshot(conn)
-    old_wallet_tiers, old_tier_config = _reconstruct_old_state(new_wallet_tiers, new_tier_config, pending)
+    old_wallet_tiers, old_tier_config = reconstruct_pre_pending_state(new_wallet_tiers, new_tier_config, pending)
     new_csv = apply_pending_changes(current_csv["csv_content"], pending)
     summary = summarize_changes(pending)
     pushed_at = to_db_timestamp(now_utc())
@@ -107,21 +79,43 @@ def create_push_from_pending_changes(conn):
         ),
     )
     push_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
-    if push_id is None:
+    if not push_id:
         push_id = conn.execute("SELECT MAX(id) FROM csv_push_history").fetchone()[0]
 
     for change in pending:
         conn.execute("UPDATE pending_changes SET push_id = ? WHERE id = ?", (push_id, change["id"]))
-    conn.execute(
-        """
-        UPDATE promotion_history
-        SET push_id = ?
-        WHERE pending_change_id IN (
-            SELECT id FROM pending_changes WHERE push_id = ?
+        history_action = {
+            "promote": "promoted",
+            "demote": "demoted",
+            "add": "added",
+            "remove": "removed",
+            "update_tier_config": None,
+        }.get(change["change_type"])
+        if history_action is None:
+            continue
+        conn.execute(
+            """
+            UPDATE promotion_history
+            SET push_id = ?, pending_change_id = ?
+            WHERE (
+                pending_change_id = ?
+                OR (
+                    COALESCE(pending_change_id, 0) = 0
+                    AND wallet_address = ?
+                    AND action = ?
+                    AND action_at = ?
+                )
+            )
+            """,
+            (
+                push_id,
+                change["id"],
+                change["id"],
+                change["wallet_address"],
+                history_action,
+                change["created_at"],
+            ),
         )
-        """,
-        (push_id, push_id),
-    )
     conn.commit()
     return {"push_id": push_id, "summary": summary, "change_count": len(pending)}
 
@@ -136,8 +130,8 @@ def list_push_history(conn):
         pushes.append(
             {
                 "id": int(row["id"]),
-                "pushed_at": row["pushed_at"],
-                "applied_at": row["applied_at"],
+                "pushed_at": str(row["pushed_at"]) if row["pushed_at"] else None,
+                "applied_at": str(row["applied_at"]) if row["applied_at"] else None,
                 "change_count": int(row["change_count"] or 0),
                 "summary": row["summary"],
                 "changes": changes,
@@ -157,8 +151,8 @@ def get_push_detail(conn, push_id):
         return None
     return {
         "id": int(row["id"]),
-        "pushed_at": row["pushed_at"],
-        "applied_at": row["applied_at"],
+        "pushed_at": str(row["pushed_at"]) if row["pushed_at"] else None,
+        "applied_at": str(row["applied_at"]) if row["applied_at"] else None,
         "change_count": int(row["change_count"] or 0),
         "summary": row["summary"],
         "old_csv": row["old_csv"],
@@ -227,7 +221,7 @@ def create_revert_push(conn, push_id):
         ),
     )
     revert_push_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
-    if revert_push_id is None:
+    if not revert_push_id:
         revert_push_id = conn.execute("SELECT MAX(id) FROM csv_push_history").fetchone()[0]
     conn.commit()
     return {"push_id": revert_push_id, "summary": summary}
