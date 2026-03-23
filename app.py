@@ -30,6 +30,7 @@ from lib.wallet_management import (
     get_tier_configs,
     get_wallet_management_snapshot,
     promote_or_demote_wallet,
+    remove_pending_change,
     remove_wallet,
     save_tier_config_changes,
 )
@@ -247,10 +248,10 @@ def _button_id(button_type, **kwargs):
     return payload
 
 
-def _wallet_action_button(label, action, wallet, disabled=False):
+def _wallet_action_button(label, action, wallet, render_token, disabled=False):
     return html.Button(
         label,
-        id=_button_id("wallet-action", action=action, wallet=wallet),
+        id=_button_id("wallet-action", action=action, wallet=wallet, render_token=render_token),
         className=f"pm-button pm-button--secondary pm-button--inline pm-button--{action}",
         n_clicks=0,
         disabled=disabled,
@@ -270,7 +271,7 @@ def _metric_chip(label, value, tone="default"):
     )
 
 
-def _pending_change_card(change):
+def _pending_change_card(change, removable=False, render_token=None):
     details = change["details"]
     wallet = change["wallet_address"]
     game = details.get("game_filter") or details.get("snapshot", {}).get("game") or "UNKNOWN"
@@ -299,9 +300,35 @@ def _pending_change_card(change):
         metrics.append(f"{snapshot.get('unique_markets_at_action', 0)} markets")
         metrics.append(f"{snapshot.get('days_active_at_action', 0)} days")
 
+    header_children = [
+        html.Div(
+            [
+                html.Span(title, className="pm-history-row__title"),
+                html.Span(game, className="pm-history-row__meta"),
+            ],
+            className="pm-history-row__top",
+        )
+    ]
+    if removable:
+        header_children.append(
+            html.Div(
+                html.Button(
+                    "Remove from push",
+                    id=_button_id("remove-pending-change", change_id=change["id"], render_token=render_token),
+                    className="pm-button pm-button--secondary pm-button--inline pm-button--danger",
+                    n_clicks=0,
+                    disabled=READ_ONLY_UI,
+                ),
+                className="pm-history-row__actions",
+            )
+        )
+
     return html.Div(
         [
-            html.Div([html.Span(title, className="pm-history-row__title"), html.Span(game, className="pm-history-row__meta")], className="pm-history-row__top"),
+            html.Div(
+                header_children,
+                className="pm-history-row__header",
+            ),
             html.Div(subtitle, className="pm-history-row__subtitle"),
             html.Div(" | ".join(metrics), className="pm-history-row__metrics") if metrics else None,
         ],
@@ -309,15 +336,15 @@ def _pending_change_card(change):
     )
 
 
-def _render_management_wallet(wallet, tier_name):
+def _render_management_wallet(wallet, tier_name, render_token):
     total_tone = "positive" if wallet["total_pnl"] > 0 else "negative" if wallet["total_pnl"] < 0 else "default"
     since_tone = "positive" if (wallet["since_promo_pnl"] or 0) > 0 else "negative" if (wallet["since_promo_pnl"] or 0) < 0 else "default"
     actions = []
     if tier_name != "high_conviction":
-        actions.append(_wallet_action_button("Promote ▲", "promote", wallet["wallet_address"], disabled=READ_ONLY_UI))
+        actions.append(_wallet_action_button("Promote ▲", "promote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
     if tier_name != "test":
-        actions.append(_wallet_action_button("Demote ▼", "demote", wallet["wallet_address"], disabled=READ_ONLY_UI))
-    actions.append(_wallet_action_button("Remove ✕", "remove", wallet["wallet_address"], disabled=READ_ONLY_UI))
+        actions.append(_wallet_action_button("Demote ▼", "demote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
+    actions.append(_wallet_action_button("Remove ✕", "remove", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
 
     chips = [
         _metric_chip("Game", wallet["game"]),
@@ -352,12 +379,13 @@ def _render_management_wallet(wallet, tier_name):
 
 
 def _render_management_sections(snapshot):
+    render_token = snapshot.get("render_token", "stable")
     sections = []
     for tier in snapshot["tiers"]:
         rows = tier["wallets"]
         if rows:
             body = html.Div(
-                [_render_management_wallet(wallet, tier["tier_name"]) for wallet in rows],
+                [_render_management_wallet(wallet, tier["tier_name"], render_token) for wallet in rows],
                 className="pm-wallet-admin-grid",
             )
         else:
@@ -1332,6 +1360,13 @@ def update_wallet_management_view(_, __, ___):
         conn = get_connection()
         snapshot = get_wallet_management_snapshot(conn, bootstrap=not READ_ONLY_UI)
         conn.close()
+        logger.info(
+            "Wallet management snapshot rendered: test=%d promoted=%d high_conviction=%d pending=%d",
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "test"), 0),
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "promoted"), 0),
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "high_conviction"), 0),
+            snapshot["pending_count"],
+        )
         banner = None
         if snapshot["bootstrap_count"]:
             banner = dbc.Alert(
@@ -1358,11 +1393,15 @@ def update_wallet_management_view(_, __, ___):
 
 @callback(
     [Output("wallet-management-flash", "children"), Output("wallet-admin-token", "data")],
-    Input(_button_id("wallet-action", action=ALL, wallet=ALL), "n_clicks"),
+    Input(_button_id("wallet-action", action=ALL, wallet=ALL, render_token=ALL), "n_clicks"),
     State("wallet-admin-token", "data"),
     prevent_initial_call=True,
 )
-def handle_wallet_management_actions(_, wallet_admin_token):
+def handle_wallet_management_actions(clicks, wallet_admin_token):
+    # clicks is a list of n_clicks for ALL matched buttons.
+    # On rerender, all values are 0 (no real click). any() catches this.
+    if not any(clicks):
+        return no_update, no_update
     triggered = dash.callback_context.triggered_id
     if not triggered:
         return no_update, no_update
@@ -1394,6 +1433,47 @@ def handle_wallet_management_actions(_, wallet_admin_token):
         return message, wallet_admin_token + 1
     except Exception as exc:
         logger.exception("Wallet management action failed")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    [Output("wallet-management-flash", "children", allow_duplicate=True), Output("wallet-admin-token", "data", allow_duplicate=True)],
+    Input(_button_id("remove-pending-change", change_id=ALL, render_token=ALL), "n_clicks"),
+    State("wallet-admin-token", "data"),
+    prevent_initial_call=True,
+)
+def handle_remove_pending_change(clicks, wallet_admin_token):
+    if not any(clicks):
+        return no_update, no_update
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Queued change removal is disabled in local read-only mode.", color="secondary"), no_update
+
+    try:
+        conn = get_connection()
+        result = remove_pending_change(conn, triggered["change_id"])
+        conn.close()
+        removed = result["removed_change"]
+        action_labels = {
+            "add": "add",
+            "remove": "removal",
+            "promote": "promotion",
+            "demote": "demotion",
+            "update_tier_config": "tier config update",
+        }
+        label = action_labels.get(removed["change_type"], removed["change_type"])
+        wallet = removed["wallet_address"]
+        return (
+            dbc.Alert(
+                f"Removed queued {label} for {wallet}. {result['remaining_count']} changes remain in the next push.",
+                color="info",
+            ),
+            wallet_admin_token + 1,
+        )
+    except Exception as exc:
+        logger.exception("Failed to remove queued change")
         return dbc.Alert(str(exc), color="danger"), no_update
 
 
@@ -1450,11 +1530,13 @@ def handle_add_wallet_modal(_, __, submit_clicks, is_open, raw_line, tier_name, 
     State("push-preview-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_push_preview_modal(_, __, ___, is_open):
+def toggle_push_preview_modal(open_clicks, cancel_clicks, confirm_clicks, is_open):
     triggered = dash.callback_context.triggered_id
-    if triggered == "btn-open-push":
+    if triggered == "btn-open-push" and open_clicks:
         return True
-    if triggered in {"btn-cancel-push", "btn-confirm-push"}:
+    if triggered == "btn-cancel-push" and cancel_clicks:
+        return False
+    if triggered == "btn-confirm-push" and confirm_clicks:
         return False
     return is_open
 
@@ -1476,7 +1558,9 @@ def render_push_preview(is_open, _):
             return dbc.Alert("A push is already pending on the VPS. Wait for it to apply before pushing again.", color="warning"), True
         if not snapshot["pending_changes"]:
             return dbc.Alert("There are no queued changes to push.", color="secondary"), True
-        return html.Div([_pending_change_card(change) for change in snapshot["pending_changes"]]), False
+        return html.Div(
+            [_pending_change_card(change, removable=True, render_token=snapshot.get("render_token")) for change in snapshot["pending_changes"]],
+        ), False
     except Exception as exc:
         logger.exception("Failed to render push preview")
         return dbc.Alert(str(exc), color="danger"), True
@@ -1617,11 +1701,13 @@ def render_changes_view(selected_push_id, _, __):
     State("revert-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_revert_modal(_, __, ___, is_open):
+def toggle_revert_modal(open_clicks, cancel_clicks, confirm_clicks, is_open):
     triggered = dash.callback_context.triggered_id
-    if triggered == "btn-open-revert":
+    if triggered == "btn-open-revert" and open_clicks:
         return True
-    if triggered in {"btn-cancel-revert", "btn-confirm-revert"}:
+    if triggered == "btn-cancel-revert" and cancel_clicks:
+        return False
+    if triggered == "btn-confirm-revert" and confirm_clicks:
         return False
     return is_open
 
