@@ -336,60 +336,141 @@ def _pending_change_card(change, removable=False, render_token=None):
     )
 
 
-def _pnl_cell(value):
-    """Format a P&L value with color."""
-    if value is None:
-        return html.Td("—", className="pm-tier-table__cell")
-    color = "#22c55e" if value > 0 else "#ef4444" if value < 0 else "#e5e5e5"
-    return html.Td(f"${value:,.2f}", style={"color": color}, className="pm-tier-table__cell")
+GAME_BADGES = {
+    "CS2": {"icon": "🎯", "label": "CS2", "color": "#f59e0b", "bg": "rgba(245,158,11,0.12)"},
+    "LOL": {"icon": "⚔️", "label": "LOL", "color": "#eab308", "bg": "rgba(234,179,8,0.12)"},
+    "DOTA": {"icon": "🛡️", "label": "DOTA", "color": "#ef4444", "bg": "rgba(239,68,68,0.12)"},
+    "VALO": {"icon": "💥", "label": "VALO", "color": "#ec4899", "bg": "rgba(236,72,153,0.12)"},
+    "ESPORTS": {"icon": "🎮", "label": "ESPORTS", "color": "#8b5cf6", "bg": "rgba(139,92,246,0.12)"},
+    "UNKNOWN": {"icon": "❓", "label": "?", "color": "#6b7280", "bg": "rgba(107,114,128,0.12)"},
+}
 
 
-def _render_wallet_row(wallet, tier_name, render_token):
-    """Render a single wallet as a table row with inline action buttons."""
-    actions = []
-    if tier_name != "high_conviction":
-        actions.append(_wallet_action_button("▲", "promote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
-    if tier_name != "test":
-        actions.append(_wallet_action_button("▼", "demote", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
-    actions.append(_wallet_action_button("✕", "remove", wallet["wallet_address"], render_token, disabled=READ_ONLY_UI))
+def _game_badge(game_code):
+    info = GAME_BADGES.get(game_code, GAME_BADGES["UNKNOWN"])
+    return html.Span(
+        f"{info['icon']}",
+        className="pm-game-badge",
+        title=game_code,
+        style={"color": info["color"], "backgroundColor": info["bg"],
+               "padding": "4px 10px", "borderRadius": "6px", "fontSize": "18px",
+               "border": f"1px solid {info['color']}30"},
+    )
 
-    since_promo = wallet.get("since_promo_pnl")
 
-    return html.Tr([
-        html.Td(wallet["wallet_address"], className="pm-tier-table__cell pm-tier-table__wallet"),
-        html.Td(wallet["game_filter"], className="pm-tier-table__cell"),
-        _pnl_cell(wallet["total_pnl"]),
-        _pnl_cell(since_promo),
-        html.Td(str(wallet["days_active"]), className="pm-tier-table__cell"),
-        html.Td(str(wallet["days_in_tier"]), className="pm-tier-table__cell"),
-        html.Td(str(wallet["unique_markets"]), className="pm-tier-table__cell"),
-        html.Td(str(wallet["total_trades"]), className="pm-tier-table__cell"),
-        html.Td(html.Div(actions, style={"display": "flex", "gap": "4px"}), className="pm-tier-table__cell"),
-    ], className="pm-tier-table__row")
+def _sparkline_svg(pnl_points, width=130, height=36):
+    """Generate inline SVG sparkline from P&L history points."""
+    if not pnl_points or len(pnl_points) < 2:
+        return html.Div("—", style={"width": f"{width}px", "color": "#555", "textAlign": "center"})
+
+    # Sample to ~30 points max for performance
+    if len(pnl_points) > 30:
+        step = len(pnl_points) // 30
+        pnl_points = pnl_points[::step]
+
+    min_val = min(pnl_points)
+    max_val = max(pnl_points)
+    val_range = max_val - min_val if max_val != min_val else 1
+    padding = 2
+
+    points = []
+    for i, val in enumerate(pnl_points):
+        x = padding + (i / (len(pnl_points) - 1)) * (width - 2 * padding)
+        y = padding + (1 - (val - min_val) / val_range) * (height - 2 * padding)
+        points.append(f"{x:.1f},{y:.1f}")
+
+    polyline = " ".join(points)
+    trending_up = pnl_points[-1] >= pnl_points[0]
+    color = "#22c55e" if trending_up else "#ef4444"
+
+    svg_str = (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="1.8" '
+        f'stroke-linecap="round" stroke-linejoin="round"/>'
+        f'</svg>'
+    )
+    return html.Div(
+        dash.html.Iframe(
+            srcDoc=svg_str,
+            style={"width": f"{width}px", "height": f"{height}px", "border": "none",
+                   "overflow": "hidden", "display": "block"},
+        ),
+        style={"width": f"{width}px", "height": f"{height}px"},
+    )
+
+
+def _pnl_combined_cell(total_pnl, since_promo):
+    """Rich P&L cell with all-time + since promo subtitle."""
+    if total_pnl is None:
+        total_pnl = 0
+    color = "#22c55e" if total_pnl > 0 else "#ef4444" if total_pnl < 0 else "#e5e5e5"
+    sign = "+" if total_pnl >= 0 else ""
+    main = html.Div(f"{sign}${total_pnl:,.2f}", className="pm-pnl-main", style={"color": color})
+    if since_promo is not None:
+        sp_sign = "+" if since_promo >= 0 else ""
+        sp_color = "#22c55e80" if since_promo >= 0 else "#ef444480"
+        sub = html.Div(f"{sp_sign}${since_promo:,.2f} Since Promo", className="pm-pnl-sub", style={"color": sp_color})
+    else:
+        sub = html.Div("")
+    return html.Td([main, sub], className="pm-tier-table__cell pm-pnl-combined")
 
 
 def _sortable_th(label, sort_type="text"):
-    """Create a sortable table header."""
     props = {"data-sortable": "true", "data-sort-dir": "none"}
     if sort_type == "number":
         props["data-sort-type"] = "number"
     return html.Th(label, className="pm-tier-table__th", **props)
 
 
-def _tier_table(wallets, tier_name, render_token):
-    """Build an HTML table for a tier's wallets."""
+def _render_wallet_row(wallet, tier_name, render_token, sparkline_points=None):
+    """Render a premium wallet row."""
+    addr = wallet["wallet_address"]
+    short_addr = f"0x...{addr[-4:]}"
+
+    # Action buttons
+    actions = []
+    if tier_name != "high_conviction":
+        actions.append(_wallet_action_button("▲ Promote", "promote", addr, render_token, disabled=READ_ONLY_UI))
+    if tier_name != "test":
+        actions.append(_wallet_action_button("▼ Demote", "demote", addr, render_token, disabled=READ_ONLY_UI))
+    actions.append(html.Span(style={"width": "4px"}))
+    actions.append(_wallet_action_button("✕ STOP", "remove", addr, render_token, disabled=READ_ONLY_UI))
+
+    return html.Tr([
+        html.Td(
+            html.Div([
+                html.Span(short_addr, className="pm-wallet-short", title=addr),
+            ], className="pm-wallet-id"),
+            className="pm-tier-table__cell",
+        ),
+        html.Td(_game_badge(wallet["game_filter"]), className="pm-tier-table__cell"),
+        _pnl_combined_cell(wallet["total_pnl"], wallet.get("since_promo_pnl")),
+        html.Td(_sparkline_svg(sparkline_points), className="pm-tier-table__cell"),
+        html.Td(str(wallet["days_in_tier"]), className="pm-tier-table__cell pm-num"),
+        html.Td(str(wallet["total_trades"]), className="pm-tier-table__cell pm-num"),
+        html.Td(
+            html.Div(actions, className="pm-action-row-compact"),
+            className="pm-tier-table__cell",
+        ),
+    ], className="pm-tier-table__row")
+
+
+def _tier_table(wallets, tier_name, render_token, sparklines=None):
     header = html.Tr([
         _sortable_th("Wallet"),
-        _sortable_th("Game"),
+        _sortable_th("Primary Game"),
         _sortable_th("All-Time P&L", "number"),
-        _sortable_th("Since Promo", "number"),
-        _sortable_th("Days Active", "number"),
+        html.Th("Performance Graph", className="pm-tier-table__th"),
         _sortable_th("Days In Tier", "number"),
-        _sortable_th("Markets", "number"),
         _sortable_th("Trades", "number"),
         html.Th("Actions", className="pm-tier-table__th"),
     ])
-    rows = [_render_wallet_row(w, tier_name, render_token) for w in wallets]
+    sparklines = sparklines or {}
+    rows = [
+        _render_wallet_row(w, tier_name, render_token, sparklines.get(w["wallet_address"]))
+        for w in wallets
+    ]
     return html.Table(
         [html.Thead(header), html.Tbody(rows)],
         className="pm-tier-table",
@@ -397,27 +478,24 @@ def _tier_table(wallets, tier_name, render_token):
 
 
 def _render_removed_section(removed_wallets):
-    """Render the Removed wallets section."""
     header = html.Tr([
         _sortable_th("Wallet"),
         _sortable_th("Game"),
         _sortable_th("Was In Tier"),
         _sortable_th("P&L At Removal", "number"),
-        _sortable_th("Days Active", "number"),
-        _sortable_th("Markets", "number"),
         _sortable_th("Trades", "number"),
         _sortable_th("Removed At"),
     ])
     rows = []
     for w in removed_wallets:
+        color = "#22c55e" if w["total_pnl"] > 0 else "#ef4444" if w["total_pnl"] < 0 else "#e5e5e5"
         rows.append(html.Tr([
-            html.Td(w["wallet_address"], className="pm-tier-table__cell pm-tier-table__wallet"),
-            html.Td(w["game_filter"], className="pm-tier-table__cell"),
+            html.Td(html.Span(f"0x...{w['wallet_address'][-4:]}", title=w["wallet_address"], className="pm-wallet-short"),
+                     className="pm-tier-table__cell"),
+            html.Td(_game_badge(w["game_filter"]), className="pm-tier-table__cell"),
             html.Td((w["from_tier"] or "").replace("_", " ").title(), className="pm-tier-table__cell"),
-            _pnl_cell(w["total_pnl"]),
-            html.Td(str(w["days_active"]), className="pm-tier-table__cell"),
-            html.Td(str(w["unique_markets"]), className="pm-tier-table__cell"),
-            html.Td(str(w["total_trades"]), className="pm-tier-table__cell"),
+            html.Td(f"${w['total_pnl']:,.2f}", style={"color": color}, className="pm-tier-table__cell"),
+            html.Td(str(w["total_trades"]), className="pm-tier-table__cell pm-num"),
             html.Td(w["removed_at"], className="pm-tier-table__cell"),
         ], className="pm-tier-table__row"))
 
@@ -437,39 +515,27 @@ def _render_removed_section(removed_wallets):
 
 def _render_management_sections(snapshot):
     render_token = snapshot.get("render_token", "stable")
+    sparklines = snapshot.get("sparklines", {})
     sections = []
     for tier in snapshot["tiers"]:
         wallets = tier["wallets"]
         if wallets:
-            body = _tier_table(wallets, tier["tier_name"], render_token)
+            body = _tier_table(wallets, tier["tier_name"], render_token, sparklines)
         else:
             body = html.Div("No wallets in this tier.", className="pm-empty-state__copy")
-        sections.append(
-            _card(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div("Tier", className="pm-kicker"),
-                                    html.H3(
-                                        f"{tier['display_name']} ({tier['copy_percentage']}% copy)",
-                                        className="pm-section-title",
-                                    ),
-                                ],
-                                className="pm-card-title-block",
-                            ),
-                            html.Div(f"{len(wallets)} wallets", className="pm-section-side-note"),
-                        ],
-                        className="pm-card-head pm-card-head--tight",
-                    ),
-                    body,
-                ],
-                class_name="pm-admin-card",
-            )
-        )
 
-    # Removed wallets section
+        # Premium tier header
+        tier_header = html.Div([
+            html.Div([
+                html.Div("TIER:", className="pm-tier-label"),
+                html.H2(f"Tier: {tier['display_name']} (Copy-Trading)", className="pm-tier-title"),
+                html.Div(f"Fee: {tier['copy_percentage']}%  |  Active Wallets: {len(wallets)}",
+                          className="pm-tier-meta"),
+            ], className="pm-tier-header-text"),
+        ], className="pm-tier-header-card")
+
+        sections.append(html.Div([tier_header, body], className="pm-tier-section"))
+
     removed = snapshot.get("removed_wallets", [])
     if removed:
         sections.append(_render_removed_section(removed))

@@ -553,6 +553,25 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
             "game_filter": game,
         })
 
+    # Bulk fetch sparkline data (last 14 days of pnl_history per wallet)
+    sparkline_data = {}
+    try:
+        spark_rows = conn.execute(
+            """
+            SELECT master_wallet, total_pnl, recorded_at
+            FROM pnl_history
+            WHERE master_wallet IS NOT NULL
+            ORDER BY master_wallet, recorded_at
+            """
+        ).fetchall()
+        for row in spark_rows:
+            wallet = row["master_wallet"]
+            if wallet not in sparkline_data:
+                sparkline_data[wallet] = []
+            sparkline_data[wallet].append(float(row["total_pnl"] or 0))
+    except Exception as exc:
+        logger.warning("Failed to fetch sparkline data: %s", exc)
+
     return {
         "tiers": tier_sections,
         "pending_changes": pending,
@@ -561,6 +580,7 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
         "bootstrap_count": bootstrap_count,
         "render_token": to_db_timestamp(now_utc()),
         "removed_wallets": removed_wallets,
+        "sparklines": sparkline_data,
     }
 
 
