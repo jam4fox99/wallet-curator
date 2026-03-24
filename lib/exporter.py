@@ -53,7 +53,7 @@ def export_xlsx(conn) -> bytes:
     ws.title = "Wallet Summary"
 
     columns = [
-        "Wallet", "Game", "Tier", "Copy %",
+        "Wallet", "Game", "In CSV", "Tier", "Copy %",
         "Realized", "Unrealized", "Total P&L", "ROI %", "Invested",
         "Markets", "Trades", "Days Active",
         "First Trade", "Last Trade",
@@ -134,9 +134,12 @@ def export_xlsx(conn) -> bytes:
 
         game = game_map.get(addr) or w["game"] or ""
 
+        in_csv = "Yes" if addr in game_map else "No"
+
         values = [
             addr,
             game,
+            in_csv,
             tier_name.replace("_", " ").title() if tier_name else "",
             copy_pct,
             round(float(w["realized_pnl"] or 0), 2),
@@ -157,13 +160,13 @@ def export_xlsx(conn) -> bytes:
         ]
         for col_idx, val in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            # Color P&L columns
-            if col_idx in (5, 6, 7, 17, 18) and isinstance(val, (int, float)):
+            # Color P&L columns (shifted +1 for In CSV column)
+            if col_idx in (6, 7, 8, 18, 19) and isinstance(val, (int, float)):
                 cell.font = _pnl_font(val)
                 cell.number_format = '#,##0.00'
-            elif col_idx in (4, 8):
+            elif col_idx in (5, 9):
                 cell.number_format = '0.00'
-            elif col_idx == 9:
+            elif col_idx == 10:
                 cell.number_format = '#,##0.00'
         row_idx += 1
 
