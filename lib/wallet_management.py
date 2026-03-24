@@ -485,10 +485,12 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
             days_in_tier = max((now_utc() - assigned_at).days, 0)
             first_trade = parse_db_timestamp(row["first_trade"]) if row["first_trade"] else None
             days_active = max((now_utc() - first_trade).days, 0) if first_trade else 0
-            since_promo = {"total": None, "realized": None, "unrealized": None}
-            if tier["tier_name"] != "test":
-                since_promo = compute_since_date_pnl(conn, row["wallet_address"], assigned_at)
             promo_snapshot = snapshot_lookup.get((row["wallet_address"], tier["tier_name"], str(row["assigned_at"])))
+            since_promo = {"total": None, "realized": None, "unrealized": None}
+            if tier["tier_name"] != "test" and promo_snapshot:
+                at_promo = float(promo_snapshot["total_pnl_at_action"] or 0)
+                current = float(row["total_pnl"] or 0)
+                since_promo = {"total": round(current - at_promo, 2), "realized": None, "unrealized": None}
             section_wallets.append(
                 {
                     "wallet_address": row["wallet_address"],
@@ -553,24 +555,19 @@ def get_wallet_management_snapshot(conn, bootstrap=True):
             "game_filter": game,
         })
 
-    # Bulk fetch sparkline data (last 14 days of pnl_history per wallet)
+    # Load pre-computed sparklines from wallet_pnl (built during pipeline)
     sparkline_data = {}
     try:
         spark_rows = conn.execute(
-            """
-            SELECT master_wallet, total_pnl, recorded_at
-            FROM pnl_history
-            WHERE master_wallet IS NOT NULL
-            ORDER BY master_wallet, recorded_at
-            """
+            "SELECT master_wallet, sparkline_json FROM wallet_pnl WHERE sparkline_json IS NOT NULL"
         ).fetchall()
         for row in spark_rows:
-            wallet = row["master_wallet"]
-            if wallet not in sparkline_data:
-                sparkline_data[wallet] = []
-            sparkline_data[wallet].append(float(row["total_pnl"] or 0))
+            try:
+                sparkline_data[row["master_wallet"]] = json.loads(row["sparkline_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
     except Exception as exc:
-        logger.warning("Failed to fetch sparkline data: %s", exc)
+        logger.warning("Failed to load sparkline data: %s", exc)
 
     return {
         "tiers": tier_sections,

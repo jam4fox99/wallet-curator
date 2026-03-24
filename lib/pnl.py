@@ -263,6 +263,38 @@ def record_pnl_history(conn, recorded_at=None):
     return inserted + 1
 
 
+def precompute_sparklines(conn):
+    """Pre-compute 14-day sparkline JSON for each wallet and store on wallet_pnl."""
+    import json
+    from datetime import timedelta
+    cutoff = to_db_timestamp(now_utc() - timedelta(days=14))
+    rows = conn.execute(
+        """
+        SELECT master_wallet, total_pnl
+        FROM pnl_history
+        WHERE master_wallet IS NOT NULL AND recorded_at >= ?
+        ORDER BY master_wallet, recorded_at
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    sparklines = {}
+    for row in rows:
+        wallet = row["master_wallet"]
+        if wallet not in sparklines:
+            sparklines[wallet] = []
+        sparklines[wallet].append(round(float(row["total_pnl"] or 0), 2))
+
+    for wallet, points in sparklines.items():
+        conn.execute(
+            "UPDATE wallet_pnl SET sparkline_json = ? WHERE master_wallet = ?",
+            (json.dumps(points), wallet),
+        )
+    conn.commit()
+    logger.info("Pre-computed sparklines for %d wallets", len(sparklines))
+    return len(sparklines)
+
+
 def _format_dollar(value):
     sign = "+" if value >= 0 else "-"
     return f"{sign}${abs(value):,.0f}"

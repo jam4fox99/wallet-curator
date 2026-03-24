@@ -440,6 +440,7 @@ def init_db():
         "ALTER TABLE csv_push_history ADD COLUMN old_tier_config TEXT",
         "ALTER TABLE csv_push_history ADD COLUMN new_tier_config TEXT",
         "ALTER TABLE csv_push_history ADD COLUMN reverts_push_id INTEGER",
+        "ALTER TABLE wallet_pnl ADD COLUMN sparkline_json TEXT",
     ]
     for sql in migrations:
         try:

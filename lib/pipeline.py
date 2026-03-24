@@ -4,7 +4,7 @@ import threading
 from lib.backfill import backfill_pnl_history
 from lib.changelog import detect_changes
 from lib.db import ensure_resolution_entries, get_backend_name, get_connection, init_db, rebuild_positions
-from lib.pnl import compute_wallet_pnl, record_pnl_history
+from lib.pnl import compute_wallet_pnl, precompute_sparklines, record_pnl_history
 from lib.pricing import fetch_prices
 from lib.resolver import check_resolutions
 from lib.time_utils import now_utc, to_db_timestamp
@@ -80,6 +80,7 @@ def run_hourly_pipeline(trigger="scheduled"):
         )
         stats["history_recorded"] += backfill_pnl_history(conn)
         stats["history_recorded"] += record_pnl_history(conn)
+        precompute_sparklines(conn)
         detect_changes(conn)
         _finish_pipeline_log(conn, log_id, stats)
         return {"status": "ok", "backend": conn.backend, **stats}
