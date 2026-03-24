@@ -2,7 +2,7 @@
 """Wallet Curator cloud dashboard."""
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import dash
 import dash_bootstrap_components as dbc
@@ -819,6 +819,18 @@ def wallet_management_layout():
                                         disabled=READ_ONLY_UI,
                                     ),
                                     html.Button(
+                                        "Export XLSX 📊",
+                                        id="btn-export-xlsx",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Button(
+                                        "Export Wallets 📋",
+                                        id="btn-export-txt",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Button(
                                         "Push to VPS 🚀",
                                         id="btn-open-push",
                                         className="pm-button pm-button--primary",
@@ -1032,6 +1044,8 @@ def serve_layout():
             dcc.Store(id="show-hidden", data=False),
             dcc.Store(id="include-outside-range", data=False),
             dcc.Store(id="selected-push-id"),
+            dcc.Download(id="download-xlsx"),
+            dcc.Download(id="download-txt"),
             dcc.Store(id="overview-chart-data"),
             dcc.Store(id="wallet-chart-data"),
             dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
@@ -1978,6 +1992,47 @@ def update_wallet_view(wallet, range_key, _):
     except Exception as exc:
         logger.exception("Failed to load wallet view")
         return None, str(exc), {"color": COLORS["negative"]}, "", ""
+
+
+# ─── Export callbacks ──────────────────────────────────────────
+@callback(
+    Output("download-xlsx", "data"),
+    Input("btn-export-xlsx", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_export_xlsx(n_clicks):
+    if not n_clicks:
+        return no_update
+    try:
+        from lib.exporter import export_xlsx
+        conn = get_connection()
+        xlsx_bytes = export_xlsx(conn)
+        conn.close()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return dcc.send_bytes(xlsx_bytes, f"wallet_export_{ts}.xlsx")
+    except Exception as exc:
+        logger.exception("XLSX export failed")
+        return no_update
+
+
+@callback(
+    Output("download-txt", "data"),
+    Input("btn-export-txt", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_export_txt(n_clicks):
+    if not n_clicks:
+        return no_update
+    try:
+        from lib.exporter import export_wallet_list_txt
+        conn = get_connection()
+        txt = export_wallet_list_txt(conn)
+        conn.close()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return dict(content=txt, filename=f"wallet_list_{ts}.txt")
+    except Exception as exc:
+        logger.exception("TXT export failed")
+        return no_update
 
 
 start_scheduler()
