@@ -1,9 +1,12 @@
 import json
+import logging
 from datetime import date, datetime, timedelta
 
 from lib.csv_builder import load_current_csv_state, row_to_line, set_row_copy_percentage, validate_wallet_csv_line
 from lib.normalizers import normalize_game, normalize_wallet
 from lib.time_utils import now_utc, parse_db_timestamp, to_db_timestamp
+
+logger = logging.getLogger(__name__)
 
 TIERS = ["test", "promoted", "high_conviction"]
 ENTRY_ACTIONS = {"added", "promoted", "demoted"}

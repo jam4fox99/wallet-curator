@@ -358,45 +358,55 @@ def _game_badge(game_code):
     )
 
 
-def _sparkline_svg(pnl_points, width=130, height=36):
-    """Generate inline SVG sparkline from P&L history points."""
+def _sparkline_svg(pnl_points, width=120, height=28):
+    """Generate inline SVG sparkline with smooth curves and gradient fill."""
     if not pnl_points or len(pnl_points) < 2:
         return html.Div("—", style={"width": f"{width}px", "color": "#555", "textAlign": "center"})
 
-    # Sample to ~30 points max for performance
-    if len(pnl_points) > 30:
-        step = len(pnl_points) // 30
+    if len(pnl_points) > 40:
+        step = len(pnl_points) // 40
         pnl_points = pnl_points[::step]
 
     min_val = min(pnl_points)
     max_val = max(pnl_points)
     val_range = max_val - min_val if max_val != min_val else 1
-    padding = 2
 
-    points = []
+    pts = []
     for i, val in enumerate(pnl_points):
-        x = padding + (i / (len(pnl_points) - 1)) * (width - 2 * padding)
-        y = padding + (1 - (val - min_val) / val_range) * (height - 2 * padding)
-        points.append(f"{x:.1f},{y:.1f}")
+        x = (i / (len(pnl_points) - 1)) * width
+        y = 1 + (1 - (val - min_val) / val_range) * (height - 2)
+        pts.append((x, y))
 
-    polyline = " ".join(points)
+    # Build smooth cubic bezier path
+    path_d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f}"
+    for i in range(1, len(pts)):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        cx = (x0 + x1) / 2
+        path_d += f" C {cx:.1f},{y0:.1f} {cx:.1f},{y1:.1f} {x1:.1f},{y1:.1f}"
+
+    # Fill path: same curve but close at bottom
+    fill_d = path_d + f" L {width:.1f},{height} L 0,{height} Z"
+
     trending_up = pnl_points[-1] >= pnl_points[0]
     color = "#22c55e" if trending_up else "#ef4444"
+    grad_id = f"g{abs(hash(tuple(pnl_points[:5]))) % 99999}"
 
     svg_str = (
         f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
-        f'xmlns="http://www.w3.org/2000/svg">'
-        f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="1.8" '
+        f'xmlns="http://www.w3.org/2000/svg" style="display:block">'
+        f'<defs><linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
+        f'<stop offset="100%" stop-color="{color}" stop-opacity="0.03"/>'
+        f'</linearGradient></defs>'
+        f'<path d="{fill_d}" fill="url(#{grad_id})"/>'
+        f'<path d="{path_d}" fill="none" stroke="{color}" stroke-width="1.5" '
         f'stroke-linecap="round" stroke-linejoin="round"/>'
         f'</svg>'
     )
     return html.Div(
-        dash.html.Iframe(
-            srcDoc=svg_str,
-            style={"width": f"{width}px", "height": f"{height}px", "border": "none",
-                   "overflow": "hidden", "display": "block"},
-        ),
-        style={"width": f"{width}px", "height": f"{height}px"},
+        dash.dcc.Markdown(svg_str, dangerously_allow_html=True),
+        style={"width": f"{width}px", "height": f"{height}px", "lineHeight": "0", "overflow": "hidden"},
     )
 
 
@@ -404,13 +414,26 @@ def _pnl_combined_cell(total_pnl, since_promo):
     """Rich P&L cell with all-time + since promo subtitle."""
     if total_pnl is None:
         total_pnl = 0
-    color = "#22c55e" if total_pnl > 0 else "#ef4444" if total_pnl < 0 else "#e5e5e5"
-    sign = "+" if total_pnl >= 0 else ""
-    main = html.Div(f"{sign}${total_pnl:,.2f}", className="pm-pnl-main", style={"color": color})
-    if since_promo is not None:
-        sp_sign = "+" if since_promo >= 0 else ""
-        sp_color = "#22c55e80" if since_promo >= 0 else "#ef444480"
-        sub = html.Div(f"{sp_sign}${since_promo:,.2f} Since Promo", className="pm-pnl-sub", style={"color": sp_color})
+    if total_pnl == 0:
+        text = "$0.00"
+        color = "#e5e5e5"
+    elif total_pnl > 0:
+        text = f"${total_pnl:,.2f}"
+        color = "#22c55e"
+    else:
+        text = f"-${abs(total_pnl):,.2f}"
+        color = "#ef4444"
+    main = html.Div(text, className="pm-pnl-main", style={"color": color})
+    if since_promo is not None and since_promo != 0:
+        if since_promo > 0:
+            sp_text = f"${since_promo:,.2f}"
+            sp_color = "#22c55e80"
+        else:
+            sp_text = f"-${abs(since_promo):,.2f}"
+            sp_color = "#ef444480"
+        sub = html.Div(f"{sp_text} Since Promo", className="pm-pnl-sub", style={"color": sp_color})
+    elif since_promo == 0:
+        sub = html.Div("$0.00 Since Promo", className="pm-pnl-sub", style={"color": "#e5e5e580"})
     else:
         sub = html.Div("")
     return html.Td([main, sub], className="pm-tier-table__cell pm-pnl-combined")
@@ -423,10 +446,9 @@ def _sortable_th(label, sort_type="text"):
     return html.Th(label, className="pm-tier-table__th", **props)
 
 
-def _render_wallet_row(wallet, tier_name, render_token, sparkline_points=None):
+def _render_wallet_row(wallet, tier_name, render_token):
     """Render a premium wallet row."""
     addr = wallet["wallet_address"]
-    short_addr = f"0x...{addr[-4:]}"
 
     # Action buttons
     actions = []
@@ -435,18 +457,17 @@ def _render_wallet_row(wallet, tier_name, render_token, sparkline_points=None):
     if tier_name != "test":
         actions.append(_wallet_action_button("▼ Demote", "demote", addr, render_token, disabled=READ_ONLY_UI))
     actions.append(html.Span(style={"width": "4px"}))
-    actions.append(_wallet_action_button("✕ STOP", "remove", addr, render_token, disabled=READ_ONLY_UI))
+    actions.append(_wallet_action_button("✕ Remove", "remove", addr, render_token, disabled=READ_ONLY_UI))
 
     return html.Tr([
         html.Td(
-            html.Div([
-                html.Span(short_addr, className="pm-wallet-short", title=addr),
-            ], className="pm-wallet-id"),
+            html.Span(addr, className="pm-wallet-copyable", title="Click to copy",
+                       **{"data-clipboard": addr}),
             className="pm-tier-table__cell",
         ),
-        html.Td(_game_badge(wallet["game_filter"]), className="pm-tier-table__cell"),
+        html.Td(wallet["game_filter"], className="pm-tier-table__cell"),
         _pnl_combined_cell(wallet["total_pnl"], wallet.get("since_promo_pnl")),
-        html.Td(_sparkline_svg(sparkline_points), className="pm-tier-table__cell"),
+        html.Td(str(wallet["unique_markets"]), className="pm-tier-table__cell pm-num"),
         html.Td(str(wallet["days_in_tier"]), className="pm-tier-table__cell pm-num"),
         html.Td(str(wallet["total_trades"]), className="pm-tier-table__cell pm-num"),
         html.Td(
@@ -456,23 +477,31 @@ def _render_wallet_row(wallet, tier_name, render_token, sparkline_points=None):
     ], className="pm-tier-table__row")
 
 
-def _tier_table(wallets, tier_name, render_token, sparklines=None):
+def _tier_table(wallets, tier_name, render_token):
     header = html.Tr([
         _sortable_th("Wallet"),
         _sortable_th("Primary Game"),
         _sortable_th("All-Time P&L", "number"),
-        html.Th("Performance Graph", className="pm-tier-table__th"),
+        _sortable_th("Markets", "number"),
         _sortable_th("Days In Tier", "number"),
         _sortable_th("Trades", "number"),
         html.Th("Actions", className="pm-tier-table__th"),
     ])
-    sparklines = sparklines or {}
     rows = [
-        _render_wallet_row(w, tier_name, render_token, sparklines.get(w["wallet_address"]))
+        _render_wallet_row(w, tier_name, render_token)
         for w in wallets
     ]
+    colgroup = html.Colgroup([
+        html.Col(className="col-wallet"),
+        html.Col(className="col-game"),
+        html.Col(className="col-pnl"),
+        html.Col(className="col-markets"),
+        html.Col(className="col-days"),
+        html.Col(className="col-trades"),
+        html.Col(className="col-actions"),
+    ])
     return html.Table(
-        [html.Thead(header), html.Tbody(rows)],
+        [colgroup, html.Thead(header), html.Tbody(rows)],
         className="pm-tier-table",
     )
 
@@ -492,7 +521,7 @@ def _render_removed_section(removed_wallets):
         rows.append(html.Tr([
             html.Td(html.Span(f"0x...{w['wallet_address'][-4:]}", title=w["wallet_address"], className="pm-wallet-short"),
                      className="pm-tier-table__cell"),
-            html.Td(_game_badge(w["game_filter"]), className="pm-tier-table__cell"),
+            html.Td(w["game_filter"], className="pm-tier-table__cell"),
             html.Td((w["from_tier"] or "").replace("_", " ").title(), className="pm-tier-table__cell"),
             html.Td(f"${w['total_pnl']:,.2f}", style={"color": color}, className="pm-tier-table__cell"),
             html.Td(str(w["total_trades"]), className="pm-tier-table__cell pm-num"),
@@ -515,26 +544,28 @@ def _render_removed_section(removed_wallets):
 
 def _render_management_sections(snapshot):
     render_token = snapshot.get("render_token", "stable")
-    sparklines = snapshot.get("sparklines", {})
     sections = []
     for tier in snapshot["tiers"]:
         wallets = tier["wallets"]
         if wallets:
-            body = _tier_table(wallets, tier["tier_name"], render_token, sparklines)
+            body = _tier_table(wallets, tier["tier_name"], render_token)
         else:
             body = html.Div("No wallets in this tier.", className="pm-empty-state__copy")
 
-        # Premium tier header
-        tier_header = html.Div([
-            html.Div([
-                html.Div("TIER:", className="pm-tier-label"),
-                html.H2(f"Tier: {tier['display_name']} (Copy-Trading)", className="pm-tier-title"),
-                html.Div(f"Fee: {tier['copy_percentage']}%  |  Active Wallets: {len(wallets)}",
-                          className="pm-tier-meta"),
-            ], className="pm-tier-header-text"),
-        ], className="pm-tier-header-card")
+        # Tier header — collapsible
+        tier_id = tier["tier_name"]
+        tier_header = html.Details([
+            html.Summary(
+                html.Div([
+                    html.Span(f"{tier['display_name']} ({tier['copy_percentage']}% copy)", className="pm-tier-label-text"),
+                    html.Span(f"{len(wallets)} wallets", className="pm-tier-meta-inline"),
+                ], className="pm-tier-header-inner"),
+                className="pm-tier-summary",
+            ),
+            body,
+        ], open=True, className="pm-tier-collapsible")
 
-        sections.append(html.Div([tier_header, body], className="pm-tier-section"))
+        sections.append(html.Div([tier_header], className="pm-tier-section"))
 
     removed = snapshot.get("removed_wallets", [])
     if removed:
@@ -871,7 +902,7 @@ def wallet_management_layout():
                             html.Div(
                                 [
                                     html.Div("Control Plane", className="pm-kicker"),
-                                    html.H2("Wallet Management", className="pm-section-title"),
+                                    html.H2("Wallet Management", className="pm-section-title pm-section-title--blue"),
                                 ],
                                 className="pm-card-title-block",
                             ),
@@ -1103,6 +1134,7 @@ def serve_layout():
     return html.Div(
         className="pm-app-shell",
         children=[
+            dcc.Location(id="url", refresh=False),
             dcc.Store(id="refresh-token", data=0),
             dcc.Store(id="wallet-admin-token", data=0),
             dcc.Store(id="overview-range", data="ALL"),
@@ -1149,6 +1181,12 @@ def serve_layout():
                         className="pm-tabs-shell",
                         children=[
                             dcc.Tab(
+                                label="Wallet Management",
+                                value="wallet-management",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
                                 label="Portfolio Overview",
                                 value="overview",
                                 className="pm-tab",
@@ -1161,20 +1199,14 @@ def serve_layout():
                                 selected_className="pm-tab pm-tab--selected",
                             ),
                             dcc.Tab(
-                                label="Wallet Management",
-                                value="wallet-management",
+                                label="Changes",
+                                value="changes",
                                 className="pm-tab",
                                 selected_className="pm-tab pm-tab--selected",
                             ),
                             dcc.Tab(
                                 label="Settings",
                                 value="settings",
-                                className="pm-tab",
-                                selected_className="pm-tab pm-tab--selected",
-                            ),
-                            dcc.Tab(
-                                label="Changes",
-                                value="changes",
                                 className="pm-tab",
                                 selected_className="pm-tab pm-tab--selected",
                             ),
@@ -1242,6 +1274,16 @@ clientside_callback(
 )
 
 
+TAB_PATHS = {
+    "overview": "/",
+    "wallets": "/wallets",
+    "wallet-management": "/wallet-management",
+    "settings": "/settings",
+    "changes": "/changes",
+}
+PATH_TO_TAB = {v: k for k, v in TAB_PATHS.items()}
+
+
 @callback(
     [
         Output("overview-container", "style"),
@@ -1262,6 +1304,29 @@ def render_tab(active_tab):
     if active_tab == "changes":
         return {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "block"}
     return {"display": "block"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}
+
+
+# Sync URL → tab on page load
+@callback(
+    Output("tabs", "value"),
+    Input("url", "pathname"),
+    prevent_initial_call=False,
+)
+def url_to_tab(pathname):
+    normalized = pathname or "/"
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    return PATH_TO_TAB.get(normalized, "overview")
+
+
+# Sync tab → URL when user clicks a tab
+@callback(
+    Output("url", "pathname"),
+    Input("tabs", "value"),
+    prevent_initial_call=True,
+)
+def tab_to_url(tab_value):
+    return TAB_PATHS.get(tab_value, "/")
 
 
 @callback(
