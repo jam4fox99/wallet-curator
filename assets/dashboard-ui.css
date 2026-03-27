@@ -1353,3 +1353,114 @@ input.pm-date-input,
   font-size: 11px;
   min-width: unset;
 }
+
+/* ── Generic collapsible alias (non-tier contexts) ── */
+.pm-collapsible-section {
+  border: 1px solid var(--pm-border);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--pm-surface);
+}
+
+.pm-collapsible-section > summary {
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  background: linear-gradient(135deg, var(--pm-surface) 0%, var(--pm-surface-alt) 100%);
+  border-bottom: 1px solid var(--pm-border-soft);
+}
+
+.pm-collapsible-section > summary::-webkit-details-marker { display: none; }
+.pm-collapsible-section > summary::marker { display: none; content: ""; }
+
+.pm-collapsible-section[open] > summary .pm-collapsible-label::after {
+  content: " ▾";
+  color: var(--pm-text-secondary);
+  font-size: 10px;
+}
+
+.pm-collapsible-section:not([open]) > summary .pm-collapsible-label::after {
+  content: " ▸";
+  color: var(--pm-text-secondary);
+  font-size: 10px;
+}
+
+.pm-collapsible-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--pm-blue);
+  letter-spacing: 0;
+}
+
+.pm-collapsible-header-inner {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.pm-collapsible-meta {
+  font-size: 12px;
+  color: var(--pm-text-secondary);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Settings input (numeric) ── */
+.pm-settings-input {
+  width: 100px;
+  height: 42px;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-radius: 10px !important;
+  outline: none !important;
+  box-shadow: none !important;
+  background: rgba(255, 255, 255, 0.03) !important;
+  color: var(--pm-text) !important;
+  font-family: "Inter", "Segoe UI", sans-serif !important;
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding: 0 12px !important;
+}
+
+.pm-settings-input input,
+input.pm-settings-input {
+  color: var(--pm-text) !important;
+  background: transparent !important;
+  -webkit-text-fill-color: var(--pm-text) !important;
+}
+
+/* ── Daily breakdown HTML table column widths ── */
+.pm-tier-table col.col-hide       { width: 5%; }
+.pm-tier-table col.col-filter     { width: 7%; }
+.pm-tier-table col.col-actual     { width: 7%; }
+.pm-tier-table col.col-sim        { width: 5%; }
+.pm-tier-table col.col-invested   { width: 10%; }
+.pm-tier-table col.col-realized   { width: 10%; }
+.pm-tier-table col.col-unrealized { width: 10%; }
+.pm-tier-table col.col-total-pnl  { width: 10%; }
+.pm-tier-table col.col-markets-daily { width: 7%; }
+.pm-tier-table col.col-trades-daily  { width: 7%; }
+.pm-tier-table col.col-in-csv     { width: 5%; }
+
+/* Daily table container */
+.pm-daily-table-shell {
+  border-radius: 16px;
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  max-height: 760px;
+}
+
+/* Settings wallet count as pill badge */
+.pm-settings-row__count-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 11px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  color: var(--pm-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}

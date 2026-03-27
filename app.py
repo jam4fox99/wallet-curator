@@ -142,6 +142,87 @@ def _money(value):
     return f"${value:,.2f}" if value >= 0 else f"-${abs(value):,.2f}"
 
 
+def _pnl_cell(value, col_class=""):
+    """Render a P&L value with color."""
+    if value is None:
+        value = 0
+    color = COLORS["positive"] if value > 0 else COLORS["negative"] if value < 0 else COLORS["text"]
+    return html.Td(_money(value), className=f"pm-tier-table__cell pm-num {col_class}".strip(), style={"color": color})
+
+
+def _daily_breakdown_table(rows):
+    """Build an HTML table matching the tier-table design for the daily breakdown."""
+    if not rows:
+        return html.Div("No wallet data for this range.", className="pm-empty-state__copy")
+
+    header = html.Tr([
+        _sortable_th("Hide"),
+        _sortable_th("Wallet"),
+        _sortable_th("Filter"),
+        _sortable_th("Actual"),
+        _sortable_th("Sim #"),
+        _sortable_th("Invested", "number"),
+        _sortable_th("Realized P&L", "number"),
+        _sortable_th("Unrealized", "number"),
+        _sortable_th("Total P&L", "number"),
+        _sortable_th("Markets", "number"),
+        _sortable_th("Trades", "number"),
+        _sortable_th("In CSV"),
+    ])
+    colgroup = html.Colgroup([
+        html.Col(className="col-hide"),
+        html.Col(className="col-wallet"),
+        html.Col(className="col-filter"),
+        html.Col(className="col-actual"),
+        html.Col(className="col-sim"),
+        html.Col(className="col-invested"),
+        html.Col(className="col-realized"),
+        html.Col(className="col-unrealized"),
+        html.Col(className="col-total-pnl"),
+        html.Col(className="col-markets-daily"),
+        html.Col(className="col-trades-daily"),
+        html.Col(className="col-in-csv"),
+    ])
+    body_rows = []
+    for row in rows:
+        is_hidden = row.get("hidden", False)
+        hide_label = "Unhide" if is_hidden else "Hide"
+        row_style = {"opacity": "0.5"} if is_hidden else {}
+        wallet_addr = row["wallet_address"]
+        body_rows.append(html.Tr([
+            html.Td(
+                html.Button(
+                    hide_label,
+                    id=_button_id("toggle-hide", wallet=wallet_addr),
+                    className="pm-button pm-button--secondary pm-button--inline",
+                    n_clicks=0,
+                    disabled=READ_ONLY_UI,
+                ),
+                className="pm-tier-table__cell",
+            ),
+            html.Td(
+                html.Span(wallet_addr, className="pm-wallet-copyable", title="Click to copy",
+                           **{"data-clipboard": wallet_addr}),
+                className="pm-tier-table__cell",
+            ),
+            html.Td(row["filter"], className="pm-tier-table__cell"),
+            html.Td(row["actual"], className="pm-tier-table__cell"),
+            html.Td(row["sim"], className="pm-tier-table__cell pm-num"),
+            _pnl_cell(row["invested"]),
+            _pnl_cell(row["realized_pnl"]),
+            _pnl_cell(row["unrealized_pnl"]),
+            _pnl_cell(row["total_pnl"]),
+            html.Td(str(row["markets"]), className="pm-tier-table__cell pm-num"),
+            html.Td(str(row["trades"]), className="pm-tier-table__cell pm-num"),
+            html.Td(row["in_csv"], className="pm-tier-table__cell pm-num"),
+        ], className="pm-tier-table__row", style=row_style))
+
+    return html.Table(
+        [colgroup, html.Thead(header), html.Tbody(body_rows)],
+        className="pm-tier-table",
+    )
+
+
 def _line_color(value):
     return COLORS["positive"] if value >= 0 else COLORS["negative"]
 
@@ -584,6 +665,11 @@ def _render_push_list(pushes):
             "applied": "Applied",
             "reverted": "Reverted by later push",
         }.get(push["status"], push["status"])
+        change_count = push.get("change_count", "")
+        summary_pills = []
+        if change_count:
+            summary_pills.append(html.Span(f"{change_count} changes"))
+        summary_pills.append(html.Span(status_label))
         rows.append(
             html.Div(
                 [
@@ -591,7 +677,7 @@ def _render_push_list(pushes):
                         [
                             html.Div(f"Push #{push['id']}", className="pm-history-list__title"),
                             html.Div(push["summary"], className="pm-history-list__summary"),
-                            html.Div(status_label, className=f"pm-history-status pm-history-status--{push['status']}"),
+                            html.Div(summary_pills, className="pm-summary-strip"),
                         ],
                         className="pm-history-list__meta",
                     ),
@@ -624,7 +710,7 @@ def _render_push_detail(detail):
                 [
                     html.Div(
                         [
-                            html.Div(f"Push #{detail['id']}", className="pm-section-title"),
+                            html.Div(f"Push #{detail['id']}", className="pm-section-title pm-section-title--blue"),
                             html.Div(f"Pushed {pushed_label}", className="pm-range-copy"),
                             html.Div(f"Applied {applied_label}", className="pm-range-copy"),
                         ],
@@ -633,7 +719,7 @@ def _render_push_detail(detail):
                     html.Button(
                         "Revert",
                         id="btn-open-revert",
-                        className="pm-button pm-button--secondary",
+                        className="pm-button pm-button--danger",
                         n_clicks=0,
                         disabled=READ_ONLY_UI or detail["status"] == "pending",
                     ),
@@ -641,7 +727,19 @@ def _render_push_detail(detail):
                 className="pm-card-head pm-card-head--tight",
             ),
             html.Div(detail["summary"], className="pm-inline-message"),
-            html.Div(change_rows, className="pm-history-detail-list"),
+            html.Details(
+                [
+                    html.Summary(
+                        html.Div([
+                            html.Span(f"Changes ({len(detail['changes'])})", className="pm-collapsible-label"),
+                        ], className="pm-collapsible-header-inner"),
+                        className="pm-tier-summary",
+                    ),
+                    html.Div(change_rows, className="pm-history-detail-list", style={"padding": "12px"}),
+                ],
+                open=True,
+                className="pm-collapsible-section",
+            ),
         ],
         className="pm-history-detail",
     )
@@ -663,7 +761,7 @@ def overview_layout():
                                     html.Div(
                                         [
                                             html.Div("Portfolio", className="pm-kicker"),
-                                            html.H2("Overview", className="pm-section-title"),
+                                            html.H2("Overview", className="pm-section-title pm-section-title--blue"),
                                         ],
                                         className="pm-card-title-block",
                                     ),
@@ -730,7 +828,7 @@ def overview_layout():
                             html.Div(
                                 [
                                     html.Div("Holdings", className="pm-kicker"),
-                                    html.H3("Daily Breakdown", className="pm-section-title"),
+                                    html.H3("Daily Breakdown", className="pm-section-title pm-section-title--blue"),
                                 ],
                                 className="pm-card-title-block",
                             ),
@@ -767,64 +865,22 @@ def overview_layout():
                         className="pm-card-head pm-card-head--tight",
                     ),
                     html.Div(id="daily-totals", className="pm-breakdown-summary"),
-                    html.Div(
-                        className="pm-table-shell",
-                        children=[
-                            dcc.Loading(
-                                dash_table.DataTable(
-                                    id="daily-table",
-                                    columns=TABLE_COLUMNS,
-                                    data=[],
-                                    sort_action="native",
-                                    page_action="none",
-                                    fixed_rows={"headers": True},
-                                    style_header={
-                                        "backgroundColor": COLORS["card"],
-                                        "color": COLORS["text_secondary"],
-                                        "border": f"1px solid {COLORS['border']}",
-                                        "fontWeight": "600",
-                                        "textTransform": "uppercase",
-                                        "fontSize": "12px",
-                                        "letterSpacing": "0.04em",
-                                        "whiteSpace": "normal",
-                                        "height": "auto",
-                                    },
-                                    style_cell={
-                                        "backgroundColor": COLORS["surface_soft"],
-                                        "color": COLORS["text"],
-                                        "border": f"1px solid {COLORS['border_soft']}",
-                                        "padding": "14px 12px",
-                                        "fontFamily": FONT_FAMILY,
-                                        "fontSize": "13px",
-                                        "lineHeight": "1.45",
-                                        "whiteSpace": "normal",
-                                        "height": "auto",
-                                    },
-                                    style_cell_conditional=[
-                                        {
-                                            "if": {"column_id": "wallet"},
-                                            "minWidth": "460px",
-                                            "width": "460px",
-                                            "maxWidth": "560px",
-                                            "whiteSpace": "nowrap",
-                                        },
-                                        {"if": {"column_id": "sim"}, "minWidth": "82px", "width": "82px", "maxWidth": "82px"},
-                                        {"if": {"column_id": "filter"}, "minWidth": "132px", "width": "132px", "maxWidth": "150px"},
-                                        {"if": {"column_id": "actual"}, "minWidth": "132px", "width": "132px", "maxWidth": "150px"},
-                                        {"if": {"column_id": "hide"}, "minWidth": "88px", "width": "88px", "maxWidth": "88px"},
-                                        {"if": {"column_id": "invested"}, "minWidth": "150px", "width": "150px", "maxWidth": "170px"},
-                                        {"if": {"column_id": "realized_pnl"}, "minWidth": "160px", "width": "160px", "maxWidth": "176px"},
-                                        {"if": {"column_id": "unrealized_pnl"}, "minWidth": "150px", "width": "150px", "maxWidth": "166px"},
-                                        {"if": {"column_id": "total_pnl"}, "minWidth": "142px", "width": "142px", "maxWidth": "156px"},
-                                        {"if": {"column_id": "markets"}, "minWidth": "140px", "width": "140px", "maxWidth": "150px"},
-                                        {"if": {"column_id": "trades"}, "minWidth": "158px", "width": "158px", "maxWidth": "168px"},
-                                        {"if": {"column_id": "in_csv"}, "minWidth": "96px", "width": "96px", "maxWidth": "96px"},
-                                    ],
-                                    style_table={"overflowX": "auto", "overflowY": "auto", "height": "760px", "maxHeight": "760px"},
-                                    style_data_conditional=[],
-                                )
-                            )
+                    html.Details(
+                        [
+                            html.Summary(
+                                html.Div([
+                                    html.Span("Wallet Breakdown Table", className="pm-collapsible-label"),
+                                    html.Span(id="daily-table-count", className="pm-collapsible-meta"),
+                                ], className="pm-collapsible-header-inner"),
+                                className="pm-tier-summary",
+                            ),
+                            html.Div(
+                                id="daily-table",
+                                className="pm-daily-table-shell",
+                            ),
                         ],
+                        open=True,
+                        className="pm-collapsible-section",
                     ),
                 ],
                 class_name="pm-breakdown-card",
@@ -847,7 +903,7 @@ def wallet_layout():
                                     html.Div(
                                         [
                                             html.Div("Wallets", className="pm-kicker"),
-                                            html.H2("Per-Wallet Performance", className="pm-section-title"),
+                                            html.H2("Per-Wallet Performance", className="pm-section-title pm-section-title--blue"),
                                         ],
                                         className="pm-card-title-block",
                                     ),
@@ -1021,7 +1077,7 @@ def settings_layout():
                             html.Div(
                                 [
                                     html.Div("Config", className="pm-kicker"),
-                                    html.H2("Tier Settings", className="pm-section-title"),
+                                    html.H2("Tier Settings", className="pm-section-title pm-section-title--blue"),
                                 ],
                                 className="pm-card-title-block",
                             ),
@@ -1042,34 +1098,48 @@ def settings_layout():
                         style={"display": "block" if READ_ONLY_UI else "none"},
                     ),
                     html.Div(id="settings-message", className="pm-inline-message"),
-                    html.Div(
+                    html.Details(
                         [
-                            html.Div(
-                                [
-                                    html.Div("Test", className="pm-settings-row__name"),
-                                    dcc.Input(id="settings-copy-test", type="number", min=0, step=0.1, className="pm-date-input"),
-                                    html.Div(id="settings-count-test", className="pm-settings-row__count"),
-                                ],
-                                className="pm-settings-row",
+                            html.Summary(
+                                html.Div([
+                                    html.Span("Tier Copy Percentages", className="pm-collapsible-label"),
+                                    html.Span("3 tiers configured", className="pm-collapsible-meta"),
+                                ], className="pm-collapsible-header-inner"),
+                                className="pm-tier-summary",
                             ),
                             html.Div(
                                 [
-                                    html.Div("Promoted", className="pm-settings-row__name"),
-                                    dcc.Input(id="settings-copy-promoted", type="number", min=0, step=0.1, className="pm-date-input"),
-                                    html.Div(id="settings-count-promoted", className="pm-settings-row__count"),
+                                    html.Div(
+                                        [
+                                            html.Div("Test", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-test", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-test", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div("Promoted", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-promoted", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-promoted", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div("High Conviction", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-high", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-high", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
                                 ],
-                                className="pm-settings-row",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div("High Conviction", className="pm-settings-row__name"),
-                                    dcc.Input(id="settings-copy-high", type="number", min=0, step=0.1, className="pm-date-input"),
-                                    html.Div(id="settings-count-high", className="pm-settings-row__count"),
-                                ],
-                                className="pm-settings-row",
+                                className="pm-settings-grid",
+                                style={"padding": "12px"},
                             ),
                         ],
-                        className="pm-settings-grid",
+                        open=True,
+                        className="pm-collapsible-section",
                     ),
                     html.Div(
                         "Changing a tier's copy percentage queues per-wallet CSV updates. Use Push to VPS to apply them live.",
@@ -1094,7 +1164,7 @@ def changes_layout():
                             html.Div(
                                 [
                                     html.Div("History", className="pm-kicker"),
-                                    html.H2("CSV Change History", className="pm-section-title"),
+                                    html.H2("CSV Change History", className="pm-section-title pm-section-title--blue"),
                                 ],
                                 className="pm-card-title-block",
                             ),
@@ -1469,8 +1539,8 @@ def update_overview(_, range_key, __):
 
 @callback(
     [
-        Output("daily-table", "data"),
-        Output("daily-table", "style_data_conditional"),
+        Output("daily-table", "children"),
+        Output("daily-table-count", "children"),
         Output("daily-totals", "children"),
         Output("btn-hidden", "children"),
         Output("btn-outside-range", "children"),
@@ -1494,37 +1564,8 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
             include_outside_range=include_outside_range,
         )
         conn.close()
-        style = [
-            {
-                "if": {"filter_query": "{realized_pnl} > 0", "column_id": "realized_pnl"},
-                "color": COLORS["positive"],
-            },
-            {
-                "if": {"filter_query": "{realized_pnl} < 0", "column_id": "realized_pnl"},
-                "color": COLORS["negative"],
-            },
-            {
-                "if": {"filter_query": "{unrealized_pnl} > 0", "column_id": "unrealized_pnl"},
-                "color": COLORS["positive"],
-            },
-            {
-                "if": {"filter_query": "{unrealized_pnl} < 0", "column_id": "unrealized_pnl"},
-                "color": COLORS["negative"],
-            },
-            {
-                "if": {"filter_query": "{total_pnl} > 0", "column_id": "total_pnl"},
-                "color": COLORS["positive"],
-            },
-            {
-                "if": {"filter_query": "{total_pnl} < 0", "column_id": "total_pnl"},
-                "color": COLORS["negative"],
-            },
-            {
-                "if": {"filter_query": "{hidden} = true"},
-                "backgroundColor": "#141414",
-                "color": COLORS["text_secondary"],
-            },
-        ]
+        table = _daily_breakdown_table(breakdown["rows"])
+        count_label = f"{len(breakdown['rows'])} wallets"
         roster_label = "Outside-range wallets included" if include_outside_range else "In-range wallets only"
         totals_text = html.Div(
             [
@@ -1546,10 +1587,16 @@ def update_daily_table(start_date, end_date, show_hidden, include_outside_range,
             if include_outside_range
             else "Include Wallets Outside Date Range"
         )
-        return breakdown["rows"], style, totals_text, button_label, range_button_label
+        return table, count_label, totals_text, button_label, range_button_label
     except Exception as exc:
         logger.exception("Failed to load daily table")
-        return [], [], html.Div(f"Daily table unavailable: {exc}"), "Show Hidden Wallets", "Include Wallets Outside Date Range"
+        return (
+            html.Div(f"Daily table unavailable: {exc}", className="pm-empty-state__copy"),
+            "",
+            html.Div(f"Daily table unavailable: {exc}"),
+            "Show Hidden Wallets",
+            "Include Wallets Outside Date Range",
+        )
 
 
 @callback(
@@ -1838,9 +1885,9 @@ def load_tier_settings(_, __):
             configs["test"]["copy_percentage"],
             configs["promoted"]["copy_percentage"],
             configs["high_conviction"]["copy_percentage"],
-            f"{counts.get('test', 0)} wallets",
-            f"{counts.get('promoted', 0)} wallets",
-            f"{counts.get('high_conviction', 0)} wallets",
+            html.Span(f"{counts.get('test', 0)} wallets", className="pm-settings-row__count-pill"),
+            html.Span(f"{counts.get('promoted', 0)} wallets", className="pm-settings-row__count-pill"),
+            html.Span(f"{counts.get('high_conviction', 0)} wallets", className="pm-settings-row__count-pill"),
         )
     except Exception:
         return no_update, no_update, no_update, "—", "—", "—"
@@ -1990,21 +2037,19 @@ def confirm_revert_push(n_clicks, selected_push_id, wallet_admin_token):
 
 @callback(
     Output("refresh-token", "data", allow_duplicate=True),
-    Input("daily-table", "active_cell"),
-    State("daily-table", "data"),
+    Input(_button_id("toggle-hide", wallet=ALL), "n_clicks"),
     State("refresh-token", "data"),
     prevent_initial_call=True,
 )
-def toggle_hidden_wallet(active_cell, rows, refresh_token):
+def toggle_hidden_wallet(clicks, refresh_token):
     if READ_ONLY_UI:
         return no_update
-    if not active_cell or not rows:
+    if not any(clicks):
         return no_update
-    if active_cell["column_id"] != "hide":
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
         return no_update
-    wallet = rows[active_cell["row"]].get("wallet_address")
-    if not wallet:
-        return no_update
+    wallet = triggered["wallet"]
 
     conn = get_connection()
     existing = conn.execute(
@@ -2091,7 +2136,9 @@ def update_wallet_view(wallet, range_key, _):
             [
                 html.Div(
                     [
-                        _stat_tile("Wallet", stats["wallet"]),
+                        _stat_tile("Wallet", html.Span(
+                            stats["wallet"], className="pm-wallet-copyable",
+                            title="Click to copy", **{"data-clipboard": stats["wallet"]})),
                         _stat_tile("Filter", stats["filter"]),
                         _stat_tile("Actual", stats["game"]),
                         _stat_tile("Invested", _money(stats["invested"])),
@@ -2108,7 +2155,7 @@ def update_wallet_view(wallet, range_key, _):
                         html.Span(f"First trade {stats['first_trade'] or '-'}"),
                         html.Span(f"Last trade {stats['last_trade'] or '-'}"),
                     ],
-                    className="pm-wallet-meta-strip",
+                    className="pm-summary-strip",
                 ),
             ],
             className="pm-wallet-summary",
