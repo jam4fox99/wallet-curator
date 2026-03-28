@@ -648,6 +648,7 @@ a {
   margin-bottom: 14px;
 }
 
+/* Legacy Dash dropdown classes */
 .pm-wallet-dropdown .Select-control,
 .pm-wallet-dropdown .Select-menu-outer,
 .pm-wallet-dropdown .Select-menu,
@@ -689,6 +690,107 @@ a {
 
 .pm-wallet-dropdown .VirtualizedSelectFocusedOption {
   background: rgba(79, 140, 255, 0.12) !important;
+}
+
+/* Dash 4.0 dropdown dark theme overrides */
+.pm-wallet-dropdown .dash-dropdown .Select-control,
+.pm-wallet-dropdown .Select--single > .Select-control {
+  background: var(--pm-surface) !important;
+  border: 1px solid var(--pm-border) !important;
+  color: var(--pm-text) !important;
+}
+
+/* Global Dash dropdown dark theme */
+.dash-dropdown .Select-control {
+  background: var(--pm-surface) !important;
+  border-color: var(--pm-border) !important;
+  color: var(--pm-text) !important;
+}
+
+.dash-dropdown .Select-menu-outer {
+  background: var(--pm-surface) !important;
+  border: 1px solid var(--pm-border) !important;
+  box-shadow: var(--pm-shadow) !important;
+}
+
+.dash-dropdown .Select-option {
+  background: var(--pm-surface) !important;
+  color: var(--pm-text) !important;
+}
+
+.dash-dropdown .Select-option.is-focused {
+  background: rgba(79, 140, 255, 0.15) !important;
+}
+
+.dash-dropdown .Select-value-label,
+.dash-dropdown .Select-placeholder {
+  color: var(--pm-text) !important;
+}
+
+.dash-dropdown .Select-input > input {
+  color: var(--pm-text) !important;
+}
+
+.dash-dropdown .Select-arrow-zone .Select-arrow {
+  border-top-color: var(--pm-text-secondary) !important;
+}
+
+/* Dash 4.0 dropdown — nuclear dark theme override */
+#wallet-dropdown div[class$="-control"],
+#wallet-dropdown div[class*="-control"],
+#wallet-dropdown .Select-control {
+  background-color: #12161f !important;
+  border-color: #232a36 !important;
+  min-height: 44px !important;
+}
+
+#wallet-dropdown div[class$="-menu"],
+#wallet-dropdown div[class*="-menu"],
+#wallet-dropdown .Select-menu-outer {
+  background-color: #12161f !important;
+  border: 1px solid #232a36 !important;
+  z-index: 999 !important;
+}
+
+#wallet-dropdown div[class$="-option"],
+#wallet-dropdown div[class*="-option"],
+#wallet-dropdown .Select-option {
+  background-color: #12161f !important;
+  color: #f4f6fb !important;
+  font-size: 13px !important;
+  font-family: 'JetBrains Mono', monospace !important;
+}
+
+#wallet-dropdown div[class$="-option"]:hover,
+#wallet-dropdown div[class*="is-focused"] {
+  background-color: rgba(79, 140, 255, 0.18) !important;
+}
+
+#wallet-dropdown div[class$="-singleValue"],
+#wallet-dropdown div[class*="-singleValue"],
+#wallet-dropdown .Select-value-label {
+  color: #f4f6fb !important;
+  font-size: 13px !important;
+  font-family: 'JetBrains Mono', monospace !important;
+}
+
+#wallet-dropdown div[class$="-placeholder"],
+#wallet-dropdown div[class*="-placeholder"],
+#wallet-dropdown .Select-placeholder {
+  color: #97a3b7 !important;
+}
+
+#wallet-dropdown input,
+#wallet-dropdown div[class*="-input"] input {
+  color: #f4f6fb !important;
+}
+
+#wallet-dropdown div[class*="-indicatorSeparator"] {
+  background-color: #232a36 !important;
+}
+
+#wallet-dropdown div[class*="-indicatorContainer"] svg {
+  fill: #97a3b7 !important;
 }
 
 .pm-wallet-summary {
