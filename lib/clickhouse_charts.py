@@ -92,18 +92,20 @@ class ClickHouseClient:
 
 
 def get_available_details(client: ClickHouseClient) -> list[dict]:
-    """Query ClickHouse for distinct subcategory_detail values (the filter level)."""
+    """Query ClickHouse for all filterable detail labels (subcategory_detail, falling back to subcategory)."""
     db = _validate_id(client.database)
     rows = client.query(f"""
-        SELECT subcategory_detail, count() as token_count
+        SELECT
+            if(subcategory_detail != '', subcategory_detail, subcategory) AS detail_label,
+            count() AS token_count
         FROM {db}.token_metadata_latest_v2
-        WHERE subcategory_detail != ''
-        GROUP BY subcategory_detail
+        WHERE subcategory != '' OR subcategory_detail != ''
+        GROUP BY detail_label
         ORDER BY token_count DESC
     """)
     return [
-        {"detail": str(r["subcategory_detail"]), "count": int(r["token_count"])}
-        for r in rows if r.get("subcategory_detail")
+        {"detail": str(r["detail_label"]), "count": int(r["token_count"])}
+        for r in rows if r.get("detail_label")
     ]
 
 
@@ -119,7 +121,7 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, game: str, lookback
         FROM {db}.trades AS t
         INNER JOIN {db}.token_metadata_latest_v2 AS tm ON tm.token_id = t.token_id
         WHERE t.wallet = {_sql_quote(wallet)}
-          AND tm.subcategory_detail = {_sql_quote(game)}
+          AND (tm.subcategory_detail = {_sql_quote(game)} OR (tm.subcategory_detail = '' AND tm.subcategory = {_sql_quote(game)}))
           AND t.ts >= now() - INTERVAL {int(lookback_days)} DAY
         GROUP BY t.token_id
         ORDER BY first_trade_ts ASC, token_id ASC
