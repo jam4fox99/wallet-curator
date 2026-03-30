@@ -91,18 +91,18 @@ class ClickHouseClient:
             return False
 
 
-def get_available_categories(client: ClickHouseClient) -> list[dict]:
-    """Query ClickHouse for all category + subcategory_detail combos."""
+def get_available_details(client: ClickHouseClient) -> list[dict]:
+    """Query ClickHouse for distinct subcategory_detail values (the filter level)."""
     db = _validate_id(client.database)
     rows = client.query(f"""
-        SELECT category, subcategory_detail, count() as token_count
+        SELECT subcategory_detail, count() as token_count
         FROM {db}.token_metadata_latest_v2
         WHERE subcategory_detail != ''
-        GROUP BY category, subcategory_detail
-        ORDER BY category ASC, token_count DESC
+        GROUP BY subcategory_detail
+        ORDER BY token_count DESC
     """)
     return [
-        {"category": str(r["category"]), "detail": str(r["subcategory_detail"]), "count": int(r["token_count"])}
+        {"detail": str(r["subcategory_detail"]), "count": int(r["token_count"])}
         for r in rows if r.get("subcategory_detail")
     ]
 

@@ -2315,23 +2315,21 @@ def load_game_options(tab):
     if tab != "subcategory-charts":
         return no_update
     try:
-        from lib.clickhouse_charts import ClickHouseClient, get_available_categories
+        from lib.clickhouse_charts import ClickHouseClient, get_available_details
         client = ClickHouseClient()
-        cats = get_available_categories(client)
-        # Group by category for the dropdown
-        options = []
-        for item in cats:
-            label = f"{item['category']} / {item['detail']} ({item['count']:,})"
-            options.append({"label": label, "value": item["detail"]})
-        return options
-    except Exception as exc:
-        logger.warning("Failed to load categories from ClickHouse: %s", exc)
+        details = get_available_details(client)
         return [
-            {"label": "Sports / Counter-Strike", "value": "Counter-Strike"},
-            {"label": "Sports / League of Legends", "value": "League of Legends"},
-            {"label": "Sports / Dota 2", "value": "Dota 2"},
-            {"label": "Sports / Valorant", "value": "Valorant"},
-            {"label": "Sports / NBA", "value": "NBA"},
+            {"label": f"{d['detail']} ({d['count']:,})", "value": d["detail"]}
+            for d in details
+        ]
+    except Exception as exc:
+        logger.warning("Failed to load details from ClickHouse: %s", exc)
+        return [
+            {"label": "Counter-Strike", "value": "Counter-Strike"},
+            {"label": "League of Legends", "value": "League of Legends"},
+            {"label": "Valorant", "value": "Valorant"},
+            {"label": "NBA", "value": "NBA"},
+            {"label": "US Politics", "value": "US Politics"},
         ]
 
 
