@@ -1126,16 +1126,18 @@ def subcategory_charts_layout():
                         ],
                         style={"display": "flex", "gap": "16px", "marginBottom": "12px"},
                     ),
+                    dcc.Store(id="sc-active-range", data=365),
                     html.Div(
                         [
                             html.Button(
                                 opt["label"],
                                 id=f"sc-range-{opt['value']}",
-                                className="pm-range-pill",
+                                className="pm-range-pill" + (" pm-range-pill--active" if opt["value"] == 365 else ""),
                                 n_clicks=0,
                             )
                             for opt in RANGE_OPTIONS
                         ],
+                        id="sc-range-pills",
                         style={"display": "flex", "gap": "6px", "marginBottom": "16px"},
                     ),
                     html.Button("Generate Chart", id="sc-generate", className="pm-button pm-button--primary", n_clicks=0),
@@ -2344,24 +2346,30 @@ def load_game_options(tab):
         ]
 
 
-_SC_RANGE_STORE = dcc.Store(id="sc-range-value", data=365)
-# Inject the store into layout — find it via the subcategory-charts-container
-app.layout.children[0].children[2].children[0].children.insert(
-    -1,  # before settings
-    _SC_RANGE_STORE,
-) if False else None  # skip — we'll add it inline below
+_SC_RANGES = [1, 7, 14, 30, 365]
 
 
+# Range pill click → update active range store + highlight
 @callback(
-    Output("sc-range-value", "data", allow_duplicate=True) if False else Output("sc-message", "children", allow_duplicate=True),
-    [Input(f"sc-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    [Output("sc-active-range", "data")] + [Output(f"sc-range-{d}", "className") for d in _SC_RANGES],
+    [Input(f"sc-range-{d}", "n_clicks") for d in _SC_RANGES],
+    State("sc-active-range", "data"),
     prevent_initial_call=True,
 )
-def _sc_range_noop(*args):
-    # Range is handled via triggered_id in the generate callback
-    return no_update
+def update_active_range(c1, c7, c14, c30, c365, current):
+    triggered = dash.ctx.triggered_id
+    selected = current or 365
+    click_map = {"sc-range-1": 1, "sc-range-7": 7, "sc-range-14": 14, "sc-range-30": 30, "sc-range-365": 365}
+    clicks_map = {"sc-range-1": c1, "sc-range-7": c7, "sc-range-14": c14, "sc-range-30": c30, "sc-range-365": c365}
+    if triggered in click_map and clicks_map.get(triggered):
+        selected = click_map[triggered]
+    return [selected] + [
+        "pm-range-pill pm-range-pill--active" if d == selected else "pm-range-pill"
+        for d in _SC_RANGES
+    ]
 
 
+# Generate chart — triggered by Generate button OR range pill change
 @callback(
     [
         Output("sc-chart", "figure"),
@@ -2369,16 +2377,14 @@ def _sc_range_noop(*args):
         Output("sc-summary", "children"),
         Output("sc-message", "children"),
     ],
-    Input("sc-generate", "n_clicks"),
-    [
-        State("sc-wallet-input", "value"),
-        State("sc-game-dropdown", "value"),
-    ] + [State(f"sc-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    [Input("sc-generate", "n_clicks"), Input("sc-active-range", "data")],
+    [State("sc-wallet-input", "value"), State("sc-game-dropdown", "value")],
     prevent_initial_call=True,
 )
-def generate_subcategory_chart(n_clicks, wallet, filter_raw, *range_clicks):
+def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
     import plotly.graph_objects as go
 
+    # Only run if Generate was clicked at least once (don't fire on initial range store)
     if not n_clicks:
         return no_update, no_update, no_update, no_update
 
@@ -2394,14 +2400,7 @@ def generate_subcategory_chart(n_clicks, wallet, filter_raw, *range_clicks):
     else:
         filter_level, filter_value = "detail", filter_raw
 
-    # Determine lookback from which range pill was last clicked
-    range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
-    lookback = 365
-    max_clicks = 0
-    for i, clicks in enumerate(range_clicks):
-        if clicks and clicks > max_clicks:
-            max_clicks = clicks
-            lookback = range_map[i]
+    lookback = active_range or 365
 
     try:
         from lib.clickhouse_charts import get_wallet_game_chart
