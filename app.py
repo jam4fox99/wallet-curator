@@ -1066,6 +1066,89 @@ def wallet_management_layout():
     )
 
 
+def subcategory_charts_layout():
+    RANGE_OPTIONS = [
+        {"label": "1D", "value": 1},
+        {"label": "7D", "value": 7},
+        {"label": "2W", "value": 14},
+        {"label": "30D", "value": 30},
+        {"label": "ALL", "value": 365},
+    ]
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            _card(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Subcategory Charts", className="pm-kicker"),
+                                    html.H2("Game-Specific Wallet Performance", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                        ],
+                        className="pm-card-head",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Wallet Address", className="pm-field-label"),
+                                    dcc.Input(
+                                        id="sc-wallet-input",
+                                        type="text",
+                                        placeholder="0x...",
+                                        className="pm-text-input",
+                                        style={"width": "100%", "padding": "8px 12px", "fontSize": "13px",
+                                               "background": "var(--pm-surface-alt)", "border": "1px solid var(--pm-border)",
+                                               "borderRadius": "8px", "color": "var(--pm-text)", "fontFamily": "monospace"},
+                                    ),
+                                ],
+                                style={"flex": "2"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Game", className="pm-field-label"),
+                                    dcc.Dropdown(
+                                        id="sc-game-dropdown",
+                                        placeholder="Select game...",
+                                        className="pm-wallet-dropdown",
+                                    ),
+                                ],
+                                style={"flex": "1"},
+                            ),
+                        ],
+                        style={"display": "flex", "gap": "16px", "marginBottom": "12px"},
+                    ),
+                    html.Div(
+                        [
+                            html.Button(
+                                opt["label"],
+                                id=f"sc-range-{opt['value']}",
+                                className="pm-range-pill",
+                                n_clicks=0,
+                            )
+                            for opt in RANGE_OPTIONS
+                        ],
+                        style={"display": "flex", "gap": "6px", "marginBottom": "16px"},
+                    ),
+                    html.Button("Generate Chart", id="sc-generate", className="pm-button pm-button--primary", n_clicks=0),
+                    html.Div(id="sc-message", className="pm-inline-message", style={"marginTop": "12px"}),
+                ],
+                class_name="pm-admin-card",
+            ),
+            html.Div(id="sc-summary", style={"marginTop": "16px"}),
+            html.Div(
+                dcc.Graph(id="sc-chart", style={"height": "500px"}, config={"displayModeBar": False}),
+                id="sc-chart-container",
+                style={"display": "none", "marginTop": "16px"},
+            ),
+        ],
+    )
+
+
 def settings_layout():
     return html.Div(
         className="pm-page-stack",
@@ -1275,6 +1358,12 @@ def serve_layout():
                                 selected_className="pm-tab pm-tab--selected",
                             ),
                             dcc.Tab(
+                                label="Subcategory Charts",
+                                value="subcategory-charts",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
                                 label="Settings",
                                 value="settings",
                                 className="pm-tab",
@@ -1293,6 +1382,7 @@ def serve_layout():
                             html.Div(id="overview-container", children=overview_layout()),
                             html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
                             html.Div(id="wallet-management-container", children=wallet_management_layout(), style={"display": "none"}),
+                            html.Div(id="subcategory-charts-container", children=subcategory_charts_layout(), style={"display": "none"}),
                             html.Div(id="settings-container", children=settings_layout(), style={"display": "none"}),
                             html.Div(id="changes-container", children=changes_layout(), style={"display": "none"}),
                         ],
@@ -1348,10 +1438,16 @@ TAB_PATHS = {
     "overview": "/",
     "wallets": "/wallets",
     "wallet-management": "/wallet-management",
+    "subcategory-charts": "/subcategory-charts",
     "settings": "/settings",
     "changes": "/changes",
 }
 PATH_TO_TAB = {v: k for k, v in TAB_PATHS.items()}
+
+_HIDE = {"display": "none"}
+_SHOW = {"display": "block"}
+_TAB_ORDER = ["overview", "wallets", "wallet-management", "subcategory-charts", "settings", "changes"]
+_CONTAINER_IDS = [f"{t.replace('subcategory-charts', 'subcategory-charts')}-container" for t in _TAB_ORDER]
 
 
 @callback(
@@ -1359,21 +1455,14 @@ PATH_TO_TAB = {v: k for k, v in TAB_PATHS.items()}
         Output("overview-container", "style"),
         Output("wallet-container", "style"),
         Output("wallet-management-container", "style"),
+        Output("subcategory-charts-container", "style"),
         Output("settings-container", "style"),
         Output("changes-container", "style"),
     ],
     Input("tabs", "value"),
 )
 def render_tab(active_tab):
-    if active_tab == "wallets":
-        return {"display": "none"}, {"display": "block"}, {"display": "none"}, {"display": "none"}, {"display": "none"}
-    if active_tab == "wallet-management":
-        return {"display": "none"}, {"display": "none"}, {"display": "block"}, {"display": "none"}, {"display": "none"}
-    if active_tab == "settings":
-        return {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "block"}, {"display": "none"}
-    if active_tab == "changes":
-        return {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "block"}
-    return {"display": "block"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}
+    return [_SHOW if tab == active_tab else _HIDE for tab in _TAB_ORDER]
 
 
 # Sync URL → tab on page load
@@ -2211,6 +2300,151 @@ def handle_export_txt(n_clicks):
     except Exception as exc:
         logger.exception("TXT export failed")
         return no_update
+
+
+# ─── Subcategory Charts callbacks ──────────────────────────────
+@callback(
+    Output("sc-game-dropdown", "options"),
+    Input("tabs", "value"),
+)
+def load_game_options(tab):
+    if tab != "subcategory-charts":
+        return no_update
+    try:
+        from lib.clickhouse_charts import ClickHouseClient, get_available_games
+        client = ClickHouseClient()
+        games = get_available_games(client)
+        return [{"label": g, "value": g} for g in games]
+    except Exception as exc:
+        logger.warning("Failed to load games from ClickHouse: %s", exc)
+        return [
+            {"label": "Counter-Strike", "value": "Counter-Strike"},
+            {"label": "League of Legends", "value": "League of Legends"},
+            {"label": "Dota 2", "value": "Dota 2"},
+            {"label": "Valorant", "value": "Valorant"},
+        ]
+
+
+_SC_RANGE_STORE = dcc.Store(id="sc-range-value", data=365)
+# Inject the store into layout — find it via the subcategory-charts-container
+app.layout.children[0].children[2].children[0].children.insert(
+    -1,  # before settings
+    _SC_RANGE_STORE,
+) if False else None  # skip — we'll add it inline below
+
+
+@callback(
+    Output("sc-range-value", "data", allow_duplicate=True) if False else Output("sc-message", "children", allow_duplicate=True),
+    [Input(f"sc-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    prevent_initial_call=True,
+)
+def _sc_range_noop(*args):
+    # Range is handled via triggered_id in the generate callback
+    return no_update
+
+
+@callback(
+    [
+        Output("sc-chart", "figure"),
+        Output("sc-chart-container", "style"),
+        Output("sc-summary", "children"),
+        Output("sc-message", "children"),
+    ],
+    Input("sc-generate", "n_clicks"),
+    [
+        State("sc-wallet-input", "value"),
+        State("sc-game-dropdown", "value"),
+    ] + [State(f"sc-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    prevent_initial_call=True,
+)
+def generate_subcategory_chart(n_clicks, wallet, game, *range_clicks):
+    import plotly.graph_objects as go
+
+    if not n_clicks:
+        return no_update, no_update, no_update, no_update
+
+    if not wallet or not wallet.startswith("0x"):
+        return no_update, {"display": "none"}, "", dbc.Alert("Enter a valid wallet address (0x...)", color="warning")
+
+    if not game:
+        return no_update, {"display": "none"}, "", dbc.Alert("Select a game from the dropdown.", color="warning")
+
+    # Determine lookback from which range pill was last clicked
+    range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
+    lookback = 365
+    max_clicks = 0
+    for i, clicks in enumerate(range_clicks):
+        if clicks and clicks > max_clicks:
+            max_clicks = clicks
+            lookback = range_map[i]
+
+    try:
+        from lib.clickhouse_charts import get_wallet_game_chart
+        payload = get_wallet_game_chart(wallet.strip().lower(), game, lookback)
+    except Exception as exc:
+        logger.exception("ClickHouse chart query failed")
+        return no_update, {"display": "none"}, "", dbc.Alert(f"ClickHouse error: {exc}", color="danger")
+
+    if not payload:
+        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {game}.", color="info")
+
+    series = payload["series"]
+    summary = payload["summary"]
+    dates = [s["date"] for s in series]
+    pnl = [s["pnl"] for s in series]
+
+    final_pnl = summary["final_pnl"]
+    color = "#22c55e" if final_pnl >= 0 else "#ef4444"
+    fill_color = "rgba(34,197,94,0.12)" if final_pnl >= 0 else "rgba(239,68,68,0.12)"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates, y=pnl,
+        mode="lines",
+        line=dict(color=color, width=2),
+        fill="tozeroy",
+        fillcolor=fill_color,
+        customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "P&L: $%{y:,.2f}<br>"
+            "Cash: $%{customdata[0]:,.2f}<br>"
+            "Marked Value: $%{customdata[1]:,.2f}<br>"
+            "Trades: %{customdata[2]}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=20, b=40),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(
+            showgrid=True, gridcolor="rgba(122,145,173,0.10)",
+            zeroline=False, tickprefix="$",
+        ),
+        hovermode="x unified",
+    )
+
+    # Summary stats
+    sign = "" if final_pnl == 0 else ("-" if final_pnl < 0 else "")
+    pnl_str = f"{sign}${abs(final_pnl):,.2f}"
+    vol_str = f"${summary['total_volume_usd']:,.0f}"
+
+    stats = html.Div([
+        _card([
+            html.Div([
+                _stat_tile("Final P&L", pnl_str, tone="positive" if final_pnl >= 0 else "negative"),
+                _stat_tile("Trades", f"{summary['total_trades']:,}"),
+                _stat_tile("Volume", vol_str),
+                _stat_tile("Max Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
+                _stat_tile("Tokens", f"{summary['scoped_tokens']}"),
+                _stat_tile("Period", f"{summary['first_trade_date']} — {summary['chart_end_date']}"),
+            ], className="pm-wallet-stat-grid"),
+        ], class_name="pm-admin-card"),
+    ])
+
+    return fig, {"display": "block", "marginTop": "16px"}, stats, ""
 
 
 start_scheduler()
