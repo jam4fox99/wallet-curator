@@ -91,16 +91,20 @@ class ClickHouseClient:
             return False
 
 
-def get_available_games(client: ClickHouseClient) -> list[str]:
-    """Query ClickHouse for distinct game names from token metadata."""
+def get_available_categories(client: ClickHouseClient) -> list[dict]:
+    """Query ClickHouse for all category + subcategory_detail combos."""
     db = _validate_id(client.database)
     rows = client.query(f"""
-        SELECT DISTINCT subcategory_detail
+        SELECT category, subcategory_detail, count() as token_count
         FROM {db}.token_metadata_latest_v2
         WHERE subcategory_detail != ''
-        ORDER BY subcategory_detail ASC
+        GROUP BY category, subcategory_detail
+        ORDER BY category ASC, token_count DESC
     """)
-    return [str(row["subcategory_detail"]) for row in rows if row.get("subcategory_detail")]
+    return [
+        {"category": str(r["category"]), "detail": str(r["subcategory_detail"]), "count": int(r["token_count"])}
+        for r in rows if r.get("subcategory_detail")
+    ]
 
 
 def fetch_token_scope(client: ClickHouseClient, wallet: str, game: str, lookback_days: int) -> list[dict]:

@@ -2,7 +2,10 @@
 """Wallet Curator cloud dashboard."""
 import logging
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import dash
 import dash_bootstrap_components as dbc
@@ -1084,7 +1087,7 @@ def subcategory_charts_layout():
                             html.Div(
                                 [
                                     html.Div("Subcategory Charts", className="pm-kicker"),
-                                    html.H2("Game-Specific Wallet Performance", className="pm-section-title pm-section-title--blue"),
+                                    html.H2("Wallet Performance by Category", className="pm-section-title pm-section-title--blue"),
                                 ],
                                 className="pm-card-title-block",
                             ),
@@ -1110,10 +1113,11 @@ def subcategory_charts_layout():
                             ),
                             html.Div(
                                 [
-                                    html.Div("Game", className="pm-field-label"),
+                                    html.Div("Category", className="pm-field-label"),
                                     dcc.Dropdown(
                                         id="sc-game-dropdown",
-                                        placeholder="Select game...",
+                                        placeholder="Select category...",
+                                        searchable=True,
                                         className="pm-wallet-dropdown",
                                     ),
                                 ],
@@ -2311,17 +2315,23 @@ def load_game_options(tab):
     if tab != "subcategory-charts":
         return no_update
     try:
-        from lib.clickhouse_charts import ClickHouseClient, get_available_games
+        from lib.clickhouse_charts import ClickHouseClient, get_available_categories
         client = ClickHouseClient()
-        games = get_available_games(client)
-        return [{"label": g, "value": g} for g in games]
+        cats = get_available_categories(client)
+        # Group by category for the dropdown
+        options = []
+        for item in cats:
+            label = f"{item['category']} / {item['detail']} ({item['count']:,})"
+            options.append({"label": label, "value": item["detail"]})
+        return options
     except Exception as exc:
-        logger.warning("Failed to load games from ClickHouse: %s", exc)
+        logger.warning("Failed to load categories from ClickHouse: %s", exc)
         return [
-            {"label": "Counter-Strike", "value": "Counter-Strike"},
-            {"label": "League of Legends", "value": "League of Legends"},
-            {"label": "Dota 2", "value": "Dota 2"},
-            {"label": "Valorant", "value": "Valorant"},
+            {"label": "Sports / Counter-Strike", "value": "Counter-Strike"},
+            {"label": "Sports / League of Legends", "value": "League of Legends"},
+            {"label": "Sports / Dota 2", "value": "Dota 2"},
+            {"label": "Sports / Valorant", "value": "Valorant"},
+            {"label": "Sports / NBA", "value": "NBA"},
         ]
 
 
@@ -2447,6 +2457,48 @@ def generate_subcategory_chart(n_clicks, wallet, game, *range_clicks):
     return fig, {"display": "block", "marginTop": "16px"}, stats, ""
 
 
+def _ensure_clickhouse_tunnel():
+    """Auto-start SSH tunnel for local ClickHouse access if not already running."""
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("DISABLE_TUNNEL") == "1":
+        return  # skip on Railway or if explicitly disabled
+    ch_url = os.environ.get("CLICKHOUSE_URL", "")
+    if "127.0.0.1" not in ch_url and "localhost" not in ch_url:
+        return  # not using local tunnel
+    key_path = Path.home() / ".ssh" / "jake_hetzner_ed25519"
+    if not key_path.exists():
+        logger.info("SSH key not found at %s — skipping tunnel", key_path)
+        return
+    # Check if tunnel is already running
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "ssh.*8123.*142.132.139.47"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logger.info("ClickHouse SSH tunnel already running")
+            return
+    except Exception:
+        pass
+    # Start tunnel in background
+    try:
+        subprocess.Popen(
+            [
+                "ssh", "-N", "-f",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ExitOnForwardFailure=yes",
+                "-L", "8123:127.0.0.1:8123",
+                "-L", "9000:127.0.0.1:9000",
+                "-i", str(key_path),
+                "jake@142.132.139.47",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("Started ClickHouse SSH tunnel")
+    except Exception as exc:
+        logger.warning("Failed to start SSH tunnel: %s", exc)
+
+
 start_scheduler()
 try:
     init_db()
@@ -2454,5 +2506,6 @@ except Exception as exc:
     logger.warning("Initial database bootstrap failed: %s", exc)
 
 if __name__ == "__main__":
+    _ensure_clickhouse_tunnel()
     port = int(os.environ.get("PORT", "8050"))
     app.run(host="0.0.0.0", port=port, debug=False)
