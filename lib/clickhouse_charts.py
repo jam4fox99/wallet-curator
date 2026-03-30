@@ -91,26 +91,53 @@ class ClickHouseClient:
             return False
 
 
-def get_available_details(client: ClickHouseClient) -> list[dict]:
-    """Query ClickHouse for all filterable detail labels (subcategory_detail, falling back to subcategory)."""
+def get_available_filters(client: ClickHouseClient) -> list[dict]:
+    """Query all three filter levels: category, subcategory, and subcategory_detail."""
     db = _validate_id(client.database)
-    rows = client.query(f"""
-        SELECT
-            if(subcategory_detail != '', subcategory_detail, subcategory) AS detail_label,
-            count() AS token_count
+
+    # Categories (Sports, Crypto, Politics...)
+    cat_rows = client.query(f"""
+        SELECT category AS label, count() AS token_count
         FROM {db}.token_metadata_latest_v2
-        WHERE subcategory != '' OR subcategory_detail != ''
-        GROUP BY detail_label
-        ORDER BY token_count DESC
+        WHERE category != ''
+        GROUP BY category ORDER BY token_count DESC
     """)
-    return [
-        {"detail": str(r["detail_label"]), "count": int(r["token_count"])}
-        for r in rows if r.get("detail_label")
-    ]
+
+    # Subcategories (Tennis, NBA, Esports, US Politics...)
+    sub_rows = client.query(f"""
+        SELECT subcategory AS label, count() AS token_count
+        FROM {db}.token_metadata_latest_v2
+        WHERE subcategory != ''
+        GROUP BY subcategory ORDER BY token_count DESC
+    """)
+
+    # Details (Counter-Strike, Valorant, Lakers...)
+    det_rows = client.query(f"""
+        SELECT subcategory_detail AS label, count() AS token_count
+        FROM {db}.token_metadata_latest_v2
+        WHERE subcategory_detail != ''
+        GROUP BY subcategory_detail ORDER BY token_count DESC
+    """)
+
+    filters = []
+    for r in cat_rows:
+        filters.append({"label": r["label"], "count": int(r["token_count"]), "level": "category"})
+    for r in sub_rows:
+        filters.append({"label": r["label"], "count": int(r["token_count"]), "level": "subcategory"})
+    for r in det_rows:
+        filters.append({"label": r["label"], "count": int(r["token_count"]), "level": "detail"})
+
+    return filters
 
 
-def fetch_token_scope(client: ClickHouseClient, wallet: str, game: str, lookback_days: int) -> list[dict]:
+def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, filter_level: str, lookback_days: int) -> list[dict]:
     db = _validate_id(client.database)
+    if filter_level == "category":
+        scope_clause = f"tm.category = {_sql_quote(filter_value)}"
+    elif filter_level == "subcategory":
+        scope_clause = f"tm.subcategory = {_sql_quote(filter_value)}"
+    else:
+        scope_clause = f"tm.subcategory_detail = {_sql_quote(filter_value)}"
     rows = client.query(f"""
         SELECT
             t.token_id AS token_id,
@@ -121,7 +148,7 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, game: str, lookback
         FROM {db}.trades AS t
         INNER JOIN {db}.token_metadata_latest_v2 AS tm ON tm.token_id = t.token_id
         WHERE t.wallet = {_sql_quote(wallet)}
-          AND (tm.subcategory_detail = {_sql_quote(game)} OR (tm.subcategory_detail = '' AND tm.subcategory = {_sql_quote(game)}))
+          AND {scope_clause}
           AND t.ts >= now() - INTERVAL {int(lookback_days)} DAY
         GROUP BY t.token_id
         ORDER BY first_trade_ts ASC, token_id ASC
@@ -320,10 +347,10 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
     }
 
 
-def get_wallet_game_chart(wallet: str, game: str, lookback_days: int = 365) -> dict[str, Any]:
+def get_wallet_game_chart(wallet: str, filter_value: str, lookback_days: int = 365, filter_level: str = "detail") -> dict[str, Any]:
     """High-level function: fetch all data and build the chart payload."""
     client = ClickHouseClient()
-    token_scope = fetch_token_scope(client, wallet, game, lookback_days)
+    token_scope = fetch_token_scope(client, wallet, filter_value, filter_level, lookback_days)
     if not token_scope:
         return None
     token_ids = [t["token_id"] for t in token_scope]
@@ -332,4 +359,4 @@ def get_wallet_game_chart(wallet: str, game: str, lookback_days: int = 365) -> d
         return None
     closes = fetch_daily_closes(client, token_ids)
     resolutions = fetch_resolution_prices(client, token_ids)
-    return build_chart_payload(wallet, game, lookback_days, token_scope, trades, closes, resolutions)
+    return build_chart_payload(wallet, filter_value, lookback_days, token_scope, trades, closes, resolutions)

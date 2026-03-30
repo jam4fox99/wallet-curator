@@ -2315,21 +2315,32 @@ def load_game_options(tab):
     if tab != "subcategory-charts":
         return no_update
     try:
-        from lib.clickhouse_charts import ClickHouseClient, get_available_details
+        from lib.clickhouse_charts import ClickHouseClient, get_available_filters
         client = ClickHouseClient()
-        details = get_available_details(client)
-        return [
-            {"label": f"{d['detail']} ({d['count']:,})", "value": d["detail"]}
-            for d in details
-        ]
+        filters = get_available_filters(client)
+
+        # Build grouped options: categories first, then subcategories, then details
+        # Value encodes the level: "category::Sports", "subcategory::Tennis", "detail::Counter-Strike"
+        options = []
+        seen = set()
+        for level_label, level_key in [("Category", "category"), ("Subcategory", "subcategory"), ("Detail", "detail")]:
+            level_items = [f for f in filters if f["level"] == level_key]
+            for item in level_items:
+                val = f"{level_key}::{item['label']}"
+                if val not in seen:
+                    seen.add(val)
+                    options.append({
+                        "label": f"[{level_label}] {item['label']} ({item['count']:,})",
+                        "value": val,
+                    })
+        return options
     except Exception as exc:
-        logger.warning("Failed to load details from ClickHouse: %s", exc)
+        logger.warning("Failed to load filters from ClickHouse: %s", exc)
         return [
-            {"label": "Counter-Strike", "value": "Counter-Strike"},
-            {"label": "League of Legends", "value": "League of Legends"},
-            {"label": "Valorant", "value": "Valorant"},
-            {"label": "NBA", "value": "NBA"},
-            {"label": "US Politics", "value": "US Politics"},
+            {"label": "[Subcategory] Esports", "value": "subcategory::Esports"},
+            {"label": "[Detail] Counter-Strike", "value": "detail::Counter-Strike"},
+            {"label": "[Subcategory] NBA", "value": "subcategory::NBA"},
+            {"label": "[Subcategory] US Politics", "value": "subcategory::US Politics"},
         ]
 
 
@@ -2365,7 +2376,7 @@ def _sc_range_noop(*args):
     ] + [State(f"sc-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
     prevent_initial_call=True,
 )
-def generate_subcategory_chart(n_clicks, wallet, game, *range_clicks):
+def generate_subcategory_chart(n_clicks, wallet, filter_raw, *range_clicks):
     import plotly.graph_objects as go
 
     if not n_clicks:
@@ -2374,8 +2385,14 @@ def generate_subcategory_chart(n_clicks, wallet, game, *range_clicks):
     if not wallet or not wallet.startswith("0x"):
         return no_update, {"display": "none"}, "", dbc.Alert("Enter a valid wallet address (0x...)", color="warning")
 
-    if not game:
-        return no_update, {"display": "none"}, "", dbc.Alert("Select a game from the dropdown.", color="warning")
+    if not filter_raw:
+        return no_update, {"display": "none"}, "", dbc.Alert("Select a category from the dropdown.", color="warning")
+
+    # Parse level and value from "level::value" format
+    if "::" in filter_raw:
+        filter_level, filter_value = filter_raw.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", filter_raw
 
     # Determine lookback from which range pill was last clicked
     range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
@@ -2388,13 +2405,13 @@ def generate_subcategory_chart(n_clicks, wallet, game, *range_clicks):
 
     try:
         from lib.clickhouse_charts import get_wallet_game_chart
-        payload = get_wallet_game_chart(wallet.strip().lower(), game, lookback)
+        payload = get_wallet_game_chart(wallet.strip().lower(), filter_value, lookback, filter_level=filter_level)
     except Exception as exc:
         logger.exception("ClickHouse chart query failed")
         return no_update, {"display": "none"}, "", dbc.Alert(f"ClickHouse error: {exc}", color="danger")
 
     if not payload:
-        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {game}.", color="info")
+        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info")
 
     series = payload["series"]
     summary = payload["summary"]
