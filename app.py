@@ -2624,6 +2624,28 @@ def load_curation_categories(tab):
         return [{"label": "[Subcategory] Esports", "value": "subcategory::Esports"}]
 
 
+_CUR_RANGES = [1, 7, 14, 30, 365]
+
+
+@callback(
+    [Output(f"cur-setup-range-{d}", "className") for d in _CUR_RANGES],
+    [Input(f"cur-setup-range-{d}", "n_clicks") for d in _CUR_RANGES],
+    prevent_initial_call=True,
+)
+def highlight_cur_range(c1, c7, c14, c30, c365):
+    triggered = dash.ctx.triggered_id
+    click_map = {f"cur-setup-range-{d}": d for d in _CUR_RANGES}
+    clicks_map = {f"cur-setup-range-1": c1, f"cur-setup-range-7": c7, f"cur-setup-range-14": c14,
+                  f"cur-setup-range-30": c30, f"cur-setup-range-365": c365}
+    selected = 365
+    if triggered in click_map and clicks_map.get(triggered):
+        selected = click_map[triggered]
+    return [
+        "pm-range-pill pm-range-pill--active" if d == selected else "pm-range-pill"
+        for d in _CUR_RANGES
+    ]
+
+
 @callback(
     [Output("cur-wallets", "data"), Output("cur-filter", "data"), Output("cur-range", "data"),
      Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
