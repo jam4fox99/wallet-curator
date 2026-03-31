@@ -430,15 +430,26 @@ def get_wallet_curation_data(wallet: str, filter_value: str, lookback_days: int 
 
 
 def get_wallet_game_chart(wallet: str, filter_value: str, lookback_days: int = 365, filter_level: str = "detail") -> dict[str, Any]:
-    """High-level function: fetch all data and build the chart payload."""
+    """High-level function: fetch all data and build the chart payload.
+    Queries 2-4 run in parallel after token scope is fetched."""
+    from concurrent.futures import ThreadPoolExecutor
+
     client = ClickHouseClient()
     token_scope = fetch_token_scope(client, wallet, filter_value, filter_level, lookback_days)
     if not token_scope:
         return None
     token_ids = [t["token_id"] for t in token_scope]
-    trades = fetch_trades(client, wallet, token_ids, lookback_days)
+
+    # Run trades, closes, resolutions in parallel
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        trades_future = pool.submit(fetch_trades, client, wallet, token_ids, lookback_days)
+        closes_future = pool.submit(fetch_daily_closes, client, token_ids)
+        resolutions_future = pool.submit(fetch_resolution_prices, client, token_ids)
+
+        trades = trades_future.result()
+        closes = closes_future.result()
+        resolutions = resolutions_future.result()
+
     if not trades:
         return None
-    closes = fetch_daily_closes(client, token_ids)
-    resolutions = fetch_resolution_prices(client, token_ids)
     return build_chart_payload(wallet, filter_value, lookback_days, token_scope, trades, closes, resolutions)
