@@ -63,6 +63,45 @@ def _daterange(start: date, end: date) -> list[date]:
     return days
 
 
+def _build_close_map(closes: list[dict[str, Any]]) -> dict[str, dict[date, float]]:
+    close_map: dict[str, dict[date, float]] = {}
+    for c in closes:
+        close_map.setdefault(c["token_id"], {})[c["trade_date"]] = c["close_price"]
+    return close_map
+
+
+def _resolved_price_as_of(resolution: dict[str, Any] | None, as_of_date: date) -> float | None:
+    if not resolution:
+        return None
+    resolved_ts = resolution.get("resolved_ts")
+    if not resolved_ts or resolved_ts.date() > as_of_date:
+        return None
+    return float(resolution["price"])
+
+
+def _latest_close_as_of(token_id: str, close_map: dict[str, dict[date, float]], as_of_date: date) -> float:
+    latest = None
+    for close_day, close_price in sorted(close_map.get(token_id, {}).items()):
+        if close_day > as_of_date:
+            break
+        latest = close_price
+    return float(latest) if latest is not None else 0.0
+
+
+def _build_final_price_lookup(token_ids: list[str], closes: list[dict[str, Any]],
+                              resolutions: dict[str, dict[str, Any]],
+                              as_of_date: date) -> dict[str, float]:
+    close_map = _build_close_map(closes)
+    final_prices = {}
+    for token_id in token_ids:
+        resolved_price = _resolved_price_as_of(resolutions.get(token_id), as_of_date)
+        if resolved_price is not None:
+            final_prices[token_id] = resolved_price
+        else:
+            final_prices[token_id] = _latest_close_as_of(token_id, close_map, as_of_date)
+    return final_prices
+
+
 class ClickHouseClient:
     def __init__(self, url=None, user=None, password=None, database=None, timeout=120.0):
         self.url = url or CLICKHOUSE_URL
@@ -260,20 +299,17 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
     calendar = _daterange(first_trade_date, chart_end_date)
 
     # Build close price lookup: {token_id: {date: price}}
-    close_map = {}
-    for c in closes:
-        close_map.setdefault(c["token_id"], {})[c["trade_date"]] = c["close_price"]
+    close_map = _build_close_map(closes)
 
     # Build daily price lookup with forward-fill + resolution
     def get_prices(token_id):
         prices = {}
         latest = None
         res = resolutions.get(token_id)
-        res_day = res["resolved_ts"].date() if res else None
-        res_price = res["price"] if res else None
         for day in calendar:
-            if res_day and day >= res_day and res_price is not None:
-                prices[day] = res_price
+            resolved_price = _resolved_price_as_of(res, day)
+            if resolved_price is not None:
+                prices[day] = resolved_price
                 continue
             if day in close_map.get(token_id, {}):
                 latest = close_map[token_id][day]
@@ -348,12 +384,8 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
 
 
 def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
-                                  closes: list[dict], resolutions: dict) -> dict[str, Any]:
-    """Compute per-market P&L using position tracking (same logic as the chart).
-
-    For each condition_id: track positions per token, apply resolution/close prices,
-    then P&L = cash_flow + final_position_value.
-    """
+                                 final_prices: dict[str, float]) -> dict[str, Any]:
+    """Compute per-market P&L using the chart's snapshot pricing basis."""
     if not trades:
         return {"markets": [], "total_markets": 0, "concentration": {"top1_pct": 0, "top3_pct": 0, "top5_pct": 0}, "win_rate": 0}
 
@@ -361,17 +393,6 @@ def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
     token_to_question = {}
     for t in token_scope:
         token_to_question[t["token_id"]] = t.get("question", "Unknown")
-
-    # Build last known price per token (resolution price if resolved, else latest close)
-    last_close = {}
-    for c in closes:
-        last_close[c["token_id"]] = c["close_price"]  # keeps overwriting to latest
-
-    def final_price(token_id):
-        res = resolutions.get(token_id)
-        if res:
-            return res["price"]
-        return last_close.get(token_id, 0)
 
     # Aggregate per market (by question name): cash flow, positions, trade count
     mkt_cash = {}       # question -> total cash flow
@@ -402,7 +423,7 @@ def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
     for question in mkt_cash:
         cash = mkt_cash[question]
         position_value = sum(
-            max(shares, 0) * final_price(tid)
+            shares * final_prices.get(tid, 0.0)
             for tid, shares in mkt_positions[question].items()
         )
         pnl = cash + position_value
@@ -463,8 +484,9 @@ def get_wallet_curation_data(wallet: str, filter_value: str, lookback_days: int 
     if not chart:
         return None
 
-    # Compute market breakdown using position tracking (same data, no extra queries)
-    breakdown = compute_market_pnl_breakdown(token_scope, trades, closes, resolutions)
+    chart_end_date = _parse_date(chart["summary"]["chart_end_date"])
+    final_prices = _build_final_price_lookup(token_ids, closes, resolutions, chart_end_date)
+    breakdown = compute_market_pnl_breakdown(token_scope, trades, final_prices)
     chart["breakdown"] = breakdown
 
     vol = chart["summary"]["total_volume_usd"]
