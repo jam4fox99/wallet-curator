@@ -2602,10 +2602,10 @@ def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
 # ─── Wallet Curation callbacks ─────────────────────────────────
 @callback(
     Output("cur-category", "options"),
-    Input("tabs", "value"),
+    [Input("tabs", "value"), Input("url", "pathname")],
 )
-def load_curation_categories(tab):
-    if tab != "wallet-curation":
+def load_curation_categories(tab, pathname):
+    if tab != "wallet-curation" and pathname != "/wallet-curation":
         return no_update
     try:
         from lib.clickhouse_charts import ClickHouseClient, get_available_filters
