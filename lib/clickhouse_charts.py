@@ -347,48 +347,82 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
     }
 
 
-def fetch_market_pnl_breakdown(client: ClickHouseClient, wallet: str, filter_value: str, filter_level: str, lookback_days: int) -> dict[str, Any]:
-    """Fetch per-market P&L breakdown for concentration analysis."""
-    db = _validate_id(client.database)
-    if filter_level == "category":
-        scope_clause = f"tm.category = {_sql_quote(filter_value)}"
-    elif filter_level == "subcategory":
-        scope_clause = f"tm.subcategory = {_sql_quote(filter_value)}"
-    else:
-        scope_clause = f"tm.subcategory_detail = {_sql_quote(filter_value)}"
+def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
+                                  closes: list[dict], resolutions: dict) -> dict[str, Any]:
+    """Compute per-market P&L using position tracking (same logic as the chart).
 
-    rows = client.query(f"""
-        SELECT
-            t.condition_id,
-            any(tm.question) AS market_name,
-            countIf(side = 'BUY') AS buy_count,
-            countIf(side = 'SELL') AS sell_count,
-            count() AS total_trades,
-            sum(if(side = 'BUY', -toFloat64(usdc), toFloat64(usdc))) - sum(toFloat64(fee_usdc)) AS net_cash,
-            sum(toFloat64(usdc)) AS volume
-        FROM {db}.trades AS t
-        INNER JOIN {db}.token_metadata_latest_v2 AS tm ON tm.token_id = t.token_id
-        WHERE t.wallet = {_sql_quote(wallet)}
-          AND {scope_clause}
-          AND t.ts >= now() - INTERVAL {int(lookback_days)} DAY
-        GROUP BY t.condition_id
-        ORDER BY net_cash DESC
-    """)
+    For each condition_id: track positions per token, apply resolution/close prices,
+    then P&L = cash_flow + final_position_value.
+    """
+    if not trades:
+        return {"markets": [], "total_markets": 0, "concentration": {"top1_pct": 0, "top3_pct": 0, "top5_pct": 0}, "win_rate": 0}
 
-    markets = [
-        {
-            "condition_id": str(r["condition_id"]),
-            "market_name": str(r.get("market_name") or "Unknown"),
-            "buy_count": int(r["buy_count"]),
-            "sell_count": int(r["sell_count"]),
-            "total_trades": int(r["total_trades"]),
-            "net_cash": round(float(r["net_cash"]), 2),
-            "volume": round(float(r["volume"]), 2),
-        }
-        for r in rows
-    ]
+    # Map token_id -> condition_id and question
+    token_to_condition = {}
+    condition_questions = {}
+    for t in token_scope:
+        token_to_condition[t["token_id"]] = t["condition_id"]
+        condition_questions[t["condition_id"]] = t.get("question", "Unknown")
 
-    # Concentration metrics
+    # Build last known price per token (resolution price if resolved, else latest close)
+    last_close = {}
+    for c in closes:
+        last_close[c["token_id"]] = c["close_price"]  # keeps overwriting to latest
+
+    def final_price(token_id):
+        res = resolutions.get(token_id)
+        if res:
+            return res["price"]
+        return last_close.get(token_id, 0)
+
+    # Aggregate per condition: cash flow, positions, trade count
+    cond_cash = {}      # condition_id -> total cash flow
+    cond_positions = {}  # condition_id -> {token_id: shares}
+    cond_trades = {}    # condition_id -> trade count
+    cond_volume = {}    # condition_id -> total volume
+
+    for t in trades:
+        cid = token_to_condition.get(t["token_id"], t.get("condition_id", ""))
+        if not cid:
+            continue
+
+        if cid not in cond_cash:
+            cond_cash[cid] = 0.0
+            cond_positions[cid] = {}
+            cond_trades[cid] = 0
+            cond_volume[cid] = 0.0
+
+        signed_shares = t["shares"] if t["side"] == "BUY" else -t["shares"]
+        signed_cash = -t["usdc"] if t["side"] == "BUY" else t["usdc"]
+
+        cond_cash[cid] += signed_cash - t["fee_usdc"]
+        cond_positions[cid].setdefault(t["token_id"], 0.0)
+        cond_positions[cid][t["token_id"]] += signed_shares
+        cond_trades[cid] += 1
+        cond_volume[cid] += t["usdc"]
+
+    # Compute final P&L per condition: cash + marked position value
+    markets = []
+    for cid in cond_cash:
+        cash = cond_cash[cid]
+        position_value = sum(
+            max(shares, 0) * final_price(tid)
+            for tid, shares in cond_positions[cid].items()
+        )
+        pnl = cash + position_value
+
+        markets.append({
+            "condition_id": cid,
+            "market_name": condition_questions.get(cid, "Unknown"),
+            "total_trades": cond_trades[cid],
+            "net_cash": round(pnl, 2),
+            "volume": round(cond_volume[cid], 2),
+        })
+
+    # Sort by absolute P&L
+    markets.sort(key=lambda m: abs(m["net_cash"]), reverse=True)
+
+    # Concentration
     pnls = [m["net_cash"] for m in markets]
     total_abs = sum(abs(p) for p in pnls) if pnls else 0
     sorted_pnls = sorted(pnls, key=lambda x: abs(x), reverse=True)
@@ -402,26 +436,42 @@ def fetch_market_pnl_breakdown(client: ClickHouseClient, wallet: str, filter_val
     win_rate = round(profitable / len(pnls) * 100, 1) if pnls else 0
 
     return {
-        "markets": markets[:10],  # top 10 by absolute P&L
+        "markets": markets[:10],
         "total_markets": len(markets),
-        "concentration": {
-            "top1_pct": pct(1),
-            "top3_pct": pct(3),
-            "top5_pct": pct(5),
-        },
+        "concentration": {"top1_pct": pct(1), "top3_pct": pct(3), "top5_pct": pct(5)},
         "win_rate": win_rate,
     }
 
 
 def get_wallet_curation_data(wallet: str, filter_value: str, lookback_days: int = 365, filter_level: str = "detail") -> dict[str, Any]:
     """Fetch chart payload + market breakdown for curation page."""
+    from concurrent.futures import ThreadPoolExecutor
+
     client = ClickHouseClient()
-    chart = get_wallet_game_chart(wallet, filter_value, lookback_days, filter_level)
+    token_scope = fetch_token_scope(client, wallet, filter_value, filter_level, lookback_days)
+    if not token_scope:
+        return None
+    token_ids = [t["token_id"] for t in token_scope]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        trades_future = pool.submit(fetch_trades, client, wallet, token_ids, lookback_days)
+        closes_future = pool.submit(fetch_daily_closes, client, token_ids)
+        resolutions_future = pool.submit(fetch_resolution_prices, client, token_ids)
+        trades = trades_future.result()
+        closes = closes_future.result()
+        resolutions = resolutions_future.result()
+
+    if not trades:
+        return None
+
+    chart = build_chart_payload(wallet, filter_value, lookback_days, token_scope, trades, closes, resolutions)
     if not chart:
         return None
-    breakdown = fetch_market_pnl_breakdown(client, wallet, filter_value, filter_level, lookback_days)
+
+    # Compute market breakdown using position tracking (same data, no extra queries)
+    breakdown = compute_market_pnl_breakdown(token_scope, trades, closes, resolutions)
     chart["breakdown"] = breakdown
-    # Add ROI
+
     vol = chart["summary"]["total_volume_usd"]
     pnl = chart["summary"]["final_pnl"]
     chart["summary"]["roi_pct"] = round((pnl / vol * 100), 2) if vol else 0
