@@ -357,12 +357,10 @@ def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
     if not trades:
         return {"markets": [], "total_markets": 0, "concentration": {"top1_pct": 0, "top3_pct": 0, "top5_pct": 0}, "win_rate": 0}
 
-    # Map token_id -> condition_id and question
-    token_to_condition = {}
-    condition_questions = {}
+    # Map token_id -> question (individual market name)
+    token_to_question = {}
     for t in token_scope:
-        token_to_condition[t["token_id"]] = t["condition_id"]
-        condition_questions[t["condition_id"]] = t.get("question", "Unknown")
+        token_to_question[t["token_id"]] = t.get("question", "Unknown")
 
     # Build last known price per token (resolution price if resolved, else latest close)
     last_close = {}
@@ -375,48 +373,45 @@ def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
             return res["price"]
         return last_close.get(token_id, 0)
 
-    # Aggregate per condition: cash flow, positions, trade count
-    cond_cash = {}      # condition_id -> total cash flow
-    cond_positions = {}  # condition_id -> {token_id: shares}
-    cond_trades = {}    # condition_id -> trade count
-    cond_volume = {}    # condition_id -> total volume
+    # Aggregate per market (by question name): cash flow, positions, trade count
+    mkt_cash = {}       # question -> total cash flow
+    mkt_positions = {}   # question -> {token_id: shares}
+    mkt_trades = {}     # question -> trade count
+    mkt_volume = {}     # question -> total volume
 
     for t in trades:
-        cid = token_to_condition.get(t["token_id"], t.get("condition_id", ""))
-        if not cid:
-            continue
+        question = token_to_question.get(t["token_id"], "Unknown")
 
-        if cid not in cond_cash:
-            cond_cash[cid] = 0.0
-            cond_positions[cid] = {}
-            cond_trades[cid] = 0
-            cond_volume[cid] = 0.0
+        if question not in mkt_cash:
+            mkt_cash[question] = 0.0
+            mkt_positions[question] = {}
+            mkt_trades[question] = 0
+            mkt_volume[question] = 0.0
 
         signed_shares = t["shares"] if t["side"] == "BUY" else -t["shares"]
         signed_cash = -t["usdc"] if t["side"] == "BUY" else t["usdc"]
 
-        cond_cash[cid] += signed_cash - t["fee_usdc"]
-        cond_positions[cid].setdefault(t["token_id"], 0.0)
-        cond_positions[cid][t["token_id"]] += signed_shares
-        cond_trades[cid] += 1
-        cond_volume[cid] += t["usdc"]
+        mkt_cash[question] += signed_cash - t["fee_usdc"]
+        mkt_positions[question].setdefault(t["token_id"], 0.0)
+        mkt_positions[question][t["token_id"]] += signed_shares
+        mkt_trades[question] += 1
+        mkt_volume[question] += t["usdc"]
 
-    # Compute final P&L per condition: cash + marked position value
+    # Compute final P&L per market: cash + marked position value
     markets = []
-    for cid in cond_cash:
-        cash = cond_cash[cid]
+    for question in mkt_cash:
+        cash = mkt_cash[question]
         position_value = sum(
             max(shares, 0) * final_price(tid)
-            for tid, shares in cond_positions[cid].items()
+            for tid, shares in mkt_positions[question].items()
         )
         pnl = cash + position_value
 
         markets.append({
-            "condition_id": cid,
-            "market_name": condition_questions.get(cid, "Unknown"),
-            "total_trades": cond_trades[cid],
+            "market_name": question,
+            "total_trades": mkt_trades[question],
             "net_cash": round(pnl, 2),
-            "volume": round(cond_volume[cid], 2),
+            "volume": round(mkt_volume[question], 2),
         })
 
     # Sort by absolute P&L
