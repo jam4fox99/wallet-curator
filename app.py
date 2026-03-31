@@ -1161,6 +1161,8 @@ def subcategory_charts_layout():
                 id="sc-chart-container",
                 style={"display": "none", "marginTop": "16px"},
             ),
+            html.Div(id="sc-concentration", style={"marginTop": "12px"}),
+            html.Div(id="sc-top-markets", style={"marginTop": "12px"}),
         ],
     )
 
@@ -2498,12 +2500,64 @@ def update_active_range(c1, c7, c14, c30, c365, current):
 
 
 # Generate chart — triggered by Generate button OR range pill change
+def _build_concentration_badges(conc):
+    """Build concentration badge HTML from concentration dict."""
+    def badge(label, pct):
+        if pct > 50:
+            color, bg = "#ef4444", "rgba(239,68,68,0.12)"
+        elif pct > 30:
+            color, bg = "#f59e0b", "rgba(245,158,11,0.12)"
+        else:
+            color, bg = "#22c55e", "rgba(34,197,94,0.12)"
+        return html.Span(f"{label}: {pct}%",
+                          style={"color": color, "background": bg, "padding": "4px 10px",
+                                 "borderRadius": "6px", "fontSize": "12px", "border": f"1px solid {color}30"})
+
+    return html.Div([
+        html.Div("P&L Concentration", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Div([
+            badge("Top 1 Market", conc.get("top1_pct", 0)),
+            badge("Top 3 Markets", conc.get("top3_pct", 0)),
+            badge("Top 5 Markets", conc.get("top5_pct", 0)),
+        ], style={"display": "flex", "gap": "8px"}),
+    ])
+
+
+def _build_top_markets_table(markets):
+    """Build top markets HTML table."""
+    if not markets:
+        return ""
+    total_abs = sum(abs(m["net_cash"]) for m in markets) or 1
+    rows = []
+    for m in markets:
+        pct = round(abs(m["net_cash"]) / total_abs * 100, 1)
+        mc = "#22c55e" if m["net_cash"] >= 0 else "#ef4444"
+        rows.append(html.Tr([
+            html.Td(m["market_name"][:60], style={"maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"}),
+            html.Td(f"${m['net_cash']:,.2f}", style={"color": mc}),
+            html.Td(str(m["total_trades"])),
+            html.Td(f"{pct}%"),
+        ], className="pm-tier-table__row"))
+
+    return html.Div([
+        html.Div("Top Markets by P&L", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                                "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Table([
+            html.Thead(html.Tr([html.Th("Market"), html.Th("P&L"), html.Th("Trades"), html.Th("% of Total")])),
+            html.Tbody(rows),
+        ], className="pm-tier-table", style={"fontSize": "12px"}),
+    ])
+
+
 @callback(
     [
         Output("sc-chart", "figure"),
         Output("sc-chart-container", "style"),
         Output("sc-summary", "children"),
         Output("sc-message", "children"),
+        Output("sc-concentration", "children"),
+        Output("sc-top-markets", "children"),
     ],
     [Input("sc-generate", "n_clicks"), Input("sc-active-range", "data")],
     [State("sc-wallet-input", "value"), State("sc-game-dropdown", "value")],
@@ -2512,17 +2566,17 @@ def update_active_range(c1, c7, c14, c30, c365, current):
 def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
     import plotly.graph_objects as go
 
-    # Only run if Generate was clicked at least once (don't fire on initial range store)
+    empty = no_update, no_update, no_update, no_update, "", ""
+
     if not n_clicks:
-        return no_update, no_update, no_update, no_update
+        return empty
 
     if not wallet or not wallet.startswith("0x"):
-        return no_update, {"display": "none"}, "", dbc.Alert("Enter a valid wallet address (0x...)", color="warning")
+        return no_update, {"display": "none"}, "", dbc.Alert("Enter a valid wallet address (0x...)", color="warning"), "", ""
 
     if not filter_raw:
-        return no_update, {"display": "none"}, "", dbc.Alert("Select a category from the dropdown.", color="warning")
+        return no_update, {"display": "none"}, "", dbc.Alert("Select a category from the dropdown.", color="warning"), "", ""
 
-    # Parse level and value from "level::value" format
     if "::" in filter_raw:
         filter_level, filter_value = filter_raw.split("::", 1)
     else:
@@ -2531,72 +2585,58 @@ def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
     lookback = active_range or 365
 
     try:
-        from lib.clickhouse_charts import get_wallet_game_chart
-        payload = get_wallet_game_chart(wallet.strip().lower(), filter_value, lookback, filter_level=filter_level)
+        from lib.clickhouse_charts import get_wallet_curation_data
+        payload = get_wallet_curation_data(wallet.strip().lower(), filter_value, lookback, filter_level=filter_level)
     except Exception as exc:
         logger.exception("ClickHouse chart query failed")
-        return no_update, {"display": "none"}, "", dbc.Alert(f"ClickHouse error: {exc}", color="danger")
+        return no_update, {"display": "none"}, "", dbc.Alert(f"ClickHouse error: {exc}", color="danger"), "", ""
 
     if not payload:
-        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info")
+        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"), "", ""
 
     series = payload["series"]
     summary = payload["summary"]
-    dates = [s["date"] for s in series]
-    pnl = [s["pnl"] for s in series]
-
     final_pnl = summary["final_pnl"]
     color = "#22c55e" if final_pnl >= 0 else "#ef4444"
     fill_color = "rgba(34,197,94,0.12)" if final_pnl >= 0 else "rgba(239,68,68,0.12)"
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=dates, y=pnl,
-        mode="lines",
-        line=dict(color=color, width=2),
-        fill="tozeroy",
-        fillcolor=fill_color,
+        x=[s["date"] for s in series], y=[s["pnl"] for s in series],
+        mode="lines", line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
         customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
-        hovertemplate=(
-            "<b>%{x}</b><br>"
-            "P&L: $%{y:,.2f}<br>"
-            "Cash: $%{customdata[0]:,.2f}<br>"
-            "Marked Value: $%{customdata[1]:,.2f}<br>"
-            "Trades: %{customdata[2]}<extra></extra>"
-        ),
+        hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
     ))
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=50, r=20, t=20, b=40),
         xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(
-            showgrid=True, gridcolor="rgba(122,145,173,0.10)",
-            zeroline=False, tickprefix="$",
-        ),
+        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.10)", zeroline=False, tickprefix="$"),
         hovermode="x unified",
     )
 
-    # Summary stats
+    pnl_tone = "positive" if final_pnl >= 0 else "negative"
     sign = "" if final_pnl == 0 else ("-" if final_pnl < 0 else "")
-    pnl_str = f"{sign}${abs(final_pnl):,.2f}"
-    vol_str = f"${summary['total_volume_usd']:,.0f}"
-
     stats = html.Div([
         _card([
             html.Div([
-                _stat_tile("Final P&L", pnl_str, tone="positive" if final_pnl >= 0 else "negative"),
+                _stat_tile("Final P&L", f"{sign}${abs(final_pnl):,.2f}", tone=pnl_tone),
+                _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
                 _stat_tile("Trades", f"{summary['total_trades']:,}"),
-                _stat_tile("Volume", vol_str),
-                _stat_tile("Max Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
+                _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
+                _stat_tile("Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
+                _stat_tile("Win Rate", f"{summary.get('win_rate', 0):.0f}%"),
                 _stat_tile("Tokens", f"{summary['scoped_tokens']}"),
                 _stat_tile("Period", f"{summary['first_trade_date']} — {summary['chart_end_date']}"),
             ], className="pm-wallet-stat-grid"),
         ], class_name="pm-admin-card"),
     ])
 
-    return fig, {"display": "block", "marginTop": "16px"}, stats, ""
+    breakdown = payload.get("breakdown", {})
+    concentration = _build_concentration_badges(breakdown.get("concentration", {}))
+    top_markets = _build_top_markets_table(breakdown.get("markets", []))
+
+    return fig, {"display": "block", "marginTop": "16px"}, stats, "", concentration, top_markets
 
 
 # ─── Wallet Curation callbacks ─────────────────────────────────
@@ -2753,56 +2793,9 @@ def render_curation_wallet(index, wallets, filter_raw, lookback):
         _stat_tile("Win Rate", f"{summary.get('win_rate', 0):.0f}%"),
     ], className="pm-wallet-stat-grid")
 
-    # Concentration
     breakdown = data.get("breakdown", {})
-    conc = breakdown.get("concentration", {})
-
-    def conc_badge(label, pct):
-        if pct > 50:
-            color, bg = "#ef4444", "rgba(239,68,68,0.12)"
-        elif pct > 30:
-            color, bg = "#f59e0b", "rgba(245,158,11,0.12)"
-        else:
-            color, bg = "#22c55e", "rgba(34,197,94,0.12)"
-        return html.Span(f"{label}: {pct}%",
-                          style={"color": color, "background": bg, "padding": "4px 10px",
-                                 "borderRadius": "6px", "fontSize": "12px", "border": f"1px solid {color}30"})
-
-    concentration = html.Div([
-        html.Div("P&L Concentration", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
-                                              "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
-        html.Div([
-            conc_badge("Top 1 Market", conc.get("top1_pct", 0)),
-            conc_badge("Top 3 Markets", conc.get("top3_pct", 0)),
-            conc_badge("Top 5 Markets", conc.get("top5_pct", 0)),
-        ], style={"display": "flex", "gap": "8px"}),
-    ])
-
-    # Top markets table
-    top_markets_data = breakdown.get("markets", [])
-    total_abs = sum(abs(m["net_cash"]) for m in top_markets_data) if top_markets_data else 0
-    if top_markets_data:
-        market_rows = []
-        for m in top_markets_data:
-            pct = round(abs(m["net_cash"]) / total_abs * 100, 1) if total_abs else 0
-            mc = "#22c55e" if m["net_cash"] >= 0 else "#ef4444"
-            market_rows.append(html.Tr([
-                html.Td(m["market_name"][:60], style={"maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"}),
-                html.Td(f"${m['net_cash']:,.2f}", style={"color": mc}),
-                html.Td(str(m["total_trades"])),
-                html.Td(f"{pct}%"),
-            ], className="pm-tier-table__row"))
-
-        top_markets = html.Div([
-            html.Div("Top Markets by P&L", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
-                                                    "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
-            html.Table([
-                html.Thead(html.Tr([html.Th("Market"), html.Th("P&L"), html.Th("Trades"), html.Th("% of Total")])),
-                html.Tbody(market_rows),
-            ], className="pm-tier-table", style={"fontSize": "12px"}),
-        ])
-    else:
-        top_markets = ""
+    concentration = _build_concentration_badges(breakdown.get("concentration", {}))
+    top_markets = _build_top_markets_table(breakdown.get("markets", []))
 
     return [progress, header, fig, stats, concentration, top_markets]
 
