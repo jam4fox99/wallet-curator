@@ -7,6 +7,16 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Load .env if present (for local dev)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 import dash
 import dash_bootstrap_components as dbc
 from dash import ALL, Input, Output, State, callback, clientside_callback, dash_table, dcc, html, no_update
