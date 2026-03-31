@@ -1155,6 +1155,115 @@ def subcategory_charts_layout():
     )
 
 
+def wallet_curation_layout():
+    RANGE_OPTIONS = [
+        {"label": "1D", "value": 1},
+        {"label": "7D", "value": 7},
+        {"label": "2W", "value": 14},
+        {"label": "30D", "value": 30},
+        {"label": "ALL", "value": 365},
+    ]
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            # Stores
+            dcc.Store(id="cur-wallets", data=[]),
+            dcc.Store(id="cur-index", data=0),
+            dcc.Store(id="cur-approved", data=[]),
+            dcc.Store(id="cur-decisions", data={}),
+            dcc.Store(id="cur-filter", data=""),
+            dcc.Store(id="cur-range", data=365),
+            dcc.Store(id="cur-cache", data={}),
+            dcc.Store(id="cur-phase", data="setup"),
+
+            # Setup screen
+            html.Div(
+                id="cur-setup",
+                children=[
+                    _card([
+                        html.Div([
+                            html.Div("Wallet Curation", className="pm-kicker"),
+                            html.H2("Swipe Review", className="pm-section-title pm-section-title--blue"),
+                        ], className="pm-card-title-block"),
+                        html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
+                        dcc.Textarea(
+                            id="cur-wallet-input",
+                            placeholder="0xabc123...\n0xdef456...\n0x789...",
+                            style={"width": "100%", "minHeight": "120px", "padding": "8px 12px",
+                                   "fontSize": "13px", "background": "var(--pm-surface-alt)",
+                                   "border": "1px solid var(--pm-border)", "borderRadius": "8px",
+                                   "color": "var(--pm-text)", "fontFamily": "monospace"},
+                        ),
+                        html.Div([
+                            html.Div([
+                                html.Div("Category", className="pm-field-label"),
+                                dcc.Dropdown(id="cur-category", placeholder="Select category...",
+                                             searchable=True, className="pm-wallet-dropdown"),
+                            ], style={"flex": "1"}),
+                        ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                        html.Div([
+                            html.Button(opt["label"], id=f"cur-setup-range-{opt['value']}",
+                                        className="pm-range-pill" + (" pm-range-pill--active" if opt["value"] == 365 else ""),
+                                        n_clicks=0)
+                            for opt in RANGE_OPTIONS
+                        ], style={"display": "flex", "gap": "6px", "marginBottom": "16px"}),
+                        html.Button("Start Review", id="cur-start", className="pm-button pm-button--primary", n_clicks=0),
+                        html.Div(id="cur-setup-msg", style={"marginTop": "8px"}),
+                    ], class_name="pm-admin-card"),
+                ],
+            ),
+
+            # Swipe screen
+            html.Div(
+                id="cur-swipe",
+                style={"display": "none"},
+                children=[
+                    html.Div(id="cur-progress", style={"marginBottom": "12px", "color": "var(--pm-text-secondary)", "fontSize": "13px"}),
+                    html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
+                    dcc.Loading(
+                        html.Div([
+                            dcc.Graph(id="cur-chart", style={"height": "400px"}, config={"displayModeBar": False}),
+                            html.Div(id="cur-stats"),
+                            html.Div(id="cur-concentration", style={"marginTop": "12px"}),
+                            html.Div(id="cur-top-markets", style={"marginTop": "12px"}),
+                        ]),
+                        type="default",
+                    ),
+                    html.Div([
+                        html.Button("← Back", id="cur-back", className="pm-button pm-button--secondary", n_clicks=0),
+                        html.Button("✗ Skip", id="cur-skip", className="pm-button pm-button--secondary",
+                                    style={"color": "#ef4444", "borderColor": "#ef444440"}, n_clicks=0),
+                        html.Button("✓ Approve", id="cur-approve", className="pm-button pm-button--primary",
+                                    style={"background": "#22c55e", "borderColor": "#22c55e"}, n_clicks=0),
+                    ], style={"display": "flex", "gap": "12px", "justifyContent": "center", "marginTop": "20px"}),
+                ],
+            ),
+
+            # Results screen
+            html.Div(
+                id="cur-results",
+                style={"display": "none"},
+                children=[
+                    _card([
+                        html.Div([
+                            html.Div("Review Complete", className="pm-kicker"),
+                            html.H2(id="cur-results-title", className="pm-section-title pm-section-title--blue"),
+                        ], className="pm-card-title-block"),
+                        html.Div(id="cur-results-list", style={"marginTop": "12px", "fontFamily": "monospace", "fontSize": "13px"}),
+                        html.Div([
+                            dcc.Download(id="cur-download"),
+                            html.Button("Download Approved List", id="cur-download-btn",
+                                        className="pm-button pm-button--primary", n_clicks=0),
+                            html.Button("Start New Batch", id="cur-new-batch",
+                                        className="pm-button pm-button--secondary", n_clicks=0),
+                        ], style={"display": "flex", "gap": "12px", "marginTop": "16px"}),
+                    ], class_name="pm-admin-card"),
+                ],
+            ),
+        ],
+    )
+
+
 def settings_layout():
     return html.Div(
         className="pm-page-stack",
@@ -1364,6 +1473,12 @@ def serve_layout():
                                 selected_className="pm-tab pm-tab--selected",
                             ),
                             dcc.Tab(
+                                label="Wallet Curation",
+                                value="wallet-curation",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
                                 label="Subcategory Charts",
                                 value="subcategory-charts",
                                 className="pm-tab",
@@ -1388,6 +1503,7 @@ def serve_layout():
                             html.Div(id="overview-container", children=overview_layout()),
                             html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
                             html.Div(id="wallet-management-container", children=wallet_management_layout(), style={"display": "none"}),
+                            html.Div(id="wallet-curation-container", children=wallet_curation_layout(), style={"display": "none"}),
                             html.Div(id="subcategory-charts-container", children=subcategory_charts_layout(), style={"display": "none"}),
                             html.Div(id="settings-container", children=settings_layout(), style={"display": "none"}),
                             html.Div(id="changes-container", children=changes_layout(), style={"display": "none"}),
@@ -1444,6 +1560,7 @@ TAB_PATHS = {
     "overview": "/",
     "wallets": "/wallets",
     "wallet-management": "/wallet-management",
+    "wallet-curation": "/wallet-curation",
     "subcategory-charts": "/subcategory-charts",
     "settings": "/settings",
     "changes": "/changes",
@@ -1452,7 +1569,7 @@ PATH_TO_TAB = {v: k for k, v in TAB_PATHS.items()}
 
 _HIDE = {"display": "none"}
 _SHOW = {"display": "block"}
-_TAB_ORDER = ["overview", "wallets", "wallet-management", "subcategory-charts", "settings", "changes"]
+_TAB_ORDER = ["overview", "wallets", "wallet-management", "wallet-curation", "subcategory-charts", "settings", "changes"]
 _CONTAINER_IDS = [f"{t.replace('subcategory-charts', 'subcategory-charts')}-container" for t in _TAB_ORDER]
 
 
@@ -1461,6 +1578,7 @@ _CONTAINER_IDS = [f"{t.replace('subcategory-charts', 'subcategory-charts')}-cont
         Output("overview-container", "style"),
         Output("wallet-container", "style"),
         Output("wallet-management-container", "style"),
+        Output("wallet-curation-container", "style"),
         Output("subcategory-charts-container", "style"),
         Output("settings-container", "style"),
         Output("changes-container", "style"),
@@ -2469,6 +2587,267 @@ def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
     ])
 
     return fig, {"display": "block", "marginTop": "16px"}, stats, ""
+
+
+# ─── Wallet Curation callbacks ─────────────────────────────────
+@callback(
+    Output("cur-category", "options"),
+    Input("tabs", "value"),
+)
+def load_curation_categories(tab):
+    if tab != "wallet-curation":
+        return no_update
+    try:
+        from lib.clickhouse_charts import ClickHouseClient, get_available_filters
+        client = ClickHouseClient()
+        filters = get_available_filters(client)
+        options = []
+        seen = set()
+        for level_label, level_key in [("Category", "category"), ("Subcategory", "subcategory"), ("Detail", "detail")]:
+            for item in [f for f in filters if f["level"] == level_key]:
+                val = f"{level_key}::{item['label']}"
+                if val not in seen:
+                    seen.add(val)
+                    options.append({"label": f"[{level_label}] {item['label']} ({item['count']:,})", "value": val})
+        return options
+    except Exception:
+        return [{"label": "[Subcategory] Esports", "value": "subcategory::Esports"}]
+
+
+@callback(
+    [Output("cur-wallets", "data"), Output("cur-filter", "data"), Output("cur-range", "data"),
+     Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
+     Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
+     Output("cur-setup-msg", "children")],
+    Input("cur-start", "n_clicks"),
+    [State("cur-wallet-input", "value"), State("cur-category", "value")] +
+    [State(f"cur-setup-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    prevent_initial_call=True,
+)
+def start_curation(n_clicks, wallet_text, category, *range_clicks):
+    if not n_clicks:
+        return [no_update] * 10
+
+    if not wallet_text or not wallet_text.strip():
+        return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+    if not category:
+        return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
+
+    wallets = [w.strip().lower() for w in wallet_text.strip().split("\n") if w.strip().startswith("0x")]
+    if not wallets:
+        return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+
+    # Determine range
+    range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
+    lookback = 365
+    max_c = 0
+    for i, c in enumerate(range_clicks):
+        if c and c > max_c:
+            max_c = c
+            lookback = range_map[i]
+
+    return (
+        wallets, category, lookback, 0, [], {},
+        {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
+    )
+
+
+@callback(
+    [Output("cur-progress", "children"), Output("cur-wallet-header", "children"),
+     Output("cur-chart", "figure"), Output("cur-stats", "children"),
+     Output("cur-concentration", "children"), Output("cur-top-markets", "children")],
+    Input("cur-index", "data"),
+    [State("cur-wallets", "data"), State("cur-filter", "data"), State("cur-range", "data")],
+)
+def render_curation_wallet(index, wallets, filter_raw, lookback):
+    import plotly.graph_objects as go
+
+    if not wallets or index is None or index >= len(wallets):
+        return ["", "", go.Figure(), "", "", ""]
+
+    wallet = wallets[index]
+    if "::" in (filter_raw or ""):
+        filter_level, filter_value = filter_raw.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", filter_raw or ""
+
+    progress = f"Wallet {index + 1} of {len(wallets)}"
+    header = html.Div([
+        html.Span(wallet, className="pm-wallet-copyable", **{"data-clipboard": wallet}),
+        html.Span(f" — {filter_value}", style={"color": "var(--pm-text-secondary)", "marginLeft": "8px"}),
+    ])
+
+    try:
+        from lib.clickhouse_charts import get_wallet_curation_data
+        data = get_wallet_curation_data(wallet, filter_value, lookback, filter_level)
+    except Exception as exc:
+        logger.exception("Curation chart failed")
+        return [progress, header, go.Figure(), dbc.Alert(f"Error: {exc}", color="danger"), "", ""]
+
+    if not data:
+        return [progress, header, go.Figure(),
+                dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"), "", ""]
+
+    # Chart
+    series = data["series"]
+    summary = data["summary"]
+    final_pnl = summary["final_pnl"]
+    color = "#22c55e" if final_pnl >= 0 else "#ef4444"
+    fill_color = "rgba(34,197,94,0.12)" if final_pnl >= 0 else "rgba(239,68,68,0.12)"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[s["date"] for s in series], y=[s["pnl"] for s in series],
+        mode="lines", line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
+        customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
+        hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.10)", zeroline=False, tickprefix="$"),
+        hovermode="x unified",
+    )
+
+    # Stats
+    pnl_color = "positive" if final_pnl >= 0 else "negative"
+    stats = html.Div([
+        _stat_tile("Final P&L", f"${final_pnl:,.2f}", tone=pnl_color),
+        _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
+        _stat_tile("Trades", f"{summary['total_trades']:,}"),
+        _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
+        _stat_tile("Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
+        _stat_tile("Win Rate", f"{summary.get('win_rate', 0):.0f}%"),
+    ], className="pm-wallet-stat-grid")
+
+    # Concentration
+    breakdown = data.get("breakdown", {})
+    conc = breakdown.get("concentration", {})
+
+    def conc_badge(label, pct):
+        if pct > 50:
+            color, bg = "#ef4444", "rgba(239,68,68,0.12)"
+        elif pct > 30:
+            color, bg = "#f59e0b", "rgba(245,158,11,0.12)"
+        else:
+            color, bg = "#22c55e", "rgba(34,197,94,0.12)"
+        return html.Span(f"{label}: {pct}%",
+                          style={"color": color, "background": bg, "padding": "4px 10px",
+                                 "borderRadius": "6px", "fontSize": "12px", "border": f"1px solid {color}30"})
+
+    concentration = html.Div([
+        html.Div("P&L Concentration", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Div([
+            conc_badge("Top 1 Market", conc.get("top1_pct", 0)),
+            conc_badge("Top 3 Markets", conc.get("top3_pct", 0)),
+            conc_badge("Top 5 Markets", conc.get("top5_pct", 0)),
+        ], style={"display": "flex", "gap": "8px"}),
+    ])
+
+    # Top markets table
+    top_markets_data = breakdown.get("markets", [])
+    total_abs = sum(abs(m["net_cash"]) for m in top_markets_data) if top_markets_data else 0
+    if top_markets_data:
+        market_rows = []
+        for m in top_markets_data:
+            pct = round(abs(m["net_cash"]) / total_abs * 100, 1) if total_abs else 0
+            mc = "#22c55e" if m["net_cash"] >= 0 else "#ef4444"
+            market_rows.append(html.Tr([
+                html.Td(m["market_name"][:60], style={"maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"}),
+                html.Td(f"${m['net_cash']:,.2f}", style={"color": mc}),
+                html.Td(str(m["total_trades"])),
+                html.Td(f"{pct}%"),
+            ], className="pm-tier-table__row"))
+
+        top_markets = html.Div([
+            html.Div("Top Markets by P&L", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                                    "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+            html.Table([
+                html.Thead(html.Tr([html.Th("Market"), html.Th("P&L"), html.Th("Trades"), html.Th("% of Total")])),
+                html.Tbody(market_rows),
+            ], className="pm-tier-table", style={"fontSize": "12px"}),
+        ])
+    else:
+        top_markets = ""
+
+    return [progress, header, fig, stats, concentration, top_markets]
+
+
+@callback(
+    [Output("cur-index", "data", allow_duplicate=True),
+     Output("cur-approved", "data", allow_duplicate=True),
+     Output("cur-decisions", "data", allow_duplicate=True),
+     Output("cur-setup", "style", allow_duplicate=True),
+     Output("cur-swipe", "style", allow_duplicate=True),
+     Output("cur-results", "style", allow_duplicate=True),
+     Output("cur-results-title", "children"),
+     Output("cur-results-list", "children")],
+    [Input("cur-approve", "n_clicks"), Input("cur-skip", "n_clicks"), Input("cur-back", "n_clicks")],
+    [State("cur-index", "data"), State("cur-wallets", "data"),
+     State("cur-approved", "data"), State("cur-decisions", "data")],
+    prevent_initial_call=True,
+)
+def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions):
+    triggered = dash.ctx.triggered_id
+    if not triggered or not wallets:
+        return [no_update] * 8
+
+    if triggered == "cur-back":
+        if index > 0:
+            return [index - 1] + [no_update] * 7
+        return [no_update] * 8
+
+    wallet = wallets[index] if index < len(wallets) else None
+    if not wallet:
+        return [no_update] * 8
+
+    if triggered == "cur-approve" and approve_clicks:
+        if wallet not in approved:
+            approved = approved + [wallet]
+        decisions = {**decisions, wallet: "approved"}
+    elif triggered == "cur-skip" and skip_clicks:
+        decisions = {**decisions, wallet: "skipped"}
+    else:
+        return [no_update] * 8
+
+    next_index = index + 1
+    if next_index >= len(wallets):
+        # Done — show results
+        title = f"Approved {len(approved)} of {len(wallets)} wallets"
+        wallet_list = html.Div([html.Div(w, style={"fontFamily": "monospace", "padding": "2px 0"}) for w in approved]) if approved else html.Div("No wallets approved.", style={"color": "var(--pm-text-secondary)"})
+        return [next_index, approved, decisions,
+                {"display": "none"}, {"display": "none"}, {"display": "block"},
+                title, wallet_list]
+
+    return [next_index, approved, decisions, no_update, no_update, no_update, no_update, no_update]
+
+
+@callback(
+    Output("cur-download", "data"),
+    Input("cur-download-btn", "n_clicks"),
+    State("cur-approved", "data"),
+    prevent_initial_call=True,
+)
+def download_approved(n_clicks, approved):
+    if not n_clicks or not approved:
+        return no_update
+    txt = "\n".join(approved) + "\n"
+    return dict(content=txt, filename=f"approved_wallets_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+
+
+@callback(
+    [Output("cur-setup", "style", allow_duplicate=True),
+     Output("cur-swipe", "style", allow_duplicate=True),
+     Output("cur-results", "style", allow_duplicate=True)],
+    Input("cur-new-batch", "n_clicks"),
+    prevent_initial_call=True,
+)
+def new_batch(n_clicks):
+    if not n_clicks:
+        return [no_update] * 3
+    return [{"display": "block"}, {"display": "none"}, {"display": "none"}]
 
 
 def _ensure_clickhouse_tunnel():

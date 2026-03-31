@@ -347,6 +347,88 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
     }
 
 
+def fetch_market_pnl_breakdown(client: ClickHouseClient, wallet: str, filter_value: str, filter_level: str, lookback_days: int) -> dict[str, Any]:
+    """Fetch per-market P&L breakdown for concentration analysis."""
+    db = _validate_id(client.database)
+    if filter_level == "category":
+        scope_clause = f"tm.category = {_sql_quote(filter_value)}"
+    elif filter_level == "subcategory":
+        scope_clause = f"tm.subcategory = {_sql_quote(filter_value)}"
+    else:
+        scope_clause = f"tm.subcategory_detail = {_sql_quote(filter_value)}"
+
+    rows = client.query(f"""
+        SELECT
+            t.condition_id,
+            any(tm.question) AS market_name,
+            countIf(side = 'BUY') AS buy_count,
+            countIf(side = 'SELL') AS sell_count,
+            count() AS total_trades,
+            sum(if(side = 'BUY', -toFloat64(usdc), toFloat64(usdc))) - sum(toFloat64(fee_usdc)) AS net_cash,
+            sum(toFloat64(usdc)) AS volume
+        FROM {db}.trades AS t
+        INNER JOIN {db}.token_metadata_latest_v2 AS tm ON tm.token_id = t.token_id
+        WHERE t.wallet = {_sql_quote(wallet)}
+          AND {scope_clause}
+          AND t.ts >= now() - INTERVAL {int(lookback_days)} DAY
+        GROUP BY t.condition_id
+        ORDER BY net_cash DESC
+    """)
+
+    markets = [
+        {
+            "condition_id": str(r["condition_id"]),
+            "market_name": str(r.get("market_name") or "Unknown"),
+            "buy_count": int(r["buy_count"]),
+            "sell_count": int(r["sell_count"]),
+            "total_trades": int(r["total_trades"]),
+            "net_cash": round(float(r["net_cash"]), 2),
+            "volume": round(float(r["volume"]), 2),
+        }
+        for r in rows
+    ]
+
+    # Concentration metrics
+    pnls = [m["net_cash"] for m in markets]
+    total_abs = sum(abs(p) for p in pnls) if pnls else 0
+    sorted_pnls = sorted(pnls, key=lambda x: abs(x), reverse=True)
+
+    def pct(top_n):
+        if not total_abs:
+            return 0
+        return round(sum(abs(p) for p in sorted_pnls[:top_n]) / total_abs * 100, 1)
+
+    profitable = sum(1 for p in pnls if p > 0)
+    win_rate = round(profitable / len(pnls) * 100, 1) if pnls else 0
+
+    return {
+        "markets": markets[:10],  # top 10 by absolute P&L
+        "total_markets": len(markets),
+        "concentration": {
+            "top1_pct": pct(1),
+            "top3_pct": pct(3),
+            "top5_pct": pct(5),
+        },
+        "win_rate": win_rate,
+    }
+
+
+def get_wallet_curation_data(wallet: str, filter_value: str, lookback_days: int = 365, filter_level: str = "detail") -> dict[str, Any]:
+    """Fetch chart payload + market breakdown for curation page."""
+    client = ClickHouseClient()
+    chart = get_wallet_game_chart(wallet, filter_value, lookback_days, filter_level)
+    if not chart:
+        return None
+    breakdown = fetch_market_pnl_breakdown(client, wallet, filter_value, filter_level, lookback_days)
+    chart["breakdown"] = breakdown
+    # Add ROI
+    vol = chart["summary"]["total_volume_usd"]
+    pnl = chart["summary"]["final_pnl"]
+    chart["summary"]["roi_pct"] = round((pnl / vol * 100), 2) if vol else 0
+    chart["summary"]["win_rate"] = breakdown["win_rate"]
+    return chart
+
+
 def get_wallet_game_chart(wallet: str, filter_value: str, lookback_days: int = 365, filter_level: str = "detail") -> dict[str, Any]:
     """High-level function: fetch all data and build the chart payload."""
     client = ClickHouseClient()
