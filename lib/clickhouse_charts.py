@@ -106,6 +106,158 @@ def _build_final_price_lookup(token_ids: list[str], closes: list[dict[str, Any]]
     return final_prices
 
 
+def _weighted_average_trade_price(trades: list[dict[str, Any]]) -> float | None:
+    total_shares = sum(float(t.get("shares") or 0.0) for t in trades)
+    if total_shares <= 0:
+        return None
+    total_usdc = sum(float(t.get("usdc") or 0.0) for t in trades)
+    return total_usdc / total_shares
+
+
+def _severity_from_thresholds(value: float | None, amber: float, red: float) -> str:
+    if value is None:
+        return "green"
+    if value >= red:
+        return "red"
+    if value >= amber:
+        return "amber"
+    return "green"
+
+
+def _build_curation_metric_severities(active_days: int, unique_markets: int,
+                                      top1_pct: float, top3_pct: float,
+                                      both_sides_market_pct: float,
+                                      copy_price_gap: float | None,
+                                      near_certain_buy_volume_pct: float) -> dict[str, str]:
+    sample = "green"
+    if unique_markets < 10 or active_days < 5:
+        sample = "red"
+    elif unique_markets < 20 or active_days < 7:
+        sample = "amber"
+
+    concentration = "green"
+    if top1_pct >= 45 or top3_pct >= 75:
+        concentration = "red"
+    elif top1_pct >= 25 or top3_pct >= 60:
+        concentration = "amber"
+
+    return {
+        "sample": sample,
+        "concentration": concentration,
+        "top1_pct": _severity_from_thresholds(top1_pct, 25, 45),
+        "top3_pct": _severity_from_thresholds(top3_pct, 60, 75),
+        "both_sides_market_pct": _severity_from_thresholds(both_sides_market_pct, 70, 85),
+        "copy_price_gap": _severity_from_thresholds(copy_price_gap, 0.02, 0.04),
+        "near_certain_buy_volume_pct": _severity_from_thresholds(near_certain_buy_volume_pct, 10, 25),
+    }
+
+
+def _build_curation_warning_chips(active_days: int, unique_markets: int,
+                                  top1_pct: float, top3_pct: float,
+                                  both_sides_market_pct: float,
+                                  copy_price_gap: float | None,
+                                  near_certain_buy_volume_pct: float) -> tuple[list[dict[str, str]], dict[str, str]]:
+    severities = _build_curation_metric_severities(
+        active_days,
+        unique_markets,
+        top1_pct,
+        top3_pct,
+        both_sides_market_pct,
+        copy_price_gap,
+        near_certain_buy_volume_pct,
+    )
+    chips = []
+
+    if severities["sample"] != "green":
+        chips.append({
+            "key": "low_sample",
+            "label": "Low sample",
+            "severity": severities["sample"],
+            "detail": f"{unique_markets} markets / {active_days} days",
+        })
+    if severities["concentration"] != "green":
+        chips.append({
+            "key": "concentrated_edge",
+            "label": "Concentrated",
+            "severity": severities["concentration"],
+            "detail": f"top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%",
+        })
+    if severities["both_sides_market_pct"] != "green":
+        chips.append({
+            "key": "heavy_both_sides",
+            "label": "Both-sides",
+            "severity": severities["both_sides_market_pct"],
+            "detail": f"{both_sides_market_pct:.1f}%",
+        })
+    if severities["copy_price_gap"] != "green" and copy_price_gap is not None:
+        chips.append({
+            "key": "taker_price_disadvantage",
+            "label": "Buy gap",
+            "severity": severities["copy_price_gap"],
+            "detail": f"{copy_price_gap:+.4f}",
+        })
+    if severities["near_certain_buy_volume_pct"] != "green":
+        chips.append({
+            "key": "near_certain_buying",
+            "label": "Near-certain buys",
+            "severity": severities["near_certain_buy_volume_pct"],
+            "detail": f"{near_certain_buy_volume_pct:.1f}%",
+        })
+
+    return chips, severities
+
+
+def build_curation_signals(token_scope: list[dict[str, Any]], trades: list[dict[str, Any]],
+                           breakdown: dict[str, Any]) -> dict[str, Any]:
+    token_to_question = {t["token_id"]: t.get("question", "Unknown") for t in token_scope}
+    active_days = len({t["trade_date"] for t in trades})
+    unique_markets = len({token_to_question.get(t["token_id"], "Unknown") for t in trades}) if trades else 0
+
+    conditions: dict[str, set[str]] = {}
+    for trade in trades:
+        conditions.setdefault(str(trade["condition_id"]), set()).add(str(trade["token_id"]))
+    both_sides_count = sum(1 for token_ids in conditions.values() if len(token_ids) > 1)
+    both_sides_market_pct = round((both_sides_count / len(conditions)) * 100.0, 1) if conditions else 0.0
+
+    buy_trades = [trade for trade in trades if trade["side"] == "BUY"]
+    maker_buy_trades = [trade for trade in buy_trades if str(trade.get("role") or "").lower() == "maker"]
+    taker_buy_trades = [trade for trade in buy_trades if str(trade.get("role") or "").lower() == "taker"]
+    maker_buy_avg = _weighted_average_trade_price(maker_buy_trades)
+    taker_buy_avg = _weighted_average_trade_price(taker_buy_trades)
+    copy_price_gap = round(taker_buy_avg - maker_buy_avg, 4) if maker_buy_avg is not None and taker_buy_avg is not None else None
+
+    buy_volume = sum(float(trade["usdc"]) for trade in buy_trades)
+    near_certain_buy_volume = sum(float(trade["usdc"]) for trade in buy_trades if float(trade.get("price") or 0.0) >= 0.95)
+    near_certain_buy_volume_pct = round((near_certain_buy_volume / buy_volume) * 100.0, 1) if buy_volume else 0.0
+
+    concentration = breakdown.get("concentration", {})
+    top1_pct = float(concentration.get("top1_pct") or 0.0)
+    top3_pct = float(concentration.get("top3_pct") or 0.0)
+    top5_pct = float(concentration.get("top5_pct") or 0.0)
+    warning_chips, metric_severities = _build_curation_warning_chips(
+        active_days,
+        unique_markets,
+        top1_pct,
+        top3_pct,
+        both_sides_market_pct,
+        copy_price_gap,
+        near_certain_buy_volume_pct,
+    )
+
+    return {
+        "active_days": active_days,
+        "unique_markets": unique_markets,
+        "top1_pct": top1_pct,
+        "top3_pct": top3_pct,
+        "top5_pct": top5_pct,
+        "both_sides_market_pct": both_sides_market_pct,
+        "copy_price_gap": copy_price_gap,
+        "near_certain_buy_volume_pct": near_certain_buy_volume_pct,
+        "metric_severities": metric_severities,
+        "warning_chips": warning_chips,
+    }
+
+
 class ClickHouseClient:
     def __init__(self, url=None, user=None, password=None, database=None, timeout=120.0):
         self.url = url or CLICKHOUSE_URL
@@ -273,6 +425,7 @@ def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], wi
             "usdc": float(r["usdc"]),
             "fee_usdc": float(r["fee_usdc"]),
             "price": float(r["price"]),
+            "role": str(r.get("role") or ""),
         }
         for r in rows
     ]
@@ -571,11 +724,14 @@ def get_wallet_curation_data(wallet: str, filter_value: str, lookback_days: int 
     opening_prices = _build_final_price_lookup(token_ids, closes, resolutions, opening_date)
     breakdown = compute_market_pnl_breakdown(token_scope, trades, final_prices, opening_positions, opening_prices)
     chart["breakdown"] = breakdown
+    chart["signals"] = build_curation_signals(token_scope, trades, breakdown)
 
     vol = chart["summary"]["total_volume_usd"]
     pnl = chart["summary"]["final_pnl"]
     chart["summary"]["roi_pct"] = round((pnl / vol * 100), 2) if vol else 0
     chart["summary"]["win_rate"] = breakdown["win_rate"]
+    chart["summary"]["active_days"] = chart["signals"]["active_days"]
+    chart["summary"]["unique_markets"] = chart["signals"]["unique_markets"]
     return chart
 
 

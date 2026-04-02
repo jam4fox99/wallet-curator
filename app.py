@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1185,8 +1186,8 @@ def wallet_curation_layout():
             dcc.Store(id="cur-decisions", data={}),
             dcc.Store(id="cur-filter", data=""),
             dcc.Store(id="cur-range", data=365),
-            dcc.Store(id="cur-cache", data={}),
-            dcc.Store(id="cur-phase", data="setup"),
+            dcc.Store(id="cur-session-id", data=""),
+            dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0),
 
             # Setup screen
             html.Div(
@@ -1234,6 +1235,8 @@ def wallet_curation_layout():
                     html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
                     dcc.Loading(
                         html.Div([
+                            html.Div(id="cur-warnings", style={"marginBottom": "12px"}),
+                            html.Div(id="cur-read", style={"marginBottom": "12px"}),
                             dcc.Graph(id="cur-chart", style={"height": "400px"}, config={"displayModeBar": False}),
                             html.Div(id="cur-stats"),
                             html.Div(id="cur-concentration", style={"marginTop": "12px"}),
@@ -2524,6 +2527,197 @@ def _build_concentration_badges(conc):
     ])
 
 
+def _severity_to_badge_style(severity):
+    if severity == "red":
+        return "#ef4444", "rgba(239,68,68,0.12)"
+    if severity == "amber":
+        return "#f59e0b", "rgba(245,158,11,0.12)"
+    return "#22c55e", "rgba(34,197,94,0.12)"
+
+
+def _severity_to_chip_tone(severity):
+    if severity == "red":
+        return "danger"
+    if severity == "amber":
+        return "warning"
+    return "success"
+
+
+def _build_curation_warning_strip(signals):
+    chips = signals.get("warning_chips", []) if signals else []
+    if not chips:
+        return html.Div(
+            [_status_chip("No major copyability flags in this window", tone="success")],
+            className="pm-status-chip-row",
+            style={"justifyContent": "flex-start"},
+        )
+    return html.Div(
+        [
+            _status_chip(f"{chip['label']}: {chip['detail']}", tone=_severity_to_chip_tone(chip["severity"]))
+            for chip in chips
+        ],
+        className="pm-status-chip-row",
+        style={"justifyContent": "flex-start"},
+    )
+
+
+def _build_curation_signal_badges(signals):
+    if not signals:
+        return ""
+
+    metric_severities = signals.get("metric_severities", {})
+
+    def badge(label, value, severity_key):
+        color, bg = _severity_to_badge_style(metric_severities.get(severity_key, "green"))
+        return html.Span(
+            f"{label}: {value}",
+            style={
+                "color": color,
+                "background": bg,
+                "padding": "4px 10px",
+                "borderRadius": "6px",
+                "fontSize": "12px",
+                "border": f"1px solid {color}30",
+            },
+        )
+
+    gap = signals.get("copy_price_gap")
+    gap_label = "n/a" if gap is None else f"{gap:+.4f}"
+
+    return html.Div([
+        html.Div("Curation Signals", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                            "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Div([
+            badge("Top 1 Market", f"{signals.get('top1_pct', 0):.1f}%", "top1_pct"),
+            badge("Top 3 Markets", f"{signals.get('top3_pct', 0):.1f}%", "top3_pct"),
+            badge("Both-Sides", f"{signals.get('both_sides_market_pct', 0):.1f}%", "both_sides_market_pct"),
+            badge("Buy Gap", gap_label, "copy_price_gap"),
+            badge("Near-Certain Buys", f"{signals.get('near_certain_buy_volume_pct', 0):.1f}%", "near_certain_buy_volume_pct"),
+        ], style={"display": "flex", "gap": "8px", "flexWrap": "wrap"}),
+    ])
+
+
+def _build_curation_read(summary, signals):
+    if not signals:
+        return ""
+
+    active_days = int(summary.get("active_days") or 0)
+    unique_markets = int(summary.get("unique_markets") or 0)
+    top1_pct = float(signals.get("top1_pct") or 0.0)
+    top3_pct = float(signals.get("top3_pct") or 0.0)
+    both_sides_pct = float(signals.get("both_sides_market_pct") or 0.0)
+    near_certain_pct = float(signals.get("near_certain_buy_volume_pct") or 0.0)
+    copy_price_gap = signals.get("copy_price_gap")
+    metric_severities = signals.get("metric_severities", {})
+    warning_chips = signals.get("warning_chips", [])
+    red_count = sum(1 for chip in warning_chips if chip.get("severity") == "red")
+    amber_count = sum(1 for chip in warning_chips if chip.get("severity") == "amber")
+
+    strengths = []
+    risks = []
+
+    if unique_markets >= 20 and active_days >= 7:
+        strengths.append(f"broad sample with {unique_markets} markets across {active_days} days")
+    elif unique_markets >= 10 and active_days >= 5:
+        strengths.append(f"usable sample with {unique_markets} markets across {active_days} days")
+    else:
+        risks.append(f"thin sample with only {unique_markets} markets across {active_days} days")
+
+    if metric_severities.get("concentration") == "green":
+        strengths.append(f"PnL is reasonably spread out (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+    elif metric_severities.get("concentration") == "amber":
+        risks.append(f"some concentration risk (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+    else:
+        risks.append(f"heavy concentration risk (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+
+    if both_sides_pct < 55:
+        strengths.append(f"mostly directional trading ({both_sides_pct:.1f}% both-sides)")
+    elif both_sides_pct < 85:
+        risks.append(f"mixed execution style ({both_sides_pct:.1f}% both-sides)")
+    else:
+        risks.append(f"very high both-sides trading ({both_sides_pct:.1f}%)")
+
+    if copy_price_gap is not None:
+        if copy_price_gap <= 0.02:
+            strengths.append(f"taker pricing is not obviously worse ({copy_price_gap:+.4f} buy gap)")
+        elif copy_price_gap <= 0.04:
+            risks.append(f"mild taker price disadvantage ({copy_price_gap:+.4f} buy gap)")
+        else:
+            risks.append(f"material taker price disadvantage ({copy_price_gap:+.4f} buy gap)")
+
+    if near_certain_pct >= 25:
+        risks.append(f"too much near-certain buying ({near_certain_pct:.1f}%)")
+    elif near_certain_pct >= 10:
+        risks.append(f"some near-certain buying ({near_certain_pct:.1f}%)")
+    else:
+        strengths.append(f"near-certain buying is low ({near_certain_pct:.1f}%)")
+
+    if red_count >= 2 or metric_severities.get("sample") == "red":
+        title = "Avoid For Now"
+        tone = "danger"
+        summary_text = "The structure is too risky to trust yet. This wallet may still be profitable, but the copyability flags are strong enough that it should not be an easy approve."
+    elif red_count == 0 and amber_count <= 1 and metric_severities.get("sample") == "green":
+        title = "Looks Promising"
+        tone = "success"
+        summary_text = "The wallet has enough breadth to take seriously and does not show a major copyability problem in this window."
+    else:
+        title = "Mixed Profile"
+        tone = "warning"
+        summary_text = "There is enough here to inspect, but the wallet has real structural risks. Treat it as a manual review candidate, not an automatic approve."
+
+    return _card([
+        html.Div([
+            html.Div("Curation Read", className="pm-kicker"),
+            _status_chip(title, tone=tone),
+        ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "12px", "marginBottom": "10px", "flexWrap": "wrap"}),
+        html.Div(summary_text, className="pm-empty-state__copy", style={"marginTop": 0}),
+        html.Div(f"What looks good: {('; '.join(strengths[:2]) + '.') if strengths else 'No obvious strengths in this window.'}",
+                 className="pm-empty-state__copy"),
+        html.Div(f"What to watch: {('; '.join(risks[:2]) + '.') if risks else 'No major risks triggered in this window.'}",
+                 className="pm-empty-state__copy"),
+    ], class_name="pm-admin-card")
+
+
+def _build_curation_loading_read(progress):
+    ready = progress.get("ready", 0)
+    running = progress.get("running", 0)
+    queued = progress.get("queued", 0)
+    return _card([
+        html.Div([
+            html.Div("Curation Read", className="pm-kicker"),
+            _status_chip("Loading", tone="warning"),
+        ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "12px", "marginBottom": "10px", "flexWrap": "wrap"}),
+        html.Div("This wallet is being fetched in the background. You should only pay the wait once for the current wallet; the next wallets are warming behind it.", className="pm-empty-state__copy", style={"marginTop": 0}),
+        html.Div(f"Cache progress: {ready} ready, {running} running, {queued} queued.", className="pm-empty-state__copy"),
+    ], class_name="pm-admin-card")
+
+
+def _build_curation_loading_figure(title):
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        annotations=[
+            dict(
+                text=title,
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(size=16, color=COLORS["text_secondary"]),
+            )
+        ],
+    )
+    return fig
+
+
 def _build_top_markets_table(markets):
     """Build top markets HTML table."""
     if not markets:
@@ -2689,6 +2883,7 @@ def highlight_cur_range(c1, c7, c14, c30, c365):
 @callback(
     [Output("cur-wallets", "data"), Output("cur-filter", "data"), Output("cur-range", "data"),
      Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
+     Output("cur-session-id", "data"),
      Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
      Output("cur-setup-msg", "children")],
     Input("cur-start", "n_clicks"),
@@ -2698,16 +2893,16 @@ def highlight_cur_range(c1, c7, c14, c30, c365):
 )
 def start_curation(n_clicks, wallet_text, category, *range_clicks):
     if not n_clicks:
-        return [no_update] * 10
+        return [no_update] * 11
 
     if not wallet_text or not wallet_text.strip():
-        return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+        return [no_update] * 10 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
     if not category:
-        return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
+        return [no_update] * 10 + [dbc.Alert("Select a category.", color="warning")]
 
     wallets = [w.strip().lower() for w in wallet_text.strip().split("\n") if w.strip().startswith("0x")]
     if not wallets:
-        return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+        return [no_update] * 10 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
 
     # Determine range
     range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
@@ -2718,24 +2913,43 @@ def start_curation(n_clicks, wallet_text, category, *range_clicks):
             max_c = c
             lookback = range_map[i]
 
+    if "::" in category:
+        filter_level, filter_value = category.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", category
+
+    session_id = uuid.uuid4().hex
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        get_curation_prefetch_manager().prime_session(
+            session_id=session_id,
+            wallets=wallets,
+            filter_level=filter_level,
+            filter_value=filter_value,
+            lookback_days=lookback,
+            warm_count=6,
+        )
+    except Exception:
+        logger.exception("Failed to seed curation prefetch session")
+
     return (
-        wallets, category, lookback, 0, [], {},
+        wallets, category, lookback, 0, [], {}, session_id,
         {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
     )
 
 
 @callback(
     [Output("cur-progress", "children"), Output("cur-wallet-header", "children"),
+     Output("cur-warnings", "children"), Output("cur-read", "children"),
      Output("cur-chart", "figure"), Output("cur-stats", "children"),
      Output("cur-concentration", "children"), Output("cur-top-markets", "children")],
-    Input("cur-index", "data"),
+    [Input("cur-index", "data"), Input("cur-session-id", "data"), Input("cur-prefetch-poll", "n_intervals")],
     [State("cur-wallets", "data"), State("cur-filter", "data"), State("cur-range", "data")],
 )
-def render_curation_wallet(index, wallets, filter_raw, lookback):
-    import plotly.graph_objects as go
-
+def render_curation_wallet(index, session_id, _poll, wallets, filter_raw, lookback):
     if not wallets or index is None or index >= len(wallets):
-        return ["", "", go.Figure(), "", "", ""]
+        return ["", "", "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""]
 
     wallet = wallets[index]
     if "::" in (filter_raw or ""):
@@ -2750,15 +2964,68 @@ def render_curation_wallet(index, wallets, filter_raw, lookback):
     ])
 
     try:
-        from lib.clickhouse_charts import get_wallet_curation_data
-        data = get_wallet_curation_data(wallet, filter_value, lookback, filter_level)
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_key(wallet, filter_level, filter_value, lookback)
+        if session_id:
+            manager.warm_session_index(session_id, index, warm_count=6)
+            status_counts = manager.get_session_progress(session_id)
+            if status_counts.get("total"):
+                progress = (
+                    f"Wallet {index + 1} of {len(wallets)}"
+                    f" • ready {status_counts['ready']}/{status_counts['total']}"
+                    f" • running {status_counts['running']}"
+                )
+        else:
+            status_counts = {"ready": 0, "running": 0, "queued": 0, "total": len(wallets)}
+        data = manager.get_payload(key)
+        status = manager.get_status(key)
+        error_text = manager.get_error(key)
     except Exception as exc:
-        logger.exception("Curation chart failed")
-        return [progress, header, go.Figure(), dbc.Alert(f"Error: {exc}", color="danger"), "", ""]
+        logger.exception("Curation cache lookup failed")
+        return [progress, header, "", "", _build_curation_loading_figure("Failed to load wallet"), dbc.Alert(f"Error: {exc}", color="danger"), "", ""]
+
+    if status == "error":
+        return [
+            progress,
+            header,
+            html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(status_counts),
+            _build_curation_loading_figure("Wallet fetch failed"),
+            dbc.Alert(error_text or f"Failed to fetch {wallet[:12]}...", color="danger"),
+            "",
+            "",
+        ]
+
+    if status == "ready" and not data:
+        return [
+            progress,
+            header,
+            "",
+            "",
+            _build_curation_loading_figure("No trades found"),
+            dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"),
+            "",
+            "",
+        ]
 
     if not data:
-        return [progress, header, go.Figure(),
-                dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"), "", ""]
+        loading_warning = html.Div(
+            [_status_chip(f"Loading wallet data • {status}", tone="warning")],
+            className="pm-status-chip-row",
+            style={"justifyContent": "flex-start"},
+        )
+        return [
+            progress,
+            header,
+            loading_warning,
+            _build_curation_loading_read(status_counts),
+            _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
+            dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
+            "",
+            "",
+        ]
 
     # Chart
     series = data["series"]
@@ -2789,15 +3056,18 @@ def render_curation_wallet(index, wallets, filter_raw, lookback):
         _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
         _stat_tile("Trades", f"{summary['total_trades']:,}"),
         _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
-        _stat_tile("Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
-        _stat_tile("Win Rate", f"{summary.get('win_rate', 0):.0f}%"),
+        _stat_tile("Unique Markets", f"{summary.get('unique_markets', 0):,}"),
+        _stat_tile("Active Days", f"{summary.get('active_days', 0):,}"),
     ], className="pm-wallet-stat-grid")
 
+    signals = data.get("signals", {})
+    warnings = _build_curation_warning_strip(signals)
+    curation_read = _build_curation_read(summary, signals)
+    concentration = _build_curation_signal_badges(signals)
     breakdown = data.get("breakdown", {})
-    concentration = _build_concentration_badges(breakdown.get("concentration", {}))
     top_markets = _build_top_markets_table(breakdown.get("markets", []))
 
-    return [progress, header, fig, stats, concentration, top_markets]
+    return [progress, header, warnings, curation_read, fig, stats, concentration, top_markets]
 
 
 @callback(

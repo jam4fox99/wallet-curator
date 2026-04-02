@@ -2,7 +2,13 @@ import unittest
 from datetime import date, datetime
 from unittest.mock import patch
 
-from lib.clickhouse_charts import _build_final_price_lookup, build_chart_payload, compute_market_pnl_breakdown
+from lib.clickhouse_charts import (
+    _build_curation_warning_chips,
+    _build_final_price_lookup,
+    build_chart_payload,
+    build_curation_signals,
+    compute_market_pnl_breakdown,
+)
 
 
 class ClickHouseChartsRegressionTests(unittest.TestCase):
@@ -143,6 +149,105 @@ class ClickHouseChartsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["first_trade_date"], "2026-03-01")
         self.assertEqual(payload["summary"]["final_pnl"], 2.0)
         self.assertEqual(payload["series"][-1]["marked_value"], 2.0)
+
+    def test_curation_signals_compute_breadth_and_copyability_metrics(self):
+        token_scope = [
+            {"token_id": "m1-yes", "condition_id": "c1", "question": "Market 1"},
+            {"token_id": "m1-no", "condition_id": "c1", "question": "Market 1"},
+            {"token_id": "m2-yes", "condition_id": "c2", "question": "Market 2"},
+        ]
+        trades = [
+            {
+                "token_id": "m1-yes",
+                "condition_id": "c1",
+                "trade_date": date(2026, 3, 24),
+                "side": "BUY",
+                "shares": 10.0,
+                "usdc": 4.0,
+                "fee_usdc": 0.0,
+                "price": 0.4,
+                "role": "maker",
+            },
+            {
+                "token_id": "m1-no",
+                "condition_id": "c1",
+                "trade_date": date(2026, 3, 24),
+                "side": "BUY",
+                "shares": 10.0,
+                "usdc": 4.7,
+                "fee_usdc": 0.0,
+                "price": 0.47,
+                "role": "taker",
+            },
+            {
+                "token_id": "m2-yes",
+                "condition_id": "c2",
+                "trade_date": date(2026, 3, 25),
+                "side": "BUY",
+                "shares": 10.0,
+                "usdc": 9.6,
+                "fee_usdc": 0.0,
+                "price": 0.96,
+                "role": "",
+            },
+        ]
+        breakdown = {
+            "concentration": {"top1_pct": 30.0, "top3_pct": 65.0, "top5_pct": 80.0},
+            "markets": [],
+            "win_rate": 50.0,
+        }
+
+        signals = build_curation_signals(token_scope, trades, breakdown)
+
+        self.assertEqual(signals["active_days"], 2)
+        self.assertEqual(signals["unique_markets"], 2)
+        self.assertEqual(signals["both_sides_market_pct"], 50.0)
+        self.assertAlmostEqual(signals["copy_price_gap"], 0.07, places=4)
+        self.assertAlmostEqual(signals["near_certain_buy_volume_pct"], 52.5, places=1)
+        self.assertEqual(signals["metric_severities"]["concentration"], "amber")
+
+    def test_curation_warning_chips_red_thresholds(self):
+        chips, severities = _build_curation_warning_chips(
+            active_days=3,
+            unique_markets=4,
+            top1_pct=50.0,
+            top3_pct=80.0,
+            both_sides_market_pct=90.0,
+            copy_price_gap=0.06,
+            near_certain_buy_volume_pct=30.0,
+        )
+
+        self.assertEqual(severities["sample"], "red")
+        self.assertEqual(severities["concentration"], "red")
+        self.assertEqual(severities["both_sides_market_pct"], "red")
+        self.assertEqual(severities["copy_price_gap"], "red")
+        self.assertEqual(severities["near_certain_buy_volume_pct"], "red")
+        self.assertEqual({chip["key"] for chip in chips}, {
+            "low_sample",
+            "concentrated_edge",
+            "heavy_both_sides",
+            "taker_price_disadvantage",
+            "near_certain_buying",
+        })
+        self.assertTrue(all(chip["severity"] == "red" for chip in chips))
+
+    def test_curation_warning_chips_amber_thresholds(self):
+        chips, severities = _build_curation_warning_chips(
+            active_days=6,
+            unique_markets=15,
+            top1_pct=30.0,
+            top3_pct=65.0,
+            both_sides_market_pct=75.0,
+            copy_price_gap=0.03,
+            near_certain_buy_volume_pct=15.0,
+        )
+
+        self.assertEqual(severities["sample"], "amber")
+        self.assertEqual(severities["concentration"], "amber")
+        self.assertEqual(severities["both_sides_market_pct"], "amber")
+        self.assertEqual(severities["copy_price_gap"], "amber")
+        self.assertEqual(severities["near_certain_buy_volume_pct"], "amber")
+        self.assertEqual({chip["severity"] for chip in chips}, {"amber"})
 
 
 if __name__ == "__main__":
