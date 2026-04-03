@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 WalletBaseKey = tuple[str, str, str]
 WalletDerivedKey = tuple[str, str, str, str]
+WalletConfig = dict[str, str]
 
 
 @dataclass
@@ -57,15 +58,17 @@ class CurationPrefetchManager:
     def prime_session(
         self,
         session_id: str,
-        wallets: list[str],
-        filter_level: str,
-        filter_value: str,
+        wallet_configs: list[WalletConfig],
         warm_count: int = 6,
     ) -> None:
         keys = [
-            self.make_base_key(wallet, filter_level, filter_value)
-            for wallet in wallets
-            if wallet
+            self.make_base_key(
+                config.get("address", ""),
+                config.get("filter_level", "detail"),
+                config.get("filter_value", ""),
+            )
+            for config in wallet_configs
+            if config.get("address")
         ]
         with self._lock:
             self._sessions[session_id] = keys
@@ -116,6 +119,14 @@ class CurationPrefetchManager:
                 entry.last_accessed = time.time()
             self._derived_cache[payload_key] = derived_payload
             return derived_payload
+
+    def get_base_payload(self, base_key: WalletBaseKey) -> dict[str, Any] | None:
+        with self._lock:
+            entry = self._cache.get(base_key)
+            if not entry or entry.status != "ready":
+                return None
+            entry.last_accessed = time.time()
+            return entry.payload
 
     def get_status(self, key: WalletBaseKey) -> str:
         with self._lock:
