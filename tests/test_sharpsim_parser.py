@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 from lib.sharpsim_parser import build_sim_payload, parse_sharpsim
 
 
-def _drl_row(ts, status, side, token_id, condition_id, question, price, shares, notional):
+def _drl_row(ts, status, side, token_id, condition_id, question, price, shares, notional, fee=0.0):
     return {
         "ts": ts,
         "status": status,
@@ -20,6 +20,7 @@ def _drl_row(ts, status, side, token_id, condition_id, question, price, shares, 
         "copied_price": price,
         "copied_shares": shares,
         "copied_notional": notional,
+        "copied_fee": fee,
     }
 
 
@@ -34,6 +35,22 @@ class SharpsimParserTests(unittest.TestCase):
         self.assertEqual(payload["filter_summary"]["League of Legends"], 43)
         self.assertEqual(payload["wallets"][payload["wallet_order"][0]]["copied"], 1571)
         self.assertEqual(payload["wallets"][payload["wallet_order"][0]]["skipped"], 3824)
+
+    def test_parse_sharpsim_maps_drl_tabs_back_to_full_wallet_addresses(self):
+        payload = parse_sharpsim(Path("tests/Sharpsim.xlsx").read_bytes(), "Sharpsim.xlsx")
+
+        first_wallet = payload["wallet_order"][0]
+        self.assertEqual(payload["wallets"][first_wallet]["sim_status"], "ready")
+        self.assertIn(first_wallet, payload["drl"])
+        self.assertGreater(len(payload["drl"][first_wallet]), 0)
+
+    def test_parse_sharpsim_preserves_copied_fees_from_drl_rows(self):
+        payload = parse_sharpsim(Path("tests/Sharpsim.xlsx").read_bytes(), "Sharpsim.xlsx")
+
+        wallet = payload["wallet_order"][1]
+        copied_rows = [row for row in payload["drl"][wallet] if row["status"] == "COPIED"]
+        self.assertIn("copied_fee", copied_rows[0])
+        self.assertGreater(sum(float(row["copied_fee"] or 0.0) for row in copied_rows), 0.0)
 
     def test_parse_sharpsim_marks_missing_drl_wallet_without_failing_upload(self):
         workbook = load_workbook("tests/Sharpsim.xlsx")
@@ -82,6 +99,34 @@ class SharpsimReplayTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["sim_status"], "ready")
         self.assertEqual(payload["validation"]["workbook_value"], 4.0)
         self.assertEqual(payload["series"][0]["pnl"], 0.0)
+
+    def test_build_sim_payload_applies_copied_fees_to_final_pnl(self):
+        wallet_meta = {
+            "address": "0xabc",
+            "filter_value": "League of Legends",
+            "copied": 2,
+            "skipped": 0,
+            "sim_7d": -0.75,
+        }
+        drl_rows = [
+            _drl_row(datetime(2026, 3, 28, 10, 0), "COPIED", "BUY", "yes-token", "cid-1", "Match 1", 0.40, 10.0, 4.0, fee=0.50),
+            _drl_row(datetime(2026, 4, 2, 10, 0), "COPIED", "SELL", "yes-token", "cid-1", "Match 1", 0.40, 10.0, 4.0, fee=0.25),
+        ]
+        closes = [
+            {"token_id": "yes-token", "trade_date": date(2026, 3, 27), "close_price": 0.40},
+            {"token_id": "yes-token", "trade_date": date(2026, 4, 3), "close_price": 0.40},
+        ]
+
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        with patch("lib.sharpsim_parser.date", FixedDate):
+            payload = build_sim_payload(wallet_meta, drl_rows, closes, {}, "7D")
+
+        self.assertEqual(payload["validation"]["delta"], 0.0)
+        self.assertEqual(payload["summary"]["final_pnl"], -0.75)
 
     def test_build_sim_payload_carries_opening_positions_from_pre_window_copied_rows(self):
         wallet_meta = {"address": "0xabc", "filter_value": "League of Legends", "copied": 1, "skipped": 0}

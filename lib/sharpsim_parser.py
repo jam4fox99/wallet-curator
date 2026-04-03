@@ -42,6 +42,7 @@ _DRL_REQUIRED = {
     "Copied Price",
     "Copied Shares",
     "Copied Notional $",
+    "Copied Fee $",
 }
 
 
@@ -64,6 +65,18 @@ def _wallet_value(value: Any) -> str | None:
     return text if text.startswith("0x") else None
 
 
+def _resolve_sheet_wallet(wallet_token: str | None, known_wallets: dict[str, dict[str, Any]]) -> str | None:
+    token = _wallet_value(wallet_token)
+    if not token:
+        return None
+    if token in known_wallets:
+        return token
+    matches = [wallet for wallet in known_wallets if wallet.startswith(token)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _normalize_copied_trade(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "trade_date": row["ts"].date(),
@@ -73,10 +86,19 @@ def _normalize_copied_trade(row: dict[str, Any]) -> dict[str, Any]:
         "side": row["side"],
         "shares": float(row["copied_shares"] or 0.0),
         "usdc": float(row["copied_notional"] or 0.0),
-        "fee_usdc": 0.0,
+        "fee_usdc": float(row.get("copied_fee") or 0.0),
         "price": float(row["copied_price"] or 0.0),
         "role": "sim",
         "question": row.get("question", ""),
+    }
+
+
+def _build_validation_payload(normalized_range: str, workbook_value: float | None, recomputed_value: float | None) -> dict[str, Any]:
+    return {
+        "workbook_value": workbook_value,
+        "recomputed_value": recomputed_value,
+        "delta": None if workbook_value is None or recomputed_value is None else round(recomputed_value - float(workbook_value), 2),
+        "range_note": "" if normalized_range in {"1D", "7D", "30D"} else "Workbook provides validation only for 1D / 7D / 30D",
     }
 
 
@@ -158,6 +180,7 @@ def build_sim_payload(
     resolutions: dict[str, Any],
     range_key: Any = CURATION_ALL_RANGE,
 ) -> dict[str, Any]:
+    normalized_range = normalize_curation_range_key(range_key)
     copied_rows = [row for row in drl_rows if row.get("status") == "COPIED"]
     if not copied_rows:
         return {
@@ -170,13 +193,10 @@ def build_sim_payload(
                 "roi_pct": 0.0,
             },
             "validation": {
-                "workbook_value": None,
-                "recomputed_value": None,
-                "delta": None,
+                **_build_validation_payload(normalized_range, None, None),
             },
         }
 
-    normalized_range = normalize_curation_range_key(range_key)
     today_value = date.today()
     if normalized_range == CURATION_ALL_RANGE:
         window_start_date = min(row["ts"].date() for row in copied_rows)
@@ -223,9 +243,7 @@ def build_sim_payload(
                 "roi_pct": 0.0,
             },
             "validation": {
-                "workbook_value": None,
-                "recomputed_value": 0.0,
-                "delta": None,
+                **_build_validation_payload(normalized_range, None, 0.0),
             },
         }
 
@@ -240,11 +258,7 @@ def build_sim_payload(
     chart["summary"]["copied_trades"] = len(copied_rows)
     chart["summary"]["sim_status"] = wallet_meta.get("sim_status", "ready")
     chart["summary"]["roi_pct"] = round((recomputed_value / visible_volume) * 100, 2) if visible_volume else 0.0
-    chart["validation"] = {
-        "workbook_value": workbook_value,
-        "recomputed_value": recomputed_value,
-        "delta": None if workbook_value is None else round(recomputed_value - float(workbook_value), 2),
-    }
+    chart["validation"] = _build_validation_payload(normalized_range, workbook_value, recomputed_value)
     return chart
 
 
@@ -307,7 +321,8 @@ def parse_sharpsim(file_bytes: bytes, filename: str = "") -> dict[str, Any]:
         rows = drl_ws.iter_rows(min_row=5, values_only=True)
         header_map = _header_map(next(rows))
         _require_columns(header_map, _DRL_REQUIRED, sheet_name)
-        wallet = _wallet_value(sheet_name.split("_")[1])
+        parts = sheet_name.split("_")
+        wallet = _resolve_sheet_wallet(parts[1] if len(parts) > 1 else None, wallets)
         if not wallet:
             continue
         wallet_rows = []
@@ -325,6 +340,7 @@ def parse_sharpsim(file_bytes: bytes, filename: str = "") -> dict[str, Any]:
                     "copied_price": float(row[header_map["Copied Price"]] or 0.0),
                     "copied_shares": float(row[header_map["Copied Shares"]] or 0.0),
                     "copied_notional": float(row[header_map["Copied Notional $"]] or 0.0),
+                    "copied_fee": float(row[header_map["Copied Fee $"]] or 0.0),
                 }
             )
         drl[wallet] = wallet_rows

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -21,6 +22,7 @@ CLICKHOUSE_URL = os.environ.get("CLICKHOUSE_URL", "http://127.0.0.1:8123/")
 CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "jake")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 CLICKHOUSE_DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "polymarket")
+GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 
 CURATION_ALL_RANGE = "ALL"
 CURATION_RANGE_DAYS = {
@@ -30,6 +32,7 @@ CURATION_RANGE_DAYS = {
     "30D": 30,
 }
 CURATION_RANGE_TOKENS = tuple([*CURATION_RANGE_DAYS.keys(), CURATION_ALL_RANGE])
+_GAMMA_OUTCOME_CACHE: dict[str, str] = {}
 
 
 def _validate_id(identifier: str) -> str:
@@ -143,6 +146,328 @@ def _weighted_average_trade_price(trades: list[dict[str, Any]]) -> float | None:
     return total_usdc / total_shares
 
 
+def _parse_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, ""):
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _fetch_gamma_outcomes_for_token_ids(token_ids: list[str]) -> dict[str, str]:
+    normalized = [token_id for token_id in token_ids if token_id and token_id.isdigit()]
+    missing = [token_id for token_id in normalized if token_id not in _GAMMA_OUTCOME_CACHE]
+    if missing:
+        batch_size = 50
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start:start + batch_size]
+            params = [("clob_token_ids", token_id) for token_id in batch]
+            params.append(("limit", str(max(len(batch) * 2, 50))))
+            try:
+                response = requests.get(GAMMA_API_URL, params=params, timeout=15)
+                response.raise_for_status()
+                markets = response.json()
+            except Exception as exc:
+                logger.warning("Gamma outcome lookup failed for %d token ids: %s", len(batch), exc)
+                markets = []
+
+            if isinstance(markets, list):
+                for market in markets:
+                    clob_ids = _parse_json_list(market.get("clobTokenIds"))
+                    outcomes = _parse_json_list(market.get("outcomes"))
+                    for index, clob_id in enumerate(clob_ids):
+                        token_id = str(clob_id)
+                        if token_id in _GAMMA_OUTCOME_CACHE:
+                            continue
+                        outcome = str(outcomes[index]).strip() if index < len(outcomes) and outcomes[index] is not None else ""
+                        _GAMMA_OUTCOME_CACHE[token_id] = outcome
+
+        for token_id in missing:
+            _GAMMA_OUTCOME_CACHE.setdefault(token_id, "")
+
+    return {token_id: _GAMMA_OUTCOME_CACHE.get(token_id, "") for token_id in normalized}
+
+
+def _build_token_meta_lookup(token_scope: list[dict[str, Any]], trades: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    trade_outcomes: dict[str, str] = {}
+    for trade in trades or []:
+        token_id = str(trade.get("token_id") or "")
+        outcome = str(trade.get("outcome") or "").strip()
+        if token_id and outcome and token_id not in trade_outcomes:
+            trade_outcomes[token_id] = outcome
+
+    gamma_outcomes = _fetch_gamma_outcomes_for_token_ids([
+        str(token.get("token_id") or "")
+        for token in token_scope
+        if str(token.get("token_id") or "")
+    ])
+
+    lookup: dict[str, dict[str, Any]] = {}
+    for token in token_scope:
+        token_id = str(token.get("token_id") or "")
+        if not token_id:
+            continue
+        outcome = trade_outcomes.get(token_id) or str(token.get("outcome") or "").strip() or gamma_outcomes.get(token_id, "")
+        lookup[token_id] = {
+            "token_id": token_id,
+            "condition_id": str(token.get("condition_id") or ""),
+            "question": str(token.get("question") or "Unknown").strip() or "Unknown",
+            "outcome_label": outcome or f"Token {token_id[:8]}",
+            "outcome_is_derived": not bool(outcome),
+        }
+    return lookup
+
+
+def _trade_mtm_pnl(trade: dict[str, Any], final_price: float) -> float:
+    signed_cash = -float(trade.get("usdc") or 0.0) if trade.get("side") == "BUY" else float(trade.get("usdc") or 0.0)
+    signed_shares = float(trade.get("shares") or 0.0) if trade.get("side") == "BUY" else -float(trade.get("shares") or 0.0)
+    return signed_cash - float(trade.get("fee_usdc") or 0.0) + (signed_shares * final_price)
+
+
+def _detect_synthetic_buy_pairs(trades: list[dict[str, Any]]) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, dict[str, int]]]:
+    grouped: dict[tuple[str, Any], list[dict[str, Any]]] = defaultdict(list)
+    for trade in trades:
+        grouped[(str(trade.get("condition_id") or ""), trade.get("ts"))].append(trade)
+
+    paired_buys: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {
+        "shares": 0.0,
+        "dollars": 0.0,
+        "cleanup_shares": 0.0,
+        "cleanup_dollars": 0.0,
+    }))
+    condition_flags: dict[str, dict[str, int]] = defaultdict(lambda: {
+        "synthetic_pair_count": 0,
+        "cleanup_pair_count": 0,
+    })
+
+    for (condition_id, _ts), condition_trades in grouped.items():
+        buy_entries = []
+        sell_entries = []
+        token_buys: dict[str, dict[str, float]] = defaultdict(lambda: {"shares": 0.0, "dollars": 0.0})
+        token_sells: dict[str, dict[str, float]] = defaultdict(lambda: {"shares": 0.0, "dollars": 0.0})
+
+        for trade in condition_trades:
+            token_id = str(trade.get("token_id") or "")
+            shares = float(trade.get("shares") or 0.0)
+            dollars = float(trade.get("usdc") or 0.0)
+            if shares <= 1e-9:
+                continue
+            if trade.get("side") == "BUY":
+                token_buys[token_id]["shares"] += shares
+                token_buys[token_id]["dollars"] += dollars
+            elif trade.get("side") == "SELL":
+                token_sells[token_id]["shares"] += shares
+                token_sells[token_id]["dollars"] += dollars
+
+        for token_id, stats in token_buys.items():
+            if stats["shares"] <= 1e-9:
+                continue
+            buy_entries.append({
+                "token_id": token_id,
+                "price": stats["dollars"] / stats["shares"],
+                "remaining_shares": stats["shares"],
+            })
+        for token_id, stats in token_sells.items():
+            if stats["shares"] <= 1e-9:
+                continue
+            sell_entries.append({
+                "token_id": token_id,
+                "price": stats["dollars"] / stats["shares"],
+                "remaining_shares": stats["shares"],
+            })
+
+        for buy in buy_entries:
+            candidates = [
+                sell for sell in sell_entries
+                if sell["token_id"] != buy["token_id"] and abs((buy["price"] + sell["price"]) - 1.0) <= 0.03
+            ]
+            candidates.sort(key=lambda sell: abs((buy["price"] + sell["price"]) - 1.0))
+            for sell in candidates:
+                if buy["remaining_shares"] <= 1e-9:
+                    break
+                if sell["remaining_shares"] <= 1e-9:
+                    continue
+                paired_shares = min(buy["remaining_shares"], sell["remaining_shares"])
+                if paired_shares <= 1e-9:
+                    continue
+                paired_dollars = paired_shares * buy["price"]
+                paired_buys[condition_id][buy["token_id"]]["shares"] += paired_shares
+                paired_buys[condition_id][buy["token_id"]]["dollars"] += paired_dollars
+                condition_flags[condition_id]["synthetic_pair_count"] += 1
+                if buy["price"] <= 0.02 or sell["price"] >= 0.98:
+                    paired_buys[condition_id][buy["token_id"]]["cleanup_shares"] += paired_shares
+                    paired_buys[condition_id][buy["token_id"]]["cleanup_dollars"] += paired_dollars
+                    condition_flags[condition_id]["cleanup_pair_count"] += 1
+                buy["remaining_shares"] -= paired_shares
+                sell["remaining_shares"] -= paired_shares
+
+    return paired_buys, condition_flags
+
+
+def build_trade_audit_rows(token_scope: list[dict[str, Any]], trades: list[dict[str, Any]],
+                           final_prices: dict[str, float]) -> list[dict[str, Any]]:
+    token_meta = _build_token_meta_lookup(token_scope, trades)
+    rows = []
+    for trade in trades:
+        token_id = str(trade.get("token_id") or "")
+        meta = token_meta.get(token_id, {
+            "question": "Unknown",
+            "outcome_label": f"Token {token_id[:8]}",
+            "outcome_is_derived": True,
+        })
+        trade_outcome = str(trade.get("outcome") or "").strip()
+        mtm_pnl = _trade_mtm_pnl(trade, float(final_prices.get(token_id, 0.0)))
+        rows.append({
+            "trade_id": str(trade.get("trade_id") or ""),
+            "ts": trade["ts"].isoformat() if isinstance(trade.get("ts"), datetime) else str(trade.get("ts") or ""),
+            "market": meta["question"],
+            "outcome_label": trade_outcome or meta["outcome_label"],
+            "outcome_is_derived": not bool(trade_outcome) and bool(meta.get("outcome_is_derived")),
+            "side": str(trade.get("side") or ""),
+            "shares": round(float(trade.get("shares") or 0.0), 2),
+            "price": round(float(trade.get("price") or 0.0), 4),
+            "dollars": round(float(trade.get("usdc") or 0.0), 2),
+            "fee": round(float(trade.get("fee_usdc") or 0.0), 2),
+            "mtm_pnl": round(mtm_pnl, 2),
+        })
+    rows.sort(key=lambda row: (-row["mtm_pnl"], row["ts"], row["market"], row["outcome_label"]))
+    return rows
+
+
+def _compact_trade_row_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    trade_id = str(row.get("trade_id") or "").strip()
+    if trade_id:
+        return ("trade_id", trade_id)
+    return (
+        str(row.get("ts") or ""),
+        str(row.get("market") or ""),
+        str(row.get("outcome_label") or ""),
+        str(row.get("side") or ""),
+        float(row.get("shares") or 0.0),
+        float(row.get("price") or 0.0),
+        float(row.get("dollars") or 0.0),
+    )
+
+
+def build_compact_trade_audit_rows(rows: list[dict[str, Any]], limit_per_side: int = 50) -> list[dict[str, Any]]:
+    rows = list(rows or [])
+    if limit_per_side <= 0 or len(rows) <= (limit_per_side * 2):
+        return rows
+
+    compact_rows = rows[:limit_per_side] + rows[-limit_per_side:]
+    deduped_rows = []
+    seen = set()
+    for row in compact_rows:
+        row_key = _compact_trade_row_key(row)
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+        deduped_rows.append(row)
+    deduped_rows.sort(key=lambda row: (-float(row.get("mtm_pnl") or 0.0), str(row.get("ts") or ""), str(row.get("market") or ""), str(row.get("outcome_label") or "")))
+    return deduped_rows
+
+
+def build_both_sides_rows(token_scope: list[dict[str, Any]], trades: list[dict[str, Any]],
+                          final_prices: dict[str, float]) -> list[dict[str, Any]]:
+    token_meta = _build_token_meta_lookup(token_scope, trades)
+    paired_buys, condition_flags = _detect_synthetic_buy_pairs(trades)
+    buy_trades_by_condition: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    token_cash: dict[str, float] = defaultdict(float)
+    token_net_shares: dict[str, float] = defaultdict(float)
+    token_sell_shares: dict[str, float] = defaultdict(float)
+    condition_cash: dict[str, float] = defaultdict(float)
+    condition_net_shares: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    condition_market: dict[str, str] = {}
+
+    for trade in trades:
+        token_id = str(trade.get("token_id") or "")
+        meta = token_meta.get(token_id, {})
+        condition_id = str(trade.get("condition_id") or meta.get("condition_id") or token_id)
+        condition_market.setdefault(condition_id, str(meta.get("question") or "Unknown"))
+
+        signed_cash = -float(trade.get("usdc") or 0.0) if trade.get("side") == "BUY" else float(trade.get("usdc") or 0.0)
+        signed_shares = float(trade.get("shares") or 0.0) if trade.get("side") == "BUY" else -float(trade.get("shares") or 0.0)
+        fee = float(trade.get("fee_usdc") or 0.0)
+
+        token_cash[token_id] += signed_cash - fee
+        token_net_shares[token_id] += signed_shares
+        condition_cash[condition_id] += signed_cash - fee
+        condition_net_shares[condition_id][token_id] += signed_shares
+
+        if trade.get("side") == "BUY":
+            buy_trades_by_condition[condition_id][token_id].append(trade)
+        elif trade.get("side") == "SELL":
+            token_sell_shares[token_id] += float(trade.get("shares") or 0.0)
+
+    rows = []
+    for condition_id, token_buys in buy_trades_by_condition.items():
+        side_entries = []
+        for token_id, buy_trades in token_buys.items():
+            meta = token_meta.get(token_id, {
+                "outcome_label": f"Token {token_id[:8]}",
+                "outcome_is_derived": True,
+            })
+            total_buy_shares = sum(float(trade.get("shares") or 0.0) for trade in buy_trades)
+            total_buy_dollars = sum(float(trade.get("usdc") or 0.0) for trade in buy_trades)
+            paired = paired_buys.get(condition_id, {}).get(token_id, {})
+            effective_buy_shares = max(total_buy_shares - float(paired.get("shares") or 0.0), 0.0)
+            effective_buy_dollars = max(total_buy_dollars - float(paired.get("dollars") or 0.0), 0.0)
+            if effective_buy_shares <= 1e-9:
+                continue
+            avg_buy = (effective_buy_dollars / effective_buy_shares) if effective_buy_shares > 0 else 0.0
+            side_pnl = token_cash[token_id] + (token_net_shares[token_id] * float(final_prices.get(token_id, 0.0)))
+            side_entries.append({
+                "token_id": token_id,
+                "outcome_label": meta["outcome_label"],
+                "outcome_is_derived": bool(meta.get("outcome_is_derived")),
+                "avg_buy": round(avg_buy, 4),
+                "bought_shares": round(effective_buy_shares, 2),
+                "bought_dollars": round(effective_buy_dollars, 2),
+                "sold_shares": round(token_sell_shares[token_id], 2),
+                "side_pnl": round(side_pnl, 2),
+            })
+
+        if len(side_entries) < 2:
+            continue
+
+        side_entries.sort(key=lambda entry: (-entry["bought_dollars"], entry["outcome_label"]))
+        top_a, top_b = side_entries[:2]
+        total_pnl = condition_cash[condition_id] + sum(
+            shares * float(final_prices.get(token_id, 0.0))
+            for token_id, shares in condition_net_shares[condition_id].items()
+        )
+        rows.append({
+            "condition_id": condition_id,
+            "market": condition_market.get(condition_id, "Unknown"),
+            "outcome_a_label": top_a["outcome_label"],
+            "outcome_a_is_derived": top_a["outcome_is_derived"],
+            "avg_buy_a": round(top_a["avg_buy"], 4),
+            "bought_shares_a": round(top_a["bought_shares"], 2),
+            "bought_dollars_a": round(top_a["bought_dollars"], 2),
+            "sold_shares_a": round(top_a["sold_shares"], 2),
+            "side_pnl_a": round(top_a["side_pnl"], 2),
+            "outcome_b_label": top_b["outcome_label"],
+            "outcome_b_is_derived": top_b["outcome_is_derived"],
+            "avg_buy_b": round(top_b["avg_buy"], 4),
+            "bought_shares_b": round(top_b["bought_shares"], 2),
+            "bought_dollars_b": round(top_b["bought_dollars"], 2),
+            "sold_shares_b": round(top_b["sold_shares"], 2),
+            "side_pnl_b": round(top_b["side_pnl"], 2),
+            "combined_avg_buy": round(float(top_a["avg_buy"]) + float(top_b["avg_buy"]), 3),
+            "total_pnl": round(total_pnl, 2),
+            "extra_outcome_count": max(len(side_entries) - 2, 0),
+            "has_paired_complements": condition_flags.get(condition_id, {}).get("synthetic_pair_count", 0) > 0,
+            "cleanup_pair_count": condition_flags.get(condition_id, {}).get("cleanup_pair_count", 0),
+        })
+
+    rows.sort(key=lambda row: (-row["combined_avg_buy"], -row["total_pnl"], row["market"]))
+    return rows
+
+
 def _severity_from_thresholds(value: float | None, amber: float, red: float) -> str:
     if value is None:
         return "green"
@@ -242,13 +567,21 @@ def build_curation_signals(token_scope: list[dict[str, Any]], trades: list[dict[
     active_days = len({t["trade_date"] for t in trades})
     unique_markets = len({token_to_question.get(t["token_id"], "Unknown") for t in trades}) if trades else 0
 
+    paired_buys, _condition_flags = _detect_synthetic_buy_pairs(trades)
+    buy_trades = [trade for trade in trades if trade["side"] == "BUY"]
     conditions: dict[str, set[str]] = {}
-    for trade in trades:
-        conditions.setdefault(str(trade["condition_id"]), set()).add(str(trade["token_id"]))
+    buy_shares_by_token: dict[tuple[str, str], float] = defaultdict(float)
+    for trade in buy_trades:
+        condition_id = str(trade["condition_id"])
+        token_id = str(trade["token_id"])
+        buy_shares_by_token[(condition_id, token_id)] += float(trade.get("shares") or 0.0)
+    for (condition_id, token_id), total_buy_shares in buy_shares_by_token.items():
+        effective_buy_shares = total_buy_shares - float(paired_buys.get(condition_id, {}).get(token_id, {}).get("shares") or 0.0)
+        if effective_buy_shares > 1e-9:
+            conditions.setdefault(condition_id, set()).add(token_id)
     both_sides_count = sum(1 for token_ids in conditions.values() if len(token_ids) > 1)
     both_sides_market_pct = round((both_sides_count / len(conditions)) * 100.0, 1) if conditions else 0.0
 
-    buy_trades = [trade for trade in trades if trade["side"] == "BUY"]
     maker_buy_trades = [trade for trade in buy_trades if str(trade.get("role") or "").lower() == "maker"]
     taker_buy_trades = [trade for trade in buy_trades if str(trade.get("role") or "").lower() == "taker"]
     maker_buy_avg = _weighted_average_trade_price(maker_buy_trades)
@@ -372,7 +705,8 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, 
             SELECT
                 token_id,
                 any(condition_id) AS condition_id,
-                any(question) AS question
+                any(question) AS question,
+                any(outcome) AS outcome
             FROM {db}.token_metadata_latest_v2
             WHERE {scope_clause}
             GROUP BY token_id
@@ -393,6 +727,7 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, 
             t.token_id AS token_id,
             any(st.condition_id) AS condition_id,
             any(st.question) AS question,
+            any(st.outcome) AS outcome,
             nullIf(minIf(t.ts, t.ts >= toDateTime({_sql_quote(window_start_dt)})), toDateTime(0)) AS first_trade_ts,
             nullIf(maxIf(t.ts, t.ts >= toDateTime({_sql_quote(window_start_dt)})), toDateTime(0)) AS last_trade_ts,
             sumIf(if(t.side = 'BUY', t.shares, -t.shares), t.ts < toDateTime({_sql_quote(window_start_dt)})) AS opening_shares,
@@ -408,6 +743,7 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, 
             "token_id": str(r["token_id"]),
             "condition_id": str(r["condition_id"]),
             "question": str(r.get("question") or ""),
+            "outcome": str(r.get("outcome") or ""),
             "first_trade_ts": _parse_dt(r["first_trade_ts"]) if r.get("first_trade_ts") else None,
             "last_trade_ts": _parse_dt(r["last_trade_ts"]) if r.get("last_trade_ts") else None,
             "opening_shares": float(r.get("opening_shares") or 0.0),
@@ -425,7 +761,8 @@ def fetch_token_scope_all_history(client: ClickHouseClient, wallet: str, filter_
             SELECT
                 token_id,
                 any(condition_id) AS condition_id,
-                any(question) AS question
+                any(question) AS question,
+                any(outcome) AS outcome
             FROM {db}.token_metadata_latest_v2
             WHERE {scope_clause}
             GROUP BY token_id
@@ -443,6 +780,7 @@ def fetch_token_scope_all_history(client: ClickHouseClient, wallet: str, filter_
             t.token_id AS token_id,
             any(st.condition_id) AS condition_id,
             any(st.question) AS question,
+            any(st.outcome) AS outcome,
             min(t.ts) AS first_trade_ts,
             max(t.ts) AS last_trade_ts,
             count() AS visible_trade_count
@@ -456,6 +794,7 @@ def fetch_token_scope_all_history(client: ClickHouseClient, wallet: str, filter_
             "token_id": str(r["token_id"]),
             "condition_id": str(r["condition_id"]),
             "question": str(r.get("question") or ""),
+            "outcome": str(r.get("outcome") or ""),
             "first_trade_ts": _parse_dt(r["first_trade_ts"]) if r.get("first_trade_ts") else None,
             "last_trade_ts": _parse_dt(r["last_trade_ts"]) if r.get("last_trade_ts") else None,
             "opening_shares": 0.0,
@@ -484,14 +823,15 @@ def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], wi
                 any(toFloat64(usdc)) AS usdc,
                 any(toFloat64(fee_usdc)) AS fee_usdc,
                 any(toFloat64(price)) AS price,
-                any(role) AS role
+                any(role) AS role,
+                any(outcome) AS outcome
             FROM {db}.trades
             WHERE wallet = {_sql_quote(wallet)}
             GROUP BY trade_id
         )
         SELECT
-            toDate(ts) AS trade_date, ts, token_id, condition_id, side,
-            shares, usdc, fee_usdc, price, role
+            toDate(ts) AS trade_date, ts, trade_id, token_id, condition_id, side,
+            shares, usdc, fee_usdc, price, role, outcome
         FROM wallet_trades
         WHERE token_id IN ({token_list})
           {window_filter}
@@ -501,6 +841,7 @@ def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], wi
         {
             "trade_date": _parse_date(r["trade_date"]),
             "ts": _parse_dt(r["ts"]),
+            "trade_id": str(r.get("trade_id") or ""),
             "token_id": str(r["token_id"]),
             "condition_id": str(r["condition_id"]),
             "side": str(r["side"]),
@@ -509,6 +850,7 @@ def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], wi
             "fee_usdc": float(r["fee_usdc"]),
             "price": float(r["price"]),
             "role": str(r.get("role") or ""),
+            "outcome": str(r.get("outcome") or ""),
         }
         for r in rows
     ]
@@ -709,14 +1051,11 @@ def get_wallet_curation_base_data(wallet: str, filter_value: str, filter_level: 
     }
 
 
-def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key: Any = CURATION_ALL_RANGE) -> dict[str, Any] | None:
-    """Derive an interval-specific curation payload from a cached lifetime base dataset."""
+def _slice_curation_base_data(base_data: dict[str, Any], range_key: Any = CURATION_ALL_RANGE) -> dict[str, Any] | None:
     if not base_data:
         return None
 
     range_key = normalize_curation_range_key(range_key)
-    wallet = base_data["wallet"]
-    filter_value = base_data["filter_value"]
     full_token_scope = base_data["token_scope"]
     all_trades = base_data["trades"]
     closes = base_data["closes"]
@@ -761,7 +1100,35 @@ def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key
     if not token_scope:
         return None
 
-    lookback_days = CURATION_RANGE_DAYS.get(range_key)
+    return {
+        "wallet": base_data["wallet"],
+        "filter_value": base_data["filter_value"],
+        "filter_level": base_data["filter_level"],
+        "range_key": range_key,
+        "lookback_days": CURATION_RANGE_DAYS.get(range_key),
+        "window_start_date": window_start_date,
+        "token_scope": token_scope,
+        "opening_positions": scoped_opening_positions,
+        "trades": trades,
+        "closes": closes,
+        "resolutions": resolutions,
+    }
+
+
+def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key: Any = CURATION_ALL_RANGE) -> dict[str, Any] | None:
+    """Derive an interval-specific curation payload from a cached lifetime base dataset."""
+    scoped_data = _slice_curation_base_data(base_data, range_key)
+    if not scoped_data:
+        return None
+
+    wallet = scoped_data["wallet"]
+    filter_value = scoped_data["filter_value"]
+    token_scope = scoped_data["token_scope"]
+    trades = scoped_data["trades"]
+    closes = scoped_data["closes"]
+    resolutions = scoped_data["resolutions"]
+    scoped_opening_positions = scoped_data["opening_positions"]
+    lookback_days = scoped_data["lookback_days"]
     chart = build_chart_payload(
         wallet,
         filter_value,
@@ -771,7 +1138,7 @@ def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key
         closes,
         resolutions,
         opening_positions=scoped_opening_positions,
-        window_start_date=window_start_date,
+        window_start_date=scoped_data["window_start_date"],
     )
     if not chart:
         return None
@@ -787,6 +1154,7 @@ def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key
     breakdown = compute_market_pnl_breakdown(token_scope, trades, final_prices, scoped_opening_positions, opening_prices)
     chart["breakdown"] = breakdown
     chart["signals"] = build_curation_signals(token_scope, trades, breakdown)
+    chart["both_sides_rows"] = build_both_sides_rows(token_scope, trades, final_prices)
 
     vol = chart["summary"]["total_volume_usd"]
     pnl = chart["summary"]["final_pnl"]
@@ -795,6 +1163,30 @@ def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key
     chart["summary"]["active_days"] = chart["signals"]["active_days"]
     chart["summary"]["unique_markets"] = chart["signals"]["unique_markets"]
     return chart
+
+
+def build_wallet_trade_audit_payload_from_base(base_data: dict[str, Any], range_key: Any = CURATION_ALL_RANGE,
+                                               limit_per_side: int | None = 50) -> dict[str, Any]:
+    scoped_data = _slice_curation_base_data(base_data, range_key)
+    if not scoped_data or not scoped_data["trades"]:
+        return {"total_rows": 0, "display_rows": [], "rows": []}
+
+    token_scope = scoped_data["token_scope"]
+    trades = scoped_data["trades"]
+    closes = scoped_data["closes"]
+    resolutions = scoped_data["resolutions"]
+    token_ids = [token["token_id"] for token in token_scope]
+    latest_close_date = max((c["trade_date"] for c in closes), default=date.today())
+    last_trade_date = max((trade["trade_date"] for trade in trades), default=date.today())
+    chart_end_date = max(date.today(), last_trade_date, latest_close_date)
+    final_prices = _build_final_price_lookup(token_ids, closes, resolutions, chart_end_date)
+    rows = build_trade_audit_rows(token_scope, trades, final_prices)
+    display_rows = rows if limit_per_side is None else build_compact_trade_audit_rows(rows, limit_per_side=limit_per_side)
+    return {
+        "total_rows": len(rows),
+        "display_rows": display_rows,
+        "rows": rows,
+    }
 
 
 def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],

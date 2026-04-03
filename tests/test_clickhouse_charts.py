@@ -1,6 +1,6 @@
 import unittest
 from datetime import date, datetime
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from lib.clickhouse_charts import (
     CURATION_ALL_RANGE,
@@ -8,6 +8,7 @@ from lib.clickhouse_charts import (
     _build_final_price_lookup,
     build_chart_payload,
     build_wallet_curation_payload_from_base,
+    build_wallet_trade_audit_payload_from_base,
     build_curation_signals,
     compute_market_pnl_breakdown,
     normalize_curation_range_key,
@@ -376,6 +377,382 @@ class ClickHouseChartsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["total_trades"], 1)
         self.assertEqual(payload["series"][-1]["pnl"], 2.5)
         self.assertEqual(payload["summary"]["active_days"], 1)
+
+    def test_interval_payload_builds_trade_and_both_sides_rows(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "League of Legends",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": "cid-1-t1",
+                    "condition_id": "cid-1",
+                    "question": "LoL: T1 vs KT Rolster - Map 1 Winner",
+                    "outcome": "T1",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 2,
+                },
+                {
+                    "token_id": "cid-1-kt",
+                    "condition_id": "cid-1",
+                    "question": "LoL: T1 vs KT Rolster - Map 1 Winner",
+                    "outcome": "KT Rolster",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 1,
+                },
+                {
+                    "token_id": "cid-1-draw",
+                    "condition_id": "cid-1",
+                    "question": "LoL: T1 vs KT Rolster - Map 1 Winner",
+                    "outcome": "Draw",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 1,
+                },
+                {
+                    "token_id": "cid-2-gen",
+                    "condition_id": "cid-2",
+                    "question": "LoL: Gen.G vs DRX - Match Winner",
+                    "outcome": "Gen.G",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 1,
+                },
+            ],
+            "trades": [
+                {
+                    "token_id": "cid-1-t1",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 1),
+                    "side": "BUY",
+                    "shares": 10.0,
+                    "usdc": 4.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.4,
+                    "role": "maker",
+                    "outcome": "T1",
+                    "ts": datetime(2026, 4, 1, 12, 0, 0),
+                },
+                {
+                    "token_id": "cid-1-kt",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 2),
+                    "side": "BUY",
+                    "shares": 8.0,
+                    "usdc": 3.6,
+                    "fee_usdc": 0.0,
+                    "price": 0.45,
+                    "role": "taker",
+                    "outcome": "KT Rolster",
+                    "ts": datetime(2026, 4, 2, 12, 0, 0),
+                },
+                {
+                    "token_id": "cid-1-t1",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 3),
+                    "side": "SELL",
+                    "shares": 4.0,
+                    "usdc": 2.4,
+                    "fee_usdc": 0.0,
+                    "price": 0.6,
+                    "role": "maker",
+                    "outcome": "T1",
+                    "ts": datetime(2026, 4, 3, 8, 0, 0),
+                },
+                {
+                    "token_id": "cid-1-draw",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 3),
+                    "side": "BUY",
+                    "shares": 1.0,
+                    "usdc": 0.1,
+                    "fee_usdc": 0.0,
+                    "price": 0.1,
+                    "role": "maker",
+                    "outcome": "Draw",
+                    "ts": datetime(2026, 4, 3, 9, 0, 0),
+                },
+                {
+                    "token_id": "cid-2-gen",
+                    "condition_id": "cid-2",
+                    "trade_date": date(2026, 4, 2),
+                    "side": "BUY",
+                    "shares": 5.0,
+                    "usdc": 1.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.2,
+                    "role": "maker",
+                    "outcome": "Gen.G",
+                    "ts": datetime(2026, 4, 2, 15, 0, 0),
+                },
+            ],
+            "closes": [
+                {"token_id": "cid-1-t1", "trade_date": date(2026, 3, 31), "close_price": 0.4},
+                {"token_id": "cid-1-kt", "trade_date": date(2026, 3, 31), "close_price": 0.45},
+                {"token_id": "cid-1-draw", "trade_date": date(2026, 3, 31), "close_price": 0.1},
+                {"token_id": "cid-2-gen", "trade_date": date(2026, 3, 31), "close_price": 0.2},
+                {"token_id": "cid-1-t1", "trade_date": date(2026, 4, 3), "close_price": 0.7},
+                {"token_id": "cid-1-kt", "trade_date": date(2026, 4, 3), "close_price": 0.25},
+                {"token_id": "cid-1-draw", "trade_date": date(2026, 4, 3), "close_price": 0.05},
+                {"token_id": "cid-2-gen", "trade_date": date(2026, 4, 3), "close_price": 0.9},
+            ],
+            "resolutions": {},
+        }
+
+        with patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_curation_payload_from_base(base_data, "7D")
+
+        self.assertNotIn("trade_rows", payload)
+
+        both_sides = payload["both_sides_rows"]
+        self.assertEqual(len(both_sides), 1)
+        self.assertEqual(both_sides[0]["market"], "LoL: T1 vs KT Rolster - Map 1 Winner")
+        self.assertEqual(both_sides[0]["outcome_a_label"], "T1")
+        self.assertEqual(both_sides[0]["outcome_b_label"], "KT Rolster")
+        self.assertEqual(both_sides[0]["extra_outcome_count"], 1)
+        self.assertAlmostEqual(both_sides[0]["sold_shares_a"], 4.0, places=2)
+        self.assertAlmostEqual(both_sides[0]["sold_shares_b"], 0.0, places=2)
+        self.assertAlmostEqual(both_sides[0]["combined_avg_buy"], 0.85, places=3)
+        self.assertAlmostEqual(both_sides[0]["total_pnl"], 0.95, places=2)
+
+    def test_trade_audit_payload_from_base_limits_display_rows_to_winners_and_losers(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        trades = []
+        for idx in range(120):
+            price = idx / 100
+            trades.append(
+                {
+                    "token_id": "sen-token",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "BUY",
+                    "shares": 1.0,
+                    "usdc": price,
+                    "fee_usdc": 0.0,
+                    "price": price,
+                    "role": "maker",
+                    "outcome": "Sentinels",
+                    "ts": datetime(2026, 3, 29, 10, idx % 60, idx % 60),
+                }
+            )
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "League of Legends",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": "sen-token",
+                    "condition_id": "cid-1",
+                    "question": "LoL: Sentinels vs LYON - Game 4 Winner",
+                    "outcome": "Sentinels",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": len(trades),
+                }
+            ],
+            "trades": trades,
+            "closes": [
+                {"token_id": "sen-token", "trade_date": date(2026, 3, 29), "close_price": 0.5},
+            ],
+            "resolutions": {},
+        }
+
+        with patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_trade_audit_payload_from_base(base_data, "30D")
+
+        self.assertEqual(payload["total_rows"], 120)
+        self.assertEqual(len(payload["display_rows"]), 100)
+        prices = [row["price"] for row in payload["display_rows"]]
+        self.assertIn(0.0, prices)
+        self.assertIn(1.19, prices)
+        self.assertNotIn(0.6, prices)
+        self.assertAlmostEqual(payload["display_rows"][0]["mtm_pnl"], 0.5, places=2)
+        self.assertAlmostEqual(payload["display_rows"][-1]["mtm_pnl"], -0.69, places=2)
+
+    def test_both_sides_rows_ignore_synthetic_complements_and_cleanup_buys(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "League of Legends",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": "team-we-token",
+                    "condition_id": "cid-1",
+                    "question": "LoL: Team WE vs ThunderTalk Gaming (BO3) - Esports World Cup China Qualifier Phase 1",
+                    "outcome": "",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 2,
+                },
+                {
+                    "token_id": "tt-token",
+                    "condition_id": "cid-1",
+                    "question": "LoL: Team WE vs ThunderTalk Gaming (BO3) - Esports World Cup China Qualifier Phase 1",
+                    "outcome": "",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 2,
+                },
+            ],
+            "trades": [
+                {
+                    "token_id": "team-we-token",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "BUY",
+                    "shares": 100.0,
+                    "usdc": 68.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.68,
+                    "role": "maker",
+                    "outcome": "Team WE",
+                    "ts": datetime(2026, 3, 29, 10, 34, 4),
+                },
+                {
+                    "token_id": "tt-token",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "SELL",
+                    "shares": 100.0,
+                    "usdc": 32.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.32,
+                    "role": "taker",
+                    "outcome": "ThunderTalk Gaming",
+                    "ts": datetime(2026, 3, 29, 10, 34, 4),
+                },
+                {
+                    "token_id": "team-we-token",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "SELL",
+                    "shares": 100.0,
+                    "usdc": 99.9,
+                    "fee_usdc": 0.0,
+                    "price": 0.999,
+                    "role": "taker",
+                    "outcome": "Team WE",
+                    "ts": datetime(2026, 3, 29, 18, 25, 42),
+                },
+                {
+                    "token_id": "tt-token",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "BUY",
+                    "shares": 100.0,
+                    "usdc": 0.1,
+                    "fee_usdc": 0.0,
+                    "price": 0.001,
+                    "role": "taker",
+                    "outcome": "ThunderTalk Gaming",
+                    "ts": datetime(2026, 3, 29, 18, 25, 42),
+                },
+            ],
+            "closes": [
+                {"token_id": "team-we-token", "trade_date": date(2026, 3, 29), "close_price": 0.999},
+                {"token_id": "tt-token", "trade_date": date(2026, 3, 29), "close_price": 0.001},
+            ],
+            "resolutions": {},
+        }
+
+        with patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_curation_payload_from_base(base_data, "30D")
+            trade_audit = build_wallet_trade_audit_payload_from_base(base_data, "30D")
+
+        self.assertEqual(trade_audit["rows"][0]["outcome_label"], "Team WE")
+        self.assertEqual(trade_audit["rows"][-1]["outcome_label"], "ThunderTalk Gaming")
+        self.assertEqual(payload["both_sides_rows"], [])
+
+    def test_gamma_outcome_fallback_labels_rows_when_clickhouse_metadata_is_blank(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [
+            {
+                "clobTokenIds": '["123456789","987654321"]',
+                "outcomes": '["Sentinels","LYON"]',
+            }
+        ]
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "League of Legends",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": "123456789",
+                    "condition_id": "cid-1",
+                    "question": "LoL: Sentinels vs LYON - Game 4 Winner",
+                    "outcome": "",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 1,
+                },
+                {
+                    "token_id": "987654321",
+                    "condition_id": "cid-1",
+                    "question": "LoL: Sentinels vs LYON - Game 4 Winner",
+                    "outcome": "",
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 1,
+                },
+            ],
+            "trades": [
+                {
+                    "token_id": "123456789",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "BUY",
+                    "shares": 10.0,
+                    "usdc": 6.8,
+                    "fee_usdc": 0.0,
+                    "price": 0.68,
+                    "role": "maker",
+                    "outcome": "",
+                    "ts": datetime(2026, 3, 29, 10, 34, 4),
+                },
+                {
+                    "token_id": "987654321",
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 29),
+                    "side": "BUY",
+                    "shares": 10.0,
+                    "usdc": 3.2,
+                    "fee_usdc": 0.0,
+                    "price": 0.32,
+                    "role": "maker",
+                    "outcome": "",
+                    "ts": datetime(2026, 3, 29, 10, 35, 4),
+                },
+            ],
+            "closes": [
+                {"token_id": "123456789", "trade_date": date(2026, 3, 29), "close_price": 0.7},
+                {"token_id": "987654321", "trade_date": date(2026, 3, 29), "close_price": 0.3},
+            ],
+            "resolutions": {},
+        }
+
+        with patch.dict("lib.clickhouse_charts._GAMMA_OUTCOME_CACHE", {}, clear=True), patch(
+            "lib.clickhouse_charts.requests.get", return_value=response
+        ), patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_curation_payload_from_base(base_data, "30D")
+            trade_audit = build_wallet_trade_audit_payload_from_base(base_data, "30D")
+
+        self.assertEqual(trade_audit["rows"][0]["outcome_label"], "Sentinels")
+        self.assertEqual(payload["both_sides_rows"][0]["outcome_b_label"], "LYON")
 
 
 if __name__ == "__main__":
