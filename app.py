@@ -1340,7 +1340,7 @@ def wallet_curation_layout():
                         html.Div(id="cur-results-list", style={"marginTop": "12px", "fontFamily": "monospace", "fontSize": "13px"}),
                         html.Div([
                             dcc.Download(id="cur-download"),
-                            html.Button("Download Approved List", id="cur-download-btn",
+                            html.Button("Download Results", id="cur-download-btn",
                                         className="pm-button pm-button--primary", n_clicks=0),
                             html.Button("Start New Batch", id="cur-new-batch",
                                         className="pm-button pm-button--secondary", n_clicks=0),
@@ -2821,6 +2821,116 @@ def _build_top_markets_table(markets):
     ])
 
 
+def _build_sim_summary_strip(wallet_meta):
+    values = []
+    if wallet_meta.get("capital"):
+        values.append(html.Span(f"${wallet_meta['capital']:,.0f} capital"))
+    if wallet_meta.get("copy_ratio") is not None:
+        values.append(html.Span(f"{wallet_meta['copy_ratio']:.0%} copy ratio"))
+    if wallet_meta.get("execution_mode"):
+        values.append(html.Span(wallet_meta["execution_mode"]))
+    values.append(html.Span(f"{wallet_meta.get('copied', 0):,} copied / {wallet_meta.get('skipped', 0):,} skipped"))
+    return html.Div(values, className="pm-sim-summary-strip")
+
+
+def _build_sim_validation(validation):
+    if not validation or validation.get("workbook_value") is None:
+        return ""
+    delta = float(validation.get("delta") or 0.0)
+    if abs(delta) <= 10:
+        tone = "pm-sim-validation--ok"
+    elif abs(delta) <= 100:
+        tone = "pm-sim-validation--warn"
+    else:
+        tone = "pm-sim-validation--bad"
+    return html.Div(
+        f"Workbook: ${validation['workbook_value']:,.2f} · Recomputed: ${validation['recomputed_value']:,.2f} · Δ ${delta:,.2f}",
+        className=f"pm-sim-validation {tone}",
+    )
+
+
+def _build_curation_stats(actual_summary, sim_payload, wallet_meta):
+    sim_summary = (sim_payload or {}).get("summary", {})
+    sim_pnl = sim_summary.get("final_pnl")
+    sim_roi = sim_summary.get("roi_pct")
+    actual_pnl = float(actual_summary.get("final_pnl", 0.0) or 0.0)
+    actual_roi = float(actual_summary.get("roi_pct", 0.0) or 0.0)
+    return html.Div([
+        _stat_tile("Final P&L", f"${actual_pnl:,.2f}", tone="positive" if actual_pnl >= 0 else "negative"),
+        html.Div([
+            _stat_tile("Sim P&L", "N/A" if sim_pnl is None else f"${float(sim_pnl):,.2f}",
+                       tone="positive" if float(sim_pnl or 0.0) >= 0 else "negative"),
+        ], className="pm-sim-stat"),
+        _stat_tile("ROI", f"{actual_roi:.1f}%"),
+        html.Div([
+            _stat_tile("Sim ROI", "N/A" if sim_roi is None else f"{float(sim_roi):.1f}%"),
+        ], className="pm-sim-stat"),
+        _stat_tile("Trades", f"{int(actual_summary.get('total_trades', 0) or 0):,}"),
+        html.Div([
+            _stat_tile("Copied", f"{int(wallet_meta.get('copied', 0) or 0):,}"),
+        ], className="pm-sim-stat"),
+    ], className="pm-wallet-stat-grid pm-wallet-stat-grid--sim")
+
+
+def _load_sim_payload(sim_session_id, wallet, range_key, base_payload):
+    if not sim_session_id or not base_payload:
+        return None, None
+
+    from lib.sharpsim_parser import build_sim_payload
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    session = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_meta = (session.get("wallets") or {}).get(wallet)
+    if not wallet_meta:
+        return None, None
+
+    wallet_meta = {
+        **wallet_meta,
+        "capital": (session.get("session_meta") or {}).get("capital"),
+        "copy_ratio": (session.get("session_meta") or {}).get("copy_ratio"),
+        "execution_mode": (session.get("session_meta") or {}).get("execution_mode"),
+    }
+    sim_payload = None
+    if wallet_meta.get("sim_status") == "ready":
+        sim_payload = build_sim_payload(
+            wallet_meta,
+            (session.get("drl") or {}).get(wallet, []),
+            base_payload.get("closes", []),
+            base_payload.get("resolutions", {}),
+            range_key,
+        )
+    return wallet_meta, sim_payload
+
+
+def _build_curation_decision_row(view, decision, sim_session_id):
+    from lib.curation_prefetch import get_curation_prefetch_manager
+
+    manager = get_curation_prefetch_manager()
+    wallet = view["wallet"]
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    range_key = _normalize_curation_range(view.get("range"))
+    key = manager.make_base_key(wallet, filter_level, filter_value)
+    actual_payload = manager.get_payload(key, range_key) or {}
+    base_payload = manager.get_base_payload(key) or {}
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, range_key, base_payload)
+    actual_summary = actual_payload.get("summary", {})
+    sim_summary = (sim_payload or {}).get("summary", {})
+    return {
+        "wallet": wallet,
+        "filter_level": filter_level,
+        "filter_value": filter_value,
+        "decision": decision,
+        "actual_final_pnl": actual_summary.get("final_pnl", 0.0),
+        "actual_roi_pct": actual_summary.get("roi_pct", 0.0),
+        "sim_final_pnl": sim_summary.get("final_pnl"),
+        "sim_roi_pct": sim_summary.get("roi_pct"),
+        "sim_copied": (wallet_meta or {}).get("copied", 0),
+        "sim_skipped": (wallet_meta or {}).get("skipped", 0),
+        "sim_status": sim_summary.get("sim_status") or (wallet_meta or {}).get("sim_status", "missing_drl"),
+    }
+
+
 @callback(
     [
         Output("sc-chart", "figure"),
@@ -3287,14 +3397,22 @@ def update_curation_status(index, session_id, selected_range, _poll, wallets, fi
 
 
 @callback(
-    [Output("cur-warnings", "children"), Output("cur-read", "children"),
-     Output("cur-chart", "figure"), Output("cur-stats", "children"),
-     Output("cur-concentration", "children"), Output("cur-top-markets", "children")],
+    [
+        Output("cur-warnings", "children"),
+        Output("cur-read", "children"),
+        Output("cur-sim-summary-panel", "children"),
+        Output("cur-chart", "figure"),
+        Output("cur-stats", "children"),
+        Output("cur-concentration", "children"),
+        Output("cur-top-markets", "children"),
+    ],
     Input("cur-view", "data"),
+    Input("cur-sim-overlay-visible", "data"),
+    State("cur-sim-session-id", "data"),
 )
-def render_curation_wallet(view):
+def render_curation_wallet(view, sim_overlay_visible, sim_session_id):
     if not view or view.get("status") == "idle":
-        return "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
+        return "", "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
 
     wallet = view.get("wallet", "")
     filter_level = view.get("filter_level", "detail")
@@ -3305,6 +3423,7 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure("Wallet fetch failed"),
             dbc.Alert(view.get("error") or f"Failed to fetch {wallet[:12]}...", color="danger"),
             "",
@@ -3313,6 +3432,7 @@ def render_curation_wallet(view):
 
     if view["status"] == "empty":
         return [
+            "",
             "",
             "",
             _build_curation_loading_figure("No trades found"),
@@ -3330,6 +3450,7 @@ def render_curation_wallet(view):
         return [
             loading_warning,
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
             dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
             "",
@@ -3347,6 +3468,7 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure("Wallet fetch failed"),
             dbc.Alert(f"Error: {exc}", color="danger"),
             "",
@@ -3357,6 +3479,7 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Loading wallet data", tone="warning")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
             dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
             "",
@@ -3370,6 +3493,9 @@ def render_curation_wallet(view):
     summary = data["summary"]
     final_pnl = summary["final_pnl"]
 
+    base_payload = manager.get_base_payload(key)
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, selected_range, base_payload)
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=[s["date"] for s in series], y=[s["pnl"] for s in series],
@@ -3377,19 +3503,36 @@ def render_curation_wallet(view):
         fill="tozeroy", fillcolor=COLORS["chart_fill"],
         customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
         hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+        name="Actual P&L",
     ))
+    if sim_overlay_visible and sim_payload and sim_payload.get("series"):
+        fig.add_trace(go.Scatter(
+            x=[s["date"] for s in sim_payload["series"]],
+            y=[s["pnl"] for s in sim_payload["series"]],
+            mode="lines",
+            line=dict(color="#9B51E0", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(155, 81, 224, 0.12)",
+            hovertemplate="<b>%{x}</b><br>Sim P&L: $%{y:,.2f}<extra></extra>",
+            name="Sim P&L",
+        ))
     _polymarket_chart_layout(fig)
 
-    # Stats
-    pnl_color = "positive" if final_pnl >= 0 else "negative"
-    stats = html.Div([
-        _stat_tile("Final P&L", f"${final_pnl:,.2f}", tone=pnl_color),
-        _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
-        _stat_tile("Trades", f"{summary['total_trades']:,}"),
-        _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
-        _stat_tile("Unique Markets", f"{summary.get('unique_markets', 0):,}"),
-        _stat_tile("Active Days", f"{summary.get('active_days', 0):,}"),
-    ], className="pm-wallet-stat-grid")
+    sim_panel = ""
+    if wallet_meta:
+        sim_panel = html.Div(
+            [
+                dbc.Checkbox(id="cur-sim-overlay-toggle", value=bool(sim_overlay_visible), className="pm-sim-toggle"),
+                _build_sim_summary_strip(wallet_meta),
+                _build_sim_validation((sim_payload or {}).get("validation")),
+                dbc.Alert("Sim data unavailable for this wallet.", color="secondary", className="pm-inline-message")
+                if wallet_meta.get("sim_status") != "ready" or not sim_payload
+                else "",
+            ],
+            className="pm-sim-panel",
+        )
+
+    stats = _build_curation_stats(summary, sim_payload, wallet_meta or {})
 
     signals = data.get("signals", {})
     warnings = _build_curation_warning_strip(signals)
@@ -3398,7 +3541,16 @@ def render_curation_wallet(view):
     breakdown = data.get("breakdown", {})
     top_markets = _build_top_markets_table(breakdown.get("markets", []))
 
-    return [warnings, curation_read, fig, stats, concentration, top_markets]
+    return [warnings, curation_read, sim_panel, fig, stats, concentration, top_markets]
+
+
+@callback(
+    Output("cur-sim-overlay-visible", "data"),
+    Input("cur-sim-overlay-toggle", "value"),
+    prevent_initial_call=True,
+)
+def set_cur_sim_overlay_visible(value):
+    return bool(value)
 
 
 @callback(
@@ -3412,11 +3564,22 @@ def render_curation_wallet(view):
      Output("cur-results-list", "children")],
     [Input("cur-approve", "n_clicks"), Input("cur-skip", "n_clicks"), Input("cur-back", "n_clicks")],
     [State("cur-index", "data"), State("cur-wallets", "data"),
-     State("cur-approved", "data"), State("cur-decisions", "data")],
+     State("cur-approved", "data"), State("cur-decisions", "data"),
+     State("cur-view", "data"), State("cur-sim-session-id", "data")],
     prevent_initial_call=True,
 )
-def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions):
-    triggered = dash.ctx.triggered_id
+def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions, current_view, sim_session_id):
+    try:
+        triggered = dash.ctx.triggered_id
+    except Exception:
+        triggered = None
+    if not triggered:
+        if approve_clicks:
+            triggered = "cur-approve"
+        elif skip_clicks:
+            triggered = "cur-skip"
+        elif back_clicks:
+            triggered = "cur-back"
     if not triggered or not wallets:
         return [no_update] * 8
 
@@ -3426,21 +3589,20 @@ def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wall
         return [no_update] * 8
 
     wallet = wallets[index] if index < len(wallets) else None
-    if not wallet:
+    if not wallet or not current_view:
         return [no_update] * 8
 
     if triggered == "cur-approve" and approve_clicks:
         if wallet not in approved:
             approved = approved + [wallet]
-        decisions = {**decisions, wallet: "approved"}
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "approved", sim_session_id)}
     elif triggered == "cur-skip" and skip_clicks:
-        decisions = {**decisions, wallet: "skipped"}
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "skipped", sim_session_id)}
     else:
         return [no_update] * 8
 
     next_index = index + 1
     if next_index >= len(wallets):
-        # Done — show results
         title = f"Approved {len(approved)} of {len(wallets)} wallets"
         wallet_list = html.Div([html.Div(w, style={"fontFamily": "monospace", "padding": "2px 0"}) for w in approved]) if approved else html.Div("No wallets approved.", style={"color": "var(--pm-text-secondary)"})
         return [next_index, approved, decisions,
@@ -3453,14 +3615,37 @@ def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wall
 @callback(
     Output("cur-download", "data"),
     Input("cur-download-btn", "n_clicks"),
-    State("cur-approved", "data"),
+    State("cur-decisions", "data"),
     prevent_initial_call=True,
 )
-def download_approved(n_clicks, approved):
-    if not n_clicks or not approved:
+def download_curation_results(n_clicks, decisions):
+    import csv
+    import io
+
+    if not n_clicks or not decisions:
         return no_update
-    txt = "\n".join(approved) + "\n"
-    return dict(content=txt, filename=f"approved_wallets_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "wallet",
+            "filter_level",
+            "filter_value",
+            "decision",
+            "actual_final_pnl",
+            "actual_roi_pct",
+            "sim_final_pnl",
+            "sim_roi_pct",
+            "sim_copied",
+            "sim_skipped",
+            "sim_status",
+        ],
+    )
+    writer.writeheader()
+    for row in decisions.values():
+        writer.writerow(row)
+    return dict(content=buffer.getvalue(), filename=f"curation_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
 
 
 @callback(

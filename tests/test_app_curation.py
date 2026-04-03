@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -238,11 +239,125 @@ class AppCurationTests(unittest.TestCase):
                     "filter_level": "subcategory",
                     "filter_value": "League of Legends",
                     "range": "ALL",
-                }
+                },
+                False,
+                "",
             )
 
-        self.assertTrue(hasattr(result[2], "to_plotly_json"))
+        self.assertTrue(hasattr(result[3], "to_plotly_json"))
         manager.get_payload.assert_called_once_with(base_key, "ALL")
+
+    def test_render_curation_wallet_adds_sim_trace_when_overlay_visible(self):
+        actual_manager = Mock()
+        session_manager = Mock()
+        wallet = "0xabc"
+        base_key = (wallet, "detail", "League of Legends")
+        base_payload = {
+            "wallet": wallet,
+            "filter_value": "League of Legends",
+            "closes": [{"token_id": "yes-token", "trade_date": date(2026, 4, 3), "close_price": 0.7}],
+            "resolutions": {},
+        }
+        actual_payload = {
+            "series": [{"date": "2026-04-03", "pnl": 1.0, "cumulative_cash": 0.0, "marked_value": 1.0, "daily_trade_count": 1}],
+            "summary": {"final_pnl": 1.0, "roi_pct": 1.0, "total_trades": 1, "total_volume_usd": 10.0, "unique_markets": 1, "active_days": 1},
+            "signals": {},
+            "breakdown": {"markets": []},
+        }
+        sim_session = {
+            "wallets": {wallet: {"address": wallet, "filter_value": "League of Legends", "sim_status": "ready", "copied": 2, "skipped": 1}},
+            "drl": {wallet: []},
+        }
+        sim_payload = {
+            "series": [{"date": "2026-04-03", "pnl": 2.0, "cumulative_cash": 0.0, "marked_value": 2.0, "daily_trade_count": 1}],
+            "summary": {"final_pnl": 2.0, "roi_pct": 20.0, "copied_trades": 2, "sim_status": "ready"},
+            "validation": {"workbook_value": 2.0, "recomputed_value": 2.0, "delta": 0.0},
+        }
+        actual_manager.make_base_key.return_value = base_key
+        actual_manager.get_payload.return_value = actual_payload
+        actual_manager.get_base_payload.return_value = base_payload
+        session_manager.get_session.return_value = sim_session
+
+        with patch("lib.curation_prefetch.get_curation_prefetch_manager", return_value=actual_manager), patch(
+            "lib.sharpsim_session.get_sharpsim_session_manager", return_value=session_manager
+        ), patch("lib.sharpsim_parser.build_sim_payload", return_value=sim_payload):
+            result = app.render_curation_wallet(
+                {"status": "ready", "wallet": wallet, "filter_level": "detail", "filter_value": "League of Legends", "range": "ALL"},
+                True,
+                "sim-session-1",
+            )
+
+        figure = result[3]
+        self.assertEqual(len(figure.data), 2)
+        self.assertEqual(figure.data[1].name, "Sim P&L")
+
+    def test_render_curation_wallet_shows_warning_when_sim_payload_is_unavailable(self):
+        actual_manager = Mock()
+        wallet = "0xabc"
+        base_key = (wallet, "detail", "League of Legends")
+        actual_manager.make_base_key.return_value = base_key
+        actual_manager.get_payload.return_value = {
+            "series": [{"date": "2026-04-03", "pnl": 1.0, "cumulative_cash": 0.0, "marked_value": 1.0, "daily_trade_count": 1}],
+            "summary": {"final_pnl": 1.0, "roi_pct": 1.0, "total_trades": 1, "total_volume_usd": 10.0, "unique_markets": 1, "active_days": 1},
+            "signals": {},
+            "breakdown": {"markets": []},
+        }
+        actual_manager.get_base_payload.return_value = {"wallet": wallet, "filter_value": "League of Legends", "closes": [], "resolutions": {}}
+
+        with patch("lib.curation_prefetch.get_curation_prefetch_manager", return_value=actual_manager), patch(
+            "lib.sharpsim_session.get_sharpsim_session_manager"
+        ) as session_manager, patch("lib.sharpsim_parser.build_sim_payload", return_value=None):
+            session_manager.return_value.get_session.return_value = {
+                "wallets": {wallet: {"address": wallet, "filter_value": "League of Legends", "sim_status": "missing_drl", "sim_error": ""}},
+                "drl": {wallet: []},
+            }
+            result = app.render_curation_wallet(
+                {"status": "ready", "wallet": wallet, "filter_level": "detail", "filter_value": "League of Legends", "range": "ALL"},
+                True,
+                "sim-session-1",
+            )
+
+        self.assertTrue(hasattr(result[3], "to_plotly_json"))
+        self.assertIn("Sim data unavailable", str(result[2]))
+
+    def test_download_curation_results_returns_csv_for_reviewed_wallets(self):
+        decisions = {
+            "0xabc": {
+                "wallet": "0xabc",
+                "decision": "approved",
+                "filter_level": "detail",
+                "filter_value": "League of Legends",
+                "actual_final_pnl": 12.5,
+                "actual_roi_pct": 10.0,
+                "sim_final_pnl": 4.0,
+                "sim_roi_pct": 40.0,
+                "sim_copied": 2,
+                "sim_skipped": 1,
+                "sim_status": "ready",
+            }
+        }
+
+        download = app.download_curation_results(1, decisions)
+
+        self.assertTrue(download["filename"].startswith("curation_results_"))
+        self.assertIn("wallet,filter_level,filter_value,decision", download["content"])
+        self.assertIn("0xabc,detail,League of Legends,approved,12.5,10.0,4.0,40.0,2,1,ready", download["content"])
+
+    def test_handle_curation_action_records_structured_decision_rows(self):
+        with patch("app._build_curation_decision_row", return_value={"wallet": "0xabc", "decision": "approved", "sim_status": "ready"}):
+            result = app.handle_curation_action(
+                1,
+                0,
+                0,
+                0,
+                ["0xabc"],
+                [],
+                {},
+                {"status": "ready", "wallet": "0xabc", "filter_level": "detail", "filter_value": "League of Legends", "range": "ALL"},
+                "sim-session-1",
+            )
+
+        self.assertEqual(result[2]["0xabc"]["sim_status"], "ready")
 
     def test_render_curation_wallet_accepts_stale_browser_argument_order(self):
         wallets, filter_raw, selected_range = app._coerce_curation_render_state(
