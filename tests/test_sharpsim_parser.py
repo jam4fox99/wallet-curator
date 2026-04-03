@@ -1,10 +1,26 @@
+from datetime import date, datetime
+from unittest.mock import patch
 from io import BytesIO
 from pathlib import Path
 import unittest
 
 from openpyxl import load_workbook
 
-from lib.sharpsim_parser import parse_sharpsim
+from lib.sharpsim_parser import build_sim_payload, parse_sharpsim
+
+
+def _drl_row(ts, status, side, token_id, condition_id, question, price, shares, notional):
+    return {
+        "ts": ts,
+        "status": status,
+        "side": side,
+        "token_id": token_id,
+        "condition_id": condition_id,
+        "question": question,
+        "copied_price": price,
+        "copied_shares": shares,
+        "copied_notional": notional,
+    }
 
 
 class SharpsimParserTests(unittest.TestCase):
@@ -30,6 +46,63 @@ class SharpsimParserTests(unittest.TestCase):
         wallet = payload["wallet_order"][0]
         self.assertEqual(payload["wallets"][wallet]["sim_status"], "missing_drl")
         self.assertEqual(payload["drl"].get(wallet, []), [])
+
+
+class SharpsimReplayTests(unittest.TestCase):
+    def test_build_sim_payload_filters_to_copied_rows_and_rebases_selected_window(self):
+        wallet_meta = {
+            "address": "0xabc",
+            "filter_value": "League of Legends",
+            "copied": 2,
+            "skipped": 1,
+            "sim_7d": 4.0,
+            "sim_30d": 6.0,
+        }
+        drl_rows = [
+            _drl_row(datetime(2026, 3, 28, 10, 0), "COPIED", "BUY", "yes-token", "cid-1", "Match 1", 0.40, 10.0, 4.0),
+            _drl_row(datetime(2026, 3, 29, 10, 0), "SKIPPED", "BUY", "yes-token", "cid-1", "Match 1", 0.60, 10.0, 6.0),
+            _drl_row(datetime(2026, 4, 2, 10, 0), "COPIED", "SELL", "yes-token", "cid-1", "Match 1", 0.80, 5.0, 4.0),
+        ]
+        closes = [
+            {"token_id": "yes-token", "trade_date": date(2026, 3, 27), "close_price": 0.40},
+            {"token_id": "yes-token", "trade_date": date(2026, 4, 3), "close_price": 0.70},
+        ]
+        resolutions = {}
+
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        with patch("lib.sharpsim_parser.date", FixedDate):
+            payload = build_sim_payload(wallet_meta, drl_rows, closes, resolutions, "7D")
+
+        self.assertEqual(payload["summary"]["total_trades"], 2)
+        self.assertEqual(payload["summary"]["copied_trades"], 2)
+        self.assertEqual(payload["summary"]["sim_status"], "ready")
+        self.assertEqual(payload["validation"]["workbook_value"], 4.0)
+        self.assertEqual(payload["series"][0]["pnl"], 0.0)
+
+    def test_build_sim_payload_carries_opening_positions_from_pre_window_copied_rows(self):
+        wallet_meta = {"address": "0xabc", "filter_value": "League of Legends", "copied": 1, "skipped": 0}
+        drl_rows = [
+            _drl_row(datetime(2026, 3, 1, 9, 0), "COPIED", "BUY", "yes-token", "cid-1", "Match 1", 0.40, 10.0, 4.0),
+        ]
+        closes = [
+            {"token_id": "yes-token", "trade_date": date(2026, 3, 31), "close_price": 0.40},
+            {"token_id": "yes-token", "trade_date": date(2026, 4, 3), "close_price": 0.60},
+        ]
+
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        with patch("lib.sharpsim_parser.date", FixedDate):
+            payload = build_sim_payload(wallet_meta, drl_rows, closes, {}, "1D")
+
+        self.assertEqual(payload["summary"]["first_trade_date"], "2026-04-02")
+        self.assertEqual(payload["series"][-1]["marked_value"], 2.0)
 
 
 if __name__ == "__main__":

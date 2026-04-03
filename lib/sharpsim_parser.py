@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import date
 from io import BytesIO
+from datetime import timedelta
 from typing import Any
 
 from openpyxl import load_workbook
+
+from lib.clickhouse_charts import (
+    CURATION_ALL_RANGE,
+    CURATION_RANGE_DAYS,
+    build_chart_payload,
+    normalize_curation_range_key,
+)
 
 
 _RESULTS_REQUIRED = {
@@ -53,6 +62,190 @@ def _require_columns(header_map: dict[str, int], required: set[str], sheet_name:
 def _wallet_value(value: Any) -> str | None:
     text = str(value or "").strip().lower()
     return text if text.startswith("0x") else None
+
+
+def _normalize_copied_trade(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trade_date": row["ts"].date(),
+        "ts": row["ts"],
+        "token_id": row["token_id"],
+        "condition_id": row["condition_id"],
+        "side": row["side"],
+        "shares": float(row["copied_shares"] or 0.0),
+        "usdc": float(row["copied_notional"] or 0.0),
+        "fee_usdc": 0.0,
+        "price": float(row["copied_price"] or 0.0),
+        "role": "sim",
+        "question": row.get("question", ""),
+    }
+
+
+def _token_scope_from_trades(
+    trades: list[dict[str, Any]],
+    opening_positions: dict[str, float],
+    visible_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    ordered: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        ordered.setdefault(
+            trade["token_id"],
+            {
+                "token_id": trade["token_id"],
+                "condition_id": trade["condition_id"],
+                "question": trade.get("question", ""),
+                "first_trade_ts": trade["ts"],
+                "last_trade_ts": trade["ts"],
+                "opening_shares": opening_positions.get(trade["token_id"], 0.0),
+                "visible_trade_count": visible_counts.get(trade["token_id"], 0),
+            },
+        )
+        ordered[trade["token_id"]]["last_trade_ts"] = trade["ts"]
+    return list(ordered.values())
+
+
+def _latest_close_before_or_on(
+    closes: list[dict[str, Any]],
+    token_id: str,
+    as_of_date: date,
+) -> float | None:
+    latest_price = None
+    latest_date = None
+    for close in closes:
+        if close["token_id"] != token_id:
+            continue
+        trade_date = close["trade_date"]
+        if trade_date > as_of_date:
+            continue
+        if latest_date is None or trade_date > latest_date:
+            latest_date = trade_date
+            latest_price = float(close["close_price"])
+    return latest_price
+
+
+def _augment_closes_for_opening_positions(
+    closes: list[dict[str, Any]],
+    token_scope: list[dict[str, Any]],
+    window_start_date: date,
+) -> list[dict[str, Any]]:
+    baseline_date = window_start_date - timedelta(days=1)
+    augmented = list(closes)
+    for token in token_scope:
+        if abs(float(token.get("opening_shares", 0.0) or 0.0)) <= 1e-9:
+            continue
+        already_has_baseline = any(
+            close["token_id"] == token["token_id"] and close["trade_date"] == baseline_date
+            for close in closes
+        )
+        if already_has_baseline:
+            continue
+        latest_price = _latest_close_before_or_on(closes, token["token_id"], baseline_date)
+        if latest_price is None:
+            continue
+        augmented.append(
+            {
+                "token_id": token["token_id"],
+                "trade_date": baseline_date,
+                "close_price": latest_price,
+            }
+        )
+    return augmented
+
+
+def build_sim_payload(
+    wallet_meta: dict[str, Any],
+    drl_rows: list[dict[str, Any]],
+    closes: list[dict[str, Any]],
+    resolutions: dict[str, Any],
+    range_key: Any = CURATION_ALL_RANGE,
+) -> dict[str, Any]:
+    copied_rows = [row for row in drl_rows if row.get("status") == "COPIED"]
+    if not copied_rows:
+        return {
+            "series": [],
+            "summary": {
+                "sim_status": wallet_meta.get("sim_status", "missing_drl"),
+                "copied_trades": 0,
+                "total_trades": 0,
+                "final_pnl": 0.0,
+                "roi_pct": 0.0,
+            },
+            "validation": {
+                "workbook_value": None,
+                "recomputed_value": None,
+                "delta": None,
+            },
+        }
+
+    normalized_range = normalize_curation_range_key(range_key)
+    today_value = date.today()
+    if normalized_range == CURATION_ALL_RANGE:
+        window_start_date = min(row["ts"].date() for row in copied_rows)
+    else:
+        window_start_date = today_value - timedelta(days=CURATION_RANGE_DAYS[normalized_range])
+
+    opening_positions: dict[str, float] = {}
+    visible_trades: list[dict[str, Any]] = []
+    visible_counts: dict[str, int] = {}
+    normalized_trades = []
+
+    for row in copied_rows:
+        trade = _normalize_copied_trade(row)
+        normalized_trades.append(trade)
+        token_id = trade["token_id"]
+        if trade["trade_date"] < window_start_date:
+            signed_shares = trade["shares"] if trade["side"] == "BUY" else -trade["shares"]
+            opening_positions[token_id] = opening_positions.get(token_id, 0.0) + signed_shares
+            continue
+        visible_trades.append(trade)
+        visible_counts[token_id] = visible_counts.get(token_id, 0) + 1
+
+    token_scope = _token_scope_from_trades(normalized_trades, opening_positions, visible_counts)
+    scoped_closes = _augment_closes_for_opening_positions(closes, token_scope, window_start_date)
+    chart = build_chart_payload(
+        wallet_meta["address"],
+        wallet_meta.get("filter_value", ""),
+        CURATION_RANGE_DAYS.get(normalized_range, 0),
+        token_scope,
+        visible_trades,
+        scoped_closes,
+        resolutions,
+        opening_positions=opening_positions,
+        window_start_date=window_start_date,
+    )
+    if not chart:
+        return {
+            "series": [],
+            "summary": {
+                "sim_status": wallet_meta.get("sim_status", "missing_drl"),
+                "copied_trades": len(copied_rows),
+                "total_trades": len(copied_rows),
+                "final_pnl": 0.0,
+                "roi_pct": 0.0,
+            },
+            "validation": {
+                "workbook_value": None,
+                "recomputed_value": 0.0,
+                "delta": None,
+            },
+        }
+
+    workbook_map = {
+        "1D": wallet_meta.get("sim_1d"),
+        "7D": wallet_meta.get("sim_7d"),
+        "30D": wallet_meta.get("sim_30d"),
+    }
+    workbook_value = workbook_map.get(normalized_range)
+    recomputed_value = chart["summary"]["final_pnl"]
+    visible_volume = sum(trade["usdc"] for trade in visible_trades)
+    chart["summary"]["copied_trades"] = len(copied_rows)
+    chart["summary"]["sim_status"] = wallet_meta.get("sim_status", "ready")
+    chart["summary"]["roi_pct"] = round((recomputed_value / visible_volume) * 100, 2) if visible_volume else 0.0
+    chart["validation"] = {
+        "workbook_value": workbook_value,
+        "recomputed_value": recomputed_value,
+        "delta": None if workbook_value is None else round(recomputed_value - float(workbook_value), 2),
+    }
+    return chart
 
 
 def parse_sharpsim(file_bytes: bytes, filename: str = "") -> dict[str, Any]:
