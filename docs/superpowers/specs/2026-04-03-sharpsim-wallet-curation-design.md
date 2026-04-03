@@ -34,6 +34,28 @@ Out of scope:
 - background ingestion of Sharpsim files into a durable database
 - replacing the existing manual review flow
 
+## Design Review Decisions
+
+The following were resolved during a structured design review:
+
+| Question | Resolution |
+|---|---|
+| Both-sides market definition | 2+ distinct outcome tokens under the same condition_id (e.g. bought Team A YES and Team B YES for the same match), not buy/sell of a single token |
+| Sim data ingestion | Upload xlsx, eager parse all sheets with loading indicator |
+| Session auto-populate | Upload replaces manual setup; manual stays available via button toggle |
+| Per-wallet filter | Each wallet carries its own filter from sim; context auto-switches on swipe |
+| Chart overlay color | Purple `#9B51E0` solid line with `rgba(155, 81, 224, 0.12)` fill |
+| Overlay default state | ON by default when sim session is active |
+| Equity curve reconstruction | Replay COPIED DRL trades, mark to market using token_daily_close from ClickHouse cache |
+| Interval switching | Rebase both curves to zero at interval start |
+| Sim stat display | Line + stat comparison cards + sim summary strip |
+| Pre-computed vs recomputed | Show both for validation; flag discrepancies by color (green/amber/red) |
+| Skipped trades visibility | Count only on summary strip (copied/skipped) |
+| Swipe decisions | Ephemeral; Download Results button at session end exports CSV |
+| Wallet ordering | Results sheet order (Sim ROI % descending) |
+| Parse strategy | Eager — parse all DRL sheets on upload, not lazily per-wallet |
+| Upload format | .xlsx only, no size limit, new upload replaces previous |
+
 ## Final Decisions
 
 - Persistence model: tab-only review state. Uploaded Sharpsim data does not survive refresh or a new tab.
@@ -261,19 +283,42 @@ The replay function should reuse or mirror the pricing helpers in `lib/clickhous
 
 ## UI Design
 
+### Visual Design Tokens
+
+All sim-specific UI uses the existing Polymarket-aligned palette:
+
+- Sim overlay line: `#9B51E0` (purple, already defined as `--pm-purple`)
+- Sim overlay fill: `rgba(155, 81, 224, 0.12)` (subtle purple fill under the curve)
+- Sim line stroke width: `2` (same as the blue actual line)
+- Actual line: `#0093fd` (blue, `--pm-blue`)
+- Stat comparison positive delta: `--pm-green` (`#3db468`)
+- Stat comparison negative delta: `--pm-red` (`#ff4d4d`)
+- Summary strip background: `var(--pm-surface-alt)` (`#1e2428`)
+- Summary strip border: `1px solid var(--pm-border)` (`#242b32`)
+- Summary strip border radius: `var(--pm-radius-lg)` (`9.2px`)
+- Summary strip text: `var(--pm-text-secondary)` (`#7b8996`) for labels, `var(--pm-text)` (`#dee3e7`) for values
+
 ### Setup Screen
 
 Add:
 
-- `Upload Sharpsim` secondary button
+- `Upload Sharpsim` secondary button (uses `pm-button pm-button--secondary`)
 - inline summary of loaded workbook state
-- `Switch to manual` button when sim mode is active
+- `Switch to manual` button when sim mode is active (uses `pm-button pm-button--secondary`)
 
 Behavior:
 
 - valid upload hides the manual wallet textarea and category dropdown
 - setup area displays a compact loaded-state summary such as wallet count and filter mix
 - switching to manual clears only the active sim session for the current tab and restores the existing setup controls
+
+Summary badge format when sim is loaded:
+
+```
+43 wallets loaded from Sharpsim | LoL (38) · Valorant (3) · Dota (2)
+```
+
+Uses a `pm-status-chip` style inline badge for each filter group count.
 
 ### Swipe Screen
 
@@ -283,26 +328,68 @@ Keep the existing structure and add only three sim-specific elements:
 - a sim summary strip
 - paired actual and sim stat presentation, including a validation row
 
-Sim summary strip content:
+Chart overlay details:
 
-- capital
-- copy ratio if available
-- execution mode if available
-- copied and skipped counts
+- purple sim trace uses `fill="tozeroy"` with `fillcolor="rgba(155, 81, 224, 0.12)"` to match the Polymarket gradient area style
+- chart legend renders inline below the chart when overlay is active: `● Actual P&L  ● Sim P&L` using the blue and purple colors respectively
+- hover tooltip shows both values at the cursor date: `P&L: $X,XXX | Sim: $Y,YYY`
+- both curves rebase to zero at interval start, so visual divergence directly represents the execution gap
 
-Comparison stats:
+Sim summary strip content and layout:
 
-- actual final PnL versus sim final PnL
-- actual ROI versus sim ROI
-- trade counts and copied counts as separate measures
-- workbook validation values versus recomputed replay values for quick confidence checks
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  $10K capital  ·  10% copy ratio  ·  smartslip  ·  1,571 / 3,824  │
+│                                                       copied/skip  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+- single horizontal bar below the overlay toggle
+- background `var(--pm-surface-alt)`, border `1px solid var(--pm-border)`, radius `9.2px`
+- labels in `var(--pm-text-secondary)` at `12px` weight `500`
+- values in `var(--pm-text)` at `13px` weight `600`
+- capital from `Portfolio` sheet, copy ratio and execution mode from `Info` sheet
+- copied/skipped counts from the per-wallet Results row, not a global total
+- fields that are absent from the workbook are silently omitted from the strip
+
+Comparison stats layout:
+
+Present actual and sim values as paired stat tiles using the existing `pm-wallet-stat-grid` layout. Each tile shows both values:
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Final P&L   │  │     ROI      │  │    Trades    │  │   Volume     │
+│  $6,620      │  │   0.66%      │  │   5,354      │  │  $1.27M      │
+│  sim $4,200  │  │  sim 0.42%   │  │  1,571 cop.  │  │              │
+└──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+```
+
+- top line: actual value in `var(--pm-text)` at the existing `pm-metric-value` size
+- bottom line: sim value prefixed with `sim` in `var(--pm-purple)` (`#9B51E0`) at a smaller size
+- for P&L and ROI tiles, color the sim value green or red based on sign
+- "Trades" tile shows total trades (actual) on top and copied count (sim) below
+- volume tile shows actual volume only since sim volume is not a meaningful comparison
+
+Validation row:
+
+Below the stat tiles, show a small muted comparison line for confidence checking:
+
+```
+Workbook 30D: $6,620  ·  Recomputed 30D: $6,618  ·  Δ $2
+```
+
+- only visible when the selected interval has a matching precomputed value (1D, 7D, 30D)
+- text in `var(--pm-text-secondary)` at `11px`
+- delta shown in green if within $10, amber if $10-$100, red if >$100
+- if no matching precomputed value exists for the current interval (2W, ALL), hide this row
 
 Failure UI for a wallet with no usable sim data:
 
 - keep the actual chart and actual stats
-- show one inline warning explaining that sim data is unavailable for this wallet
-- render sim values as `N/A`
+- show one inline warning explaining that sim data is unavailable for this wallet, using `pm-inline-message` with the existing alert styling
+- render sim values as `N/A` in `var(--pm-text-secondary)`
 - keep swipe controls unchanged
+- the overlay toggle greys out but remains visible so the layout doesn't shift
 
 ### Results Screen And Export
 
@@ -313,6 +400,7 @@ Changes:
 - keep the approved summary at session end
 - replace or extend the current text download with CSV export
 - include one row per reviewed wallet, not just approved wallets
+- add a `Download Results` primary button (`pm-button pm-button--primary`)
 
 CSV columns:
 
@@ -327,6 +415,8 @@ CSV columns:
 - `sim_copied`
 - `sim_skipped`
 - `sim_status`
+
+Wallet ordering in review: use the Results sheet order, which is sorted by Sim ROI % descending (best performers first). This gives the reviewer the most promising wallets early in the session.
 
 ## Failure Handling
 

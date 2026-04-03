@@ -3,11 +3,14 @@ from datetime import date, datetime
 from unittest.mock import patch
 
 from lib.clickhouse_charts import (
+    CURATION_ALL_RANGE,
     _build_curation_warning_chips,
     _build_final_price_lookup,
     build_chart_payload,
+    build_wallet_curation_payload_from_base,
     build_curation_signals,
     compute_market_pnl_breakdown,
+    normalize_curation_range_key,
 )
 
 
@@ -248,6 +251,131 @@ class ClickHouseChartsRegressionTests(unittest.TestCase):
         self.assertEqual(severities["copy_price_gap"], "amber")
         self.assertEqual(severities["near_certain_buy_volume_pct"], "amber")
         self.assertEqual({chip["severity"] for chip in chips}, {"amber"})
+
+    def test_normalize_curation_range_key_maps_all_time_aliases(self):
+        self.assertEqual(normalize_curation_range_key(None), CURATION_ALL_RANGE)
+        self.assertEqual(normalize_curation_range_key("365"), CURATION_ALL_RANGE)
+        self.assertEqual(normalize_curation_range_key("2W"), "14D")
+        self.assertEqual(normalize_curation_range_key(30), "30D")
+
+    def test_all_time_payload_uses_full_trade_history(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "Esports",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "question": self.question,
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 2,
+                }
+            ],
+            "trades": [
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "trade_date": date(2024, 1, 1),
+                    "side": "BUY",
+                    "shares": 10.0,
+                    "usdc": 4.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.4,
+                    "role": "maker",
+                },
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 1),
+                    "side": "SELL",
+                    "shares": 4.0,
+                    "usdc": 3.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.75,
+                    "role": "maker",
+                },
+            ],
+            "closes": [
+                {"token_id": self.token_yes, "trade_date": date(2023, 12, 31), "close_price": 0.4},
+                {"token_id": self.token_yes, "trade_date": date(2026, 4, 3), "close_price": 0.7},
+            ],
+            "resolutions": {},
+        }
+
+        with patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_curation_payload_from_base(base_data, "ALL")
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["meta"]["range_key"], "ALL")
+        self.assertEqual(payload["summary"]["first_trade_date"], "2024-01-01")
+        self.assertEqual(payload["summary"]["total_trades"], 2)
+
+    def test_interval_payload_carries_opening_positions_from_pre_window_trades(self):
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 4, 3)
+
+        base_data = {
+            "wallet": "wallet",
+            "filter_value": "Esports",
+            "filter_level": "detail",
+            "token_scope": [
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "question": self.question,
+                    "opening_shares": 0.0,
+                    "visible_trade_count": 2,
+                }
+            ],
+            "trades": [
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 3, 20),
+                    "side": "BUY",
+                    "shares": 10.0,
+                    "usdc": 4.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.4,
+                    "role": "maker",
+                },
+                {
+                    "token_id": self.token_yes,
+                    "condition_id": "cid-1",
+                    "trade_date": date(2026, 4, 1),
+                    "side": "SELL",
+                    "shares": 5.0,
+                    "usdc": 3.0,
+                    "fee_usdc": 0.0,
+                    "price": 0.6,
+                    "role": "maker",
+                },
+            ],
+            "closes": [
+                {"token_id": self.token_yes, "trade_date": date(2026, 3, 26), "close_price": 0.4},
+                {"token_id": self.token_yes, "trade_date": date(2026, 4, 1), "close_price": 0.6},
+                {"token_id": self.token_yes, "trade_date": date(2026, 4, 3), "close_price": 0.7},
+            ],
+            "resolutions": {},
+        }
+
+        with patch("lib.clickhouse_charts.date", FixedDate):
+            payload = build_wallet_curation_payload_from_base(base_data, "7D")
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["meta"]["range_key"], "7D")
+        self.assertEqual(payload["summary"]["first_trade_date"], "2026-03-27")
+        self.assertEqual(payload["summary"]["total_trades"], 1)
+        self.assertEqual(payload["series"][-1]["pnl"], 2.5)
+        self.assertEqual(payload["summary"]["active_days"], 1)
 
 
 if __name__ == "__main__":

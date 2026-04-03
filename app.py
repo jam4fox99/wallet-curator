@@ -34,6 +34,7 @@ except ModuleNotFoundError:
 
 from lib.changelog import get_recent_changes
 from lib.charts import get_chart_payload, get_sync_status_summary, get_wallet_options, get_wallet_stats
+from lib.clickhouse_charts import CURATION_ALL_RANGE, normalize_curation_range_key
 from lib.daily_pnl import get_daily_breakdown
 from lib.db import get_connection, init_db
 from lib.pipeline import run_hourly_pipeline
@@ -58,9 +59,18 @@ COLORS = {
     "card_alt": "#1e2428",
     "surface_soft": "#15191d",
     "text": "#dee3e7",
+    "text_strong": "#ffffff",
     "text_secondary": "#7b8996",
+    "buy": "#359a5e",
     "positive": "#3db468",
+    "positive_soft": "rgba(61, 180, 104, 0.12)",
+    "positive_muted": "rgba(61, 180, 104, 0.55)",
+    "sell": "#cb3131",
     "negative": "#ff4d4d",
+    "negative_soft": "rgba(255, 77, 77, 0.14)",
+    "negative_muted": "rgba(255, 77, 77, 0.55)",
+    "warning": "#f59e0b",
+    "warning_soft": "rgba(245, 158, 11, 0.14)",
     "border": "#242b32",
     "border_soft": "#1a202b",
     "button": "#0093fd",
@@ -104,7 +114,7 @@ app = dash.Dash(
     __name__,
     external_stylesheets=[
         dbc.themes.DARKLY,
-        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap",
+        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap",
     ],
     suppress_callback_exceptions=True,
 )
@@ -448,9 +458,9 @@ def _pending_change_card(change, removable=False, render_token=None):
 
 
 GAME_BADGES = {
-    "CS2": {"icon": "🎯", "label": "CS2", "color": "#f59e0b", "bg": "rgba(245,158,11,0.12)"},
+    "CS2": {"icon": "🎯", "label": "CS2", "color": COLORS["warning"], "bg": COLORS["warning_soft"]},
     "LOL": {"icon": "⚔️", "label": "LOL", "color": "#eab308", "bg": "rgba(234,179,8,0.12)"},
-    "DOTA": {"icon": "🛡️", "label": "DOTA", "color": "#ef4444", "bg": "rgba(239,68,68,0.12)"},
+    "DOTA": {"icon": "🛡️", "label": "DOTA", "color": COLORS["sell"], "bg": COLORS["negative_soft"]},
     "VALO": {"icon": "💥", "label": "VALO", "color": "#ec4899", "bg": "rgba(236,72,153,0.12)"},
     "ESPORTS": {"icon": "🎮", "label": "ESPORTS", "color": "#8b5cf6", "bg": "rgba(139,92,246,0.12)"},
     "UNKNOWN": {"icon": "❓", "label": "?", "color": "#6b7280", "bg": "rgba(107,114,128,0.12)"},
@@ -472,7 +482,7 @@ def _game_badge(game_code):
 def _sparkline_svg(pnl_points, width=120, height=28):
     """Generate inline SVG sparkline with smooth curves and gradient fill."""
     if not pnl_points or len(pnl_points) < 2:
-        return html.Div("—", style={"width": f"{width}px", "color": "#555", "textAlign": "center"})
+        return html.Div("—", style={"width": f"{width}px", "color": COLORS["text_secondary"], "textAlign": "center"})
 
     if len(pnl_points) > 40:
         step = len(pnl_points) // 40
@@ -500,7 +510,7 @@ def _sparkline_svg(pnl_points, width=120, height=28):
     fill_d = path_d + f" L {width:.1f},{height} L 0,{height} Z"
 
     trending_up = pnl_points[-1] >= pnl_points[0]
-    color = "#22c55e" if trending_up else "#ef4444"
+    color = COLORS["positive"] if trending_up else COLORS["negative"]
     grad_id = f"g{abs(hash(tuple(pnl_points[:5]))) % 99999}"
 
     svg_str = (
@@ -527,24 +537,24 @@ def _pnl_combined_cell(total_pnl, since_promo):
         total_pnl = 0
     if total_pnl == 0:
         text = "$0.00"
-        color = "#e5e5e5"
+        color = COLORS["text"]
     elif total_pnl > 0:
         text = f"${total_pnl:,.2f}"
-        color = "#22c55e"
+        color = COLORS["positive"]
     else:
         text = f"-${abs(total_pnl):,.2f}"
-        color = "#ef4444"
+        color = COLORS["negative"]
     main = html.Div(text, className="pm-pnl-main", style={"color": color})
     if since_promo is not None and since_promo != 0:
         if since_promo > 0:
             sp_text = f"${since_promo:,.2f}"
-            sp_color = "#22c55e80"
+            sp_color = COLORS["positive_muted"]
         else:
             sp_text = f"-${abs(since_promo):,.2f}"
-            sp_color = "#ef444480"
+            sp_color = COLORS["negative_muted"]
         sub = html.Div(f"{sp_text} Since Promo", className="pm-pnl-sub", style={"color": sp_color})
     elif since_promo == 0:
-        sub = html.Div("$0.00 Since Promo", className="pm-pnl-sub", style={"color": "#e5e5e580"})
+        sub = html.Div("$0.00 Since Promo", className="pm-pnl-sub", style={"color": COLORS["text_secondary"]})
     else:
         sub = html.Div("")
     return html.Td([main, sub], className="pm-tier-table__cell pm-pnl-combined")
@@ -628,7 +638,7 @@ def _render_removed_section(removed_wallets):
     ])
     rows = []
     for w in removed_wallets:
-        color = "#22c55e" if w["total_pnl"] > 0 else "#ef4444" if w["total_pnl"] < 0 else "#e5e5e5"
+        color = COLORS["positive"] if w["total_pnl"] > 0 else COLORS["negative"] if w["total_pnl"] < 0 else COLORS["text"]
         rows.append(html.Tr([
             html.Td(html.Span(f"0x...{w['wallet_address'][-4:]}", title=w["wallet_address"], className="pm-wallet-short"),
                      className="pm-tier-table__cell"),
@@ -661,7 +671,10 @@ def _render_management_sections(snapshot):
         if wallets:
             body = _tier_table(wallets, tier["tier_name"], render_token)
         else:
-            body = html.Div("No wallets in this tier.", className="pm-empty-state__copy")
+            body = html.Div(
+                html.Div("No wallets in this tier.", className="pm-empty-state__copy", style={"marginTop": 0}),
+                className="pm-empty-state pm-tier-empty-state",
+            )
 
         # Tier header — collapsible
         tier_id = tier["tier_name"]
@@ -1047,7 +1060,7 @@ def wallet_management_layout():
                             html.Div("Paste Sharp CSV lines (one wallet per line)", className="pm-field-label"),
                             dcc.Textarea(
                                 id="add-wallet-line",
-                                className="pm-textarea",
+                                className="pm-textarea pm-textarea--mono",
                                 placeholder="0xabc123...,true,true,true,200,...\n0xdef456...,true,true,true,200,...",
                                 style={"width": "100%", "minHeight": "160px"},
                             ),
@@ -1130,10 +1143,7 @@ def subcategory_charts_layout():
                                         id="sc-wallet-input",
                                         type="text",
                                         placeholder="0x...",
-                                        className="pm-text-input",
-                                        style={"width": "100%", "padding": "8px 12px", "fontSize": "13px",
-                                               "background": "var(--pm-surface-alt)", "border": "1px solid var(--pm-border)",
-                                               "borderRadius": "8px", "color": "var(--pm-text)", "fontFamily": "monospace"},
+                                        className="pm-text-input pm-text-input--mono",
                                     ),
                                 ],
                                 style={"flex": "2"},
@@ -1184,14 +1194,18 @@ def subcategory_charts_layout():
     )
 
 
+_CUR_RANGE_OPTIONS = [
+    {"token": "1D", "label": "1D"},
+    {"token": "7D", "label": "7D"},
+    {"token": "14D", "label": "2W"},
+    {"token": "30D", "label": "30D"},
+    {"token": CURATION_ALL_RANGE, "label": "ALL"},
+]
+_CUR_RANGE_TOKENS = [opt["token"] for opt in _CUR_RANGE_OPTIONS]
+_CUR_RANGE_LABELS = {opt["token"]: opt["label"] for opt in _CUR_RANGE_OPTIONS}
+
+
 def wallet_curation_layout():
-    RANGE_OPTIONS = [
-        {"label": "1D", "value": 1},
-        {"label": "7D", "value": 7},
-        {"label": "2W", "value": 14},
-        {"label": "30D", "value": 30},
-        {"label": "ALL", "value": 365},
-    ]
     return html.Div(
         className="pm-page-stack",
         children=[
@@ -1201,10 +1215,10 @@ def wallet_curation_layout():
             dcc.Store(id="cur-approved", data=[]),
             dcc.Store(id="cur-decisions", data={}),
             dcc.Store(id="cur-filter", data=""),
-            dcc.Store(id="cur-selected-range", data=365),
-            dcc.Store(id="cur-range", data=365),
+            dcc.Store(id="cur-range", data=CURATION_ALL_RANGE),
             dcc.Store(id="cur-session-id", data=""),
-            dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0),
+            dcc.Store(id="cur-view", data={"status": "idle"}),
+            dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0, disabled=True),
 
             # Setup screen
             html.Div(
@@ -1218,11 +1232,9 @@ def wallet_curation_layout():
                         html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
                         dcc.Textarea(
                             id="cur-wallet-input",
+                            className="pm-textarea pm-textarea--mono",
                             placeholder="0xabc123...\n0xdef456...\n0x789...",
-                            style={"width": "100%", "minHeight": "120px", "padding": "8px 12px",
-                                   "fontSize": "13px", "background": "var(--pm-surface-alt)",
-                                   "border": "1px solid var(--pm-border)", "borderRadius": "8px",
-                                   "color": "var(--pm-text)", "fontFamily": "monospace"},
+                            style={"minHeight": "120px"},
                         ),
                         html.Div([
                             html.Div([
@@ -1231,12 +1243,19 @@ def wallet_curation_layout():
                                              searchable=True, className="pm-wallet-dropdown"),
                             ], style={"flex": "1"}),
                         ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
-                        html.Div([
-                            html.Button(opt["label"], id=f"cur-setup-range-{opt['value']}",
-                                        className="pm-range-pill" + (" pm-range-pill--active" if opt["value"] == 365 else ""),
-                                        n_clicks=0)
-                            for opt in RANGE_OPTIONS
-                        ], style={"display": "flex", "gap": "6px", "marginBottom": "16px"}),
+                        html.Div(
+                            [
+                                html.Button(
+                                    opt["label"],
+                                    id=f"cur-setup-range-{opt['token']}",
+                                    className="pm-range-pill" + (" pm-range-pill--active" if opt["token"] == CURATION_ALL_RANGE else ""),
+                                    n_clicks=0,
+                                )
+                                for opt in _CUR_RANGE_OPTIONS
+                            ],
+                            className="pm-range-pill-group",
+                            style={"marginBottom": "16px"},
+                        ),
                         html.Button("Start Review", id="cur-start", className="pm-button pm-button--primary", n_clicks=0),
                         html.Div(id="cur-setup-msg", style={"marginTop": "8px"}),
                     ], class_name="pm-admin-card"),
@@ -1250,23 +1269,33 @@ def wallet_curation_layout():
                 children=[
                     html.Div(id="cur-progress", style={"marginBottom": "12px", "color": "var(--pm-text-secondary)", "fontSize": "13px"}),
                     html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
-                    dcc.Loading(
-                        html.Div([
+                    html.Div(
+                        [
+                            html.Button(
+                                opt["label"],
+                                id=f"cur-swipe-range-{opt['token']}",
+                                className="pm-range-pill" + (" pm-range-pill--active" if opt["token"] == CURATION_ALL_RANGE else ""),
+                                n_clicks=0,
+                            )
+                            for opt in _CUR_RANGE_OPTIONS
+                        ],
+                        className="pm-range-pill-group",
+                        style={"marginBottom": "16px"},
+                    ),
+                    html.Div(
+                        [
                             html.Div(id="cur-warnings", style={"marginBottom": "12px"}),
                             html.Div(id="cur-read", style={"marginBottom": "12px"}),
                             dcc.Graph(id="cur-chart", style={"height": "400px"}, config={"displayModeBar": False}),
                             html.Div(id="cur-stats"),
                             html.Div(id="cur-concentration", style={"marginTop": "12px"}),
                             html.Div(id="cur-top-markets", style={"marginTop": "12px"}),
-                        ]),
-                        type="default",
+                        ]
                     ),
                     html.Div([
                         html.Button("← Back", id="cur-back", className="pm-button pm-button--secondary", n_clicks=0),
-                        html.Button("✗ Skip", id="cur-skip", className="pm-button pm-button--secondary",
-                                    style={"color": "#ef4444", "borderColor": "#ef444440"}, n_clicks=0),
-                        html.Button("✓ Approve", id="cur-approve", className="pm-button pm-button--primary",
-                                    style={"background": "#22c55e", "borderColor": "#22c55e"}, n_clicks=0),
+                        html.Button("✗ Skip", id="cur-skip", className="pm-button pm-button--sell", n_clicks=0),
+                        html.Button("✓ Approve", id="cur-approve", className="pm-button pm-button--buy", n_clicks=0),
                     ], style={"display": "flex", "gap": "12px", "justifyContent": "center", "marginTop": "20px"}),
                 ],
             ),
@@ -2524,11 +2553,11 @@ def _build_concentration_badges(conc):
     """Build concentration badge HTML from concentration dict."""
     def badge(label, pct):
         if pct > 50:
-            color, bg = "#ef4444", "rgba(239,68,68,0.12)"
+            color, bg = COLORS["negative"], COLORS["negative_soft"]
         elif pct > 30:
-            color, bg = "#f59e0b", "rgba(245,158,11,0.12)"
+            color, bg = COLORS["warning"], COLORS["warning_soft"]
         else:
-            color, bg = "#22c55e", "rgba(34,197,94,0.12)"
+            color, bg = COLORS["buy"], COLORS["positive_soft"]
         return html.Span(f"{label}: {pct}%",
                           style={"color": color, "background": bg, "padding": "4px 10px",
                                  "borderRadius": "6px", "fontSize": "12px", "border": f"1px solid {color}30"})
@@ -2546,10 +2575,10 @@ def _build_concentration_badges(conc):
 
 def _severity_to_badge_style(severity):
     if severity == "red":
-        return "#ef4444", "rgba(239,68,68,0.12)"
+        return COLORS["negative"], COLORS["negative_soft"]
     if severity == "amber":
-        return "#f59e0b", "rgba(245,158,11,0.12)"
-    return "#22c55e", "rgba(34,197,94,0.12)"
+        return COLORS["warning"], COLORS["warning_soft"]
+    return COLORS["buy"], COLORS["positive_soft"]
 
 
 def _severity_to_chip_tone(severity):
@@ -2695,18 +2724,22 @@ def _build_curation_read(summary, signals):
     ], class_name="pm-admin-card")
 
 
-def _build_curation_loading_read(progress):
-    ready = progress.get("ready", 0)
-    running = progress.get("running", 0)
-    queued = progress.get("queued", 0)
-    return _card([
+def _build_curation_loading_read(progress=None):
+    children = [
         html.Div([
             html.Div("Curation Read", className="pm-kicker"),
             _status_chip("Loading", tone="warning"),
         ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "12px", "marginBottom": "10px", "flexWrap": "wrap"}),
         html.Div("This wallet is being fetched in the background. You should only pay the wait once for the current wallet; the next wallets are warming behind it.", className="pm-empty-state__copy", style={"marginTop": 0}),
-        html.Div(f"Cache progress: {ready} ready, {running} running, {queued} queued.", className="pm-empty-state__copy"),
-    ], class_name="pm-admin-card")
+    ]
+    if progress is not None:
+        ready = progress.get("ready", 0)
+        running = progress.get("running", 0)
+        queued = progress.get("queued", 0)
+        children.append(
+            html.Div(f"Cache progress: {ready} ready, {running} running, {queued} queued.", className="pm-empty-state__copy")
+        )
+    return _card(children, class_name="pm-admin-card")
 
 
 def _build_curation_loading_figure(title):
@@ -2743,7 +2776,7 @@ def _build_top_markets_table(markets):
     rows = []
     for m in markets:
         pct = round(abs(m["net_cash"]) / total_abs * 100, 1)
-        mc = "#22c55e" if m["net_cash"] >= 0 else "#ef4444"
+        mc = COLORS["positive"] if m["net_cash"] >= 0 else COLORS["negative"]
         rows.append(html.Tr([
             html.Td(m["market_name"][:60], style={"maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"}),
             html.Td(f"${m['net_cash']:,.2f}", style={"color": mc}),
@@ -2868,75 +2901,206 @@ def load_curation_categories(tab, pathname):
         return [{"label": "[Subcategory] Esports", "value": "subcategory::Esports"}]
 
 
-_CUR_RANGES = [1, 7, 14, 30, 365]
+def _normalize_curation_range(selected_range):
+    return normalize_curation_range_key(selected_range)
 
 
-def _normalize_curation_lookback(selected_range):
+def _cur_range_label(selected_range):
+    return _CUR_RANGE_LABELS.get(_normalize_curation_range(selected_range), "ALL")
+
+
+def _is_curation_wallet_list(value):
+    return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
+
+
+def _is_curation_range_candidate(value):
+    if isinstance(value, int):
+        return value in {1, 7, 14, 30, 365}
+    if not isinstance(value, str):
+        return False
+    return value.strip().upper() in {"1", "1D", "7", "7D", "14", "14D", "2W", "30", "30D", "365", CURATION_ALL_RANGE}
+
+
+def _coerce_curation_render_state(selected_range, poll_value, wallets, filter_raw):
+    candidates = [selected_range, poll_value, wallets, filter_raw]
+
+    wallet_list = []
+    for candidate in candidates:
+        if _is_curation_wallet_list(candidate):
+            wallet_list = list(candidate)
+            break
+
+    filter_value = ""
+    for candidate in candidates:
+        if isinstance(candidate, str) and "::" in candidate:
+            filter_value = candidate
+            break
+
+    range_value = CURATION_ALL_RANGE
+    for candidate in candidates:
+        if _is_curation_range_candidate(candidate):
+            range_value = candidate
+            break
+
+    return wallet_list, filter_value, _normalize_curation_range(range_value)
+
+
+def _cur_view_key(session_id, index, wallet, filter_raw, selected_range):
+    return "|".join(
+        [
+            str(session_id or ""),
+            str(index if index is not None else ""),
+            str(wallet or ""),
+            str(filter_raw or ""),
+            _normalize_curation_range(selected_range),
+        ]
+    )
+
+
+def _build_curation_wallet_header(wallet, filter_value):
+    return html.Div([
+        html.Span(wallet, className="pm-wallet-copyable", **{"data-clipboard": wallet}),
+        html.Span(f" — {filter_value}", style={"color": "var(--pm-text-secondary)", "marginLeft": "8px"}),
+    ])
+
+
+def _default_curation_status_counts(total_wallets):
+    return {"ready": 0, "running": 0, "queued": 0, "error": 0, "total": total_wallets}
+
+
+def _build_curation_progress_copy(index, wallets, selected_range, status_counts):
+    progress = f"Wallet {index + 1} of {len(wallets)} • {_cur_range_label(selected_range)}"
+    if status_counts.get("total"):
+        progress = (
+            f"Wallet {index + 1} of {len(wallets)}"
+            f" • {_cur_range_label(selected_range)}"
+            f" • ready {status_counts['ready']}/{status_counts['total']}"
+            f" • running {status_counts['running']}"
+        )
+    return progress
+
+
+def _resolve_curation_view(index, session_id, selected_range, wallets, filter_raw):
+    wallets, filter_raw, selected_range = _coerce_curation_render_state(
+        selected_range,
+        None,
+        wallets,
+        filter_raw,
+    )
+    idle_view = {"status": "idle"}
+    if not wallets or index is None or index >= len(wallets):
+        return "", "", idle_view, True
+
+    wallet = wallets[index]
+    if "::" in (filter_raw or ""):
+        filter_level, filter_value = filter_raw.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", filter_raw or ""
+
+    header = _build_curation_wallet_header(wallet, filter_value)
+    status_counts = _default_curation_status_counts(len(wallets))
+    view = {
+        "status": "loading",
+        "key": _cur_view_key(session_id, index, wallet, filter_raw, selected_range),
+        "wallet": wallet,
+        "filter_raw": filter_raw or "",
+        "filter_level": filter_level,
+        "filter_value": filter_value,
+        "range": selected_range,
+        "session_id": session_id or "",
+        "error": None,
+    }
+
     try:
-        selected_range = int(selected_range)
-    except (TypeError, ValueError):
-        return 365
-    return selected_range if selected_range in _CUR_RANGES else 365
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        if session_id:
+            manager.warm_session_index(session_id, index, warm_count=6)
+            status_counts = manager.get_session_progress(session_id)
+        data = manager.get_payload(key, selected_range)
+        status = manager.get_status(key)
+        error_text = manager.get_error(key)
+
+        if status == "error":
+            view["status"] = "error"
+            view["error"] = error_text or f"Failed to fetch {wallet[:12]}..."
+        elif status == "ready" and not data:
+            view["status"] = "empty"
+        elif data:
+            view["status"] = "ready"
+        else:
+            view["status"] = "loading"
+    except Exception as exc:
+        logger.exception("Curation cache lookup failed")
+        view["status"] = "error"
+        view["error"] = f"Error: {exc}"
+
+    progress = _build_curation_progress_copy(index, wallets, selected_range, status_counts)
+    poll_disabled = view["status"] in {"idle", "ready", "empty", "error"}
+    return progress, header, view, poll_disabled
 
 
 @callback(
-    Output("cur-selected-range", "data"),
-    [Input(f"cur-setup-range-{d}", "n_clicks") for d in _CUR_RANGES],
-    State("cur-selected-range", "data"),
+    Output("cur-range", "data"),
+    [Input(f"cur-setup-range-{token}", "n_clicks") for token in _CUR_RANGE_TOKENS]
+    + [Input(f"cur-swipe-range-{token}", "n_clicks") for token in _CUR_RANGE_TOKENS],
+    State("cur-range", "data"),
     prevent_initial_call=True,
 )
-def set_cur_setup_range(c1, c7, c14, c30, c365, current):
+def set_cur_range(*args):
+    *clicks, current = args
     triggered = dash.ctx.triggered_id
-    click_map = {f"cur-setup-range-{d}": d for d in _CUR_RANGES}
-    clicks_map = {
-        "cur-setup-range-1": c1,
-        "cur-setup-range-7": c7,
-        "cur-setup-range-14": c14,
-        "cur-setup-range-30": c30,
-        "cur-setup-range-365": c365,
+    click_map = {
+        **{f"cur-setup-range-{token}": token for token in _CUR_RANGE_TOKENS},
+        **{f"cur-swipe-range-{token}": token for token in _CUR_RANGE_TOKENS},
     }
-    selected = _normalize_curation_lookback(current)
+    clicks_map = dict(zip(click_map.keys(), clicks))
+    selected = _normalize_curation_range(current)
     if triggered in click_map and clicks_map.get(triggered):
         return click_map[triggered]
     return selected
 
 
 @callback(
-    [Output(f"cur-setup-range-{d}", "className") for d in _CUR_RANGES],
-    Input("cur-selected-range", "data"),
+    [Output(f"cur-setup-range-{token}", "className") for token in _CUR_RANGE_TOKENS]
+    + [Output(f"cur-swipe-range-{token}", "className") for token in _CUR_RANGE_TOKENS],
+    Input("cur-range", "data"),
 )
 def highlight_cur_range(selected):
-    selected = _normalize_curation_lookback(selected)
-    return [
-        "pm-range-pill pm-range-pill--active" if d == selected else "pm-range-pill"
-        for d in _CUR_RANGES
+    selected = _normalize_curation_range(selected)
+    classes = [
+        "pm-range-pill pm-range-pill--active" if token == selected else "pm-range-pill"
+        for token in _CUR_RANGE_TOKENS
     ]
+    return classes + classes.copy()
 
 
 @callback(
-    [Output("cur-wallets", "data"), Output("cur-filter", "data"), Output("cur-range", "data"),
+    [Output("cur-wallets", "data"), Output("cur-filter", "data"),
      Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
      Output("cur-session-id", "data"),
      Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
      Output("cur-setup-msg", "children")],
     Input("cur-start", "n_clicks"),
-    [State("cur-wallet-input", "value"), State("cur-category", "value"), State("cur-selected-range", "data")],
+    [State("cur-wallet-input", "value"), State("cur-category", "value"), State("cur-range", "data")],
     prevent_initial_call=True,
 )
 def start_curation(n_clicks, wallet_text, category, selected_range):
     if not n_clicks:
-        return [no_update] * 11
+        return [no_update] * 10
 
     if not wallet_text or not wallet_text.strip():
-        return [no_update] * 10 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+        return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
     if not category:
-        return [no_update] * 10 + [dbc.Alert("Select a category.", color="warning")]
+        return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
 
     wallets = [w.strip().lower() for w in wallet_text.strip().split("\n") if w.strip().startswith("0x")]
     if not wallets:
-        return [no_update] * 10 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+        return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
 
-    lookback = _normalize_curation_lookback(selected_range)
+    selected_range = _normalize_curation_range(selected_range)
 
     if "::" in category:
         filter_level, filter_value = category.split("::", 1)
@@ -2952,100 +3116,111 @@ def start_curation(n_clicks, wallet_text, category, selected_range):
             wallets=wallets,
             filter_level=filter_level,
             filter_value=filter_value,
-            lookback_days=lookback,
             warm_count=6,
         )
     except Exception:
         logger.exception("Failed to seed curation prefetch session")
 
     return (
-        wallets, category, lookback, 0, [], {}, session_id,
+        wallets, category, 0, [], {}, session_id,
         {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
     )
 
 
 @callback(
-    [Output("cur-progress", "children"), Output("cur-wallet-header", "children"),
-     Output("cur-warnings", "children"), Output("cur-read", "children"),
+    [
+        Output("cur-progress", "children"),
+        Output("cur-wallet-header", "children"),
+        Output("cur-view", "data"),
+        Output("cur-prefetch-poll", "disabled"),
+    ],
+    [Input("cur-index", "data"), Input("cur-session-id", "data"), Input("cur-range", "data"), Input("cur-prefetch-poll", "n_intervals")],
+    [State("cur-wallets", "data"), State("cur-filter", "data"), State("cur-view", "data")],
+)
+def update_curation_status(index, session_id, selected_range, _poll, wallets, filter_raw, current_view):
+    progress, header, next_view, poll_disabled = _resolve_curation_view(
+        index,
+        session_id,
+        selected_range,
+        wallets,
+        filter_raw,
+    )
+    if current_view == next_view:
+        next_view = no_update
+    return progress, header, next_view, poll_disabled
+
+
+@callback(
+    [Output("cur-warnings", "children"), Output("cur-read", "children"),
      Output("cur-chart", "figure"), Output("cur-stats", "children"),
      Output("cur-concentration", "children"), Output("cur-top-markets", "children")],
-    [Input("cur-index", "data"), Input("cur-session-id", "data"), Input("cur-prefetch-poll", "n_intervals")],
-    [State("cur-wallets", "data"), State("cur-filter", "data"), State("cur-range", "data")],
+    Input("cur-view", "data"),
 )
-def render_curation_wallet(index, session_id, _poll, wallets, filter_raw, lookback):
-    if not wallets or index is None or index >= len(wallets):
-        return ["", "", "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""]
+def render_curation_wallet(view):
+    if not view or view.get("status") == "idle":
+        return "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
 
-    wallet = wallets[index]
-    if "::" in (filter_raw or ""):
-        filter_level, filter_value = filter_raw.split("::", 1)
-    else:
-        filter_level, filter_value = "detail", filter_raw or ""
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
 
-    progress = f"Wallet {index + 1} of {len(wallets)}"
-    header = html.Div([
-        html.Span(wallet, className="pm-wallet-copyable", **{"data-clipboard": wallet}),
-        html.Span(f" — {filter_value}", style={"color": "var(--pm-text-secondary)", "marginLeft": "8px"}),
-    ])
+    if view["status"] == "error":
+        return [
+            html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(),
+            _build_curation_loading_figure("Wallet fetch failed"),
+            dbc.Alert(view.get("error") or f"Failed to fetch {wallet[:12]}...", color="danger"),
+            "",
+            "",
+        ]
+
+    if view["status"] == "empty":
+        return [
+            "",
+            "",
+            _build_curation_loading_figure("No trades found"),
+            dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value} for {_cur_range_label(selected_range)}.", color="info"),
+            "",
+            "",
+        ]
+
+    if view["status"] == "loading":
+        loading_warning = html.Div(
+            [_status_chip("Loading wallet data", tone="warning")],
+            className="pm-status-chip-row",
+            style={"justifyContent": "flex-start"},
+        )
+        return [
+            loading_warning,
+            _build_curation_loading_read(),
+            _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
+            dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
+            "",
+            "",
+        ]
 
     try:
         from lib.curation_prefetch import get_curation_prefetch_manager
 
         manager = get_curation_prefetch_manager()
-        key = manager.make_key(wallet, filter_level, filter_value, lookback)
-        if session_id:
-            manager.warm_session_index(session_id, index, warm_count=6)
-            status_counts = manager.get_session_progress(session_id)
-            if status_counts.get("total"):
-                progress = (
-                    f"Wallet {index + 1} of {len(wallets)}"
-                    f" • ready {status_counts['ready']}/{status_counts['total']}"
-                    f" • running {status_counts['running']}"
-                )
-        else:
-            status_counts = {"ready": 0, "running": 0, "queued": 0, "total": len(wallets)}
-        data = manager.get_payload(key)
-        status = manager.get_status(key)
-        error_text = manager.get_error(key)
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        data = manager.get_payload(key, selected_range)
     except Exception as exc:
-        logger.exception("Curation cache lookup failed")
-        return [progress, header, "", "", _build_curation_loading_figure("Failed to load wallet"), dbc.Alert(f"Error: {exc}", color="danger"), "", ""]
-
-    if status == "error":
+        logger.exception("Failed to render curation wallet")
         return [
-            progress,
-            header,
             html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
-            _build_curation_loading_read(status_counts),
+            _build_curation_loading_read(),
             _build_curation_loading_figure("Wallet fetch failed"),
-            dbc.Alert(error_text or f"Failed to fetch {wallet[:12]}...", color="danger"),
-            "",
-            "",
-        ]
-
-    if status == "ready" and not data:
-        return [
-            progress,
-            header,
-            "",
-            "",
-            _build_curation_loading_figure("No trades found"),
-            dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"),
+            dbc.Alert(f"Error: {exc}", color="danger"),
             "",
             "",
         ]
 
     if not data:
-        loading_warning = html.Div(
-            [_status_chip(f"Loading wallet data • {status}", tone="warning")],
-            className="pm-status-chip-row",
-            style={"justifyContent": "flex-start"},
-        )
         return [
-            progress,
-            header,
-            loading_warning,
-            _build_curation_loading_read(status_counts),
+            html.Div([_status_chip("Loading wallet data", tone="warning")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(),
             _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
             dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
             "",
@@ -3053,6 +3228,8 @@ def render_curation_wallet(index, session_id, _poll, wallets, filter_raw, lookba
         ]
 
     # Chart
+    import plotly.graph_objects as go
+
     series = data["series"]
     summary = data["summary"]
     final_pnl = summary["final_pnl"]
@@ -3085,7 +3262,7 @@ def render_curation_wallet(index, session_id, _poll, wallets, filter_raw, lookba
     breakdown = data.get("breakdown", {})
     top_markets = _build_top_markets_table(breakdown.get("markets", []))
 
-    return [progress, header, warnings, curation_read, fig, stats, concentration, top_markets]
+    return [warnings, curation_read, fig, stats, concentration, top_markets]
 
 
 @callback(

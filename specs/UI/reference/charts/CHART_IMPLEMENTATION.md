@@ -252,5 +252,5 @@ TTL:
 |------|---------|
 | `lib/clickhouse_charts.py` | All ClickHouse queries + P&L reconstruction logic |
 | `app.py` (subcategory_charts_layout + callbacks) | Dash page layout + generate chart callback |
-| `specs/WALLET_GAME_CHART_INTEGRATION.md` | Original spec from your dev |
-| `specs/CHART_IMPLEMENTATION.md` | This file |
+| `specs/UI/reference/charts/WALLET_GAME_CHART_INTEGRATION.md` | Original spec from your dev |
+| `specs/UI/reference/charts/CHART_IMPLEMENTATION.md` | This file |

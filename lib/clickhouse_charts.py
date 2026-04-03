@@ -22,6 +22,15 @@ CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "jake")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 CLICKHOUSE_DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "polymarket")
 
+CURATION_ALL_RANGE = "ALL"
+CURATION_RANGE_DAYS = {
+    "1D": 1,
+    "7D": 7,
+    "14D": 14,
+    "30D": 30,
+}
+CURATION_RANGE_TOKENS = tuple([*CURATION_RANGE_DAYS.keys(), CURATION_ALL_RANGE])
+
 
 def _validate_id(identifier: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
@@ -52,6 +61,26 @@ def _parse_date(value: Any) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     return _parse_dt(value).date()
+
+
+def normalize_curation_range_key(range_key: Any) -> str:
+    if isinstance(range_key, int):
+        range_key = str(range_key)
+    text = str(range_key or CURATION_ALL_RANGE).strip().upper()
+    aliases = {
+        "1": "1D",
+        "1D": "1D",
+        "7": "7D",
+        "7D": "7D",
+        "14": "14D",
+        "14D": "14D",
+        "2W": "14D",
+        "30": "30D",
+        "30D": "30D",
+        "365": CURATION_ALL_RANGE,
+        CURATION_ALL_RANGE: CURATION_ALL_RANGE,
+    }
+    return aliases.get(text, CURATION_ALL_RANGE)
 
 
 def _daterange(start: date, end: date) -> list[date]:
@@ -325,15 +354,18 @@ def get_available_filters(client: ClickHouseClient) -> list[dict]:
     return filters
 
 
+def _scope_clause_for_filter(filter_value: str, filter_level: str) -> str:
+    if filter_level == "category":
+        return f"category = {_sql_quote(filter_value)}"
+    if filter_level == "subcategory":
+        return f"subcategory = {_sql_quote(filter_value)}"
+    return f"subcategory_detail = {_sql_quote(filter_value)}"
+
+
 def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, filter_level: str,
                       window_start_date: date) -> list[dict]:
     db = _validate_id(client.database)
-    if filter_level == "category":
-        scope_clause = f"category = {_sql_quote(filter_value)}"
-    elif filter_level == "subcategory":
-        scope_clause = f"subcategory = {_sql_quote(filter_value)}"
-    else:
-        scope_clause = f"subcategory_detail = {_sql_quote(filter_value)}"
+    scope_clause = _scope_clause_for_filter(filter_value, filter_level)
     window_start_dt = f"{window_start_date.isoformat()} 00:00:00"
     rows = client.query(f"""
         WITH scoped_tokens AS (
@@ -385,10 +417,61 @@ def fetch_token_scope(client: ClickHouseClient, wallet: str, filter_value: str, 
     ]
 
 
-def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], window_start_date: date) -> list[dict]:
+def fetch_token_scope_all_history(client: ClickHouseClient, wallet: str, filter_value: str, filter_level: str) -> list[dict]:
+    db = _validate_id(client.database)
+    scope_clause = _scope_clause_for_filter(filter_value, filter_level)
+    rows = client.query(f"""
+        WITH scoped_tokens AS (
+            SELECT
+                token_id,
+                any(condition_id) AS condition_id,
+                any(question) AS question
+            FROM {db}.token_metadata_latest_v2
+            WHERE {scope_clause}
+            GROUP BY token_id
+        ),
+        wallet_trades AS (
+            SELECT
+                trade_id,
+                any(ts) AS ts,
+                any(token_id) AS token_id
+            FROM {db}.trades
+            WHERE wallet = {_sql_quote(wallet)}
+            GROUP BY trade_id
+        )
+        SELECT
+            t.token_id AS token_id,
+            any(st.condition_id) AS condition_id,
+            any(st.question) AS question,
+            min(t.ts) AS first_trade_ts,
+            max(t.ts) AS last_trade_ts,
+            count() AS visible_trade_count
+        FROM wallet_trades AS t
+        INNER JOIN scoped_tokens AS st ON st.token_id = t.token_id
+        GROUP BY t.token_id
+        ORDER BY first_trade_ts ASC, token_id ASC
+    """)
+    return [
+        {
+            "token_id": str(r["token_id"]),
+            "condition_id": str(r["condition_id"]),
+            "question": str(r.get("question") or ""),
+            "first_trade_ts": _parse_dt(r["first_trade_ts"]) if r.get("first_trade_ts") else None,
+            "last_trade_ts": _parse_dt(r["last_trade_ts"]) if r.get("last_trade_ts") else None,
+            "opening_shares": 0.0,
+            "visible_trade_count": int(r.get("visible_trade_count") or 0),
+        }
+        for r in rows
+    ]
+
+
+def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], window_start_date: date | None = None) -> list[dict]:
     db = _validate_id(client.database)
     token_list = ", ".join(_sql_quote(t) for t in token_ids)
-    window_start_dt = f"{window_start_date.isoformat()} 00:00:00"
+    window_filter = ""
+    if window_start_date is not None:
+        window_start_dt = f"{window_start_date.isoformat()} 00:00:00"
+        window_filter = f"\n          AND ts >= toDateTime({_sql_quote(window_start_dt)})"
     rows = client.query(f"""
         WITH wallet_trades AS (
             SELECT
@@ -411,7 +494,7 @@ def fetch_trades(client: ClickHouseClient, wallet: str, token_ids: list[str], wi
             shares, usdc, fee_usdc, price, role
         FROM wallet_trades
         WHERE token_id IN ({token_list})
-          AND ts >= toDateTime({_sql_quote(window_start_dt)})
+          {window_filter}
         ORDER BY ts ASC, token_id ASC
     """)
     return [
@@ -484,7 +567,8 @@ def fetch_resolution_prices(client: ClickHouseClient, token_ids: list[str]) -> d
 def build_chart_payload(wallet: str, game: str, lookback_days: int,
                         token_scope: list[dict], trades: list[dict],
                         closes: list[dict], resolutions: dict,
-                        opening_positions: dict[str, float] | None = None) -> dict[str, Any]:
+                        opening_positions: dict[str, float] | None = None,
+                        window_start_date: date | None = None) -> dict[str, Any]:
     """Reconstruct daily marked-to-market P&L series for the selected window."""
     if not token_scope:
         return None
@@ -495,7 +579,8 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
     first_visible_trade_date = min((t["trade_date"] for t in trades), default=None)
     last_trade_date = max((t["trade_date"] for t in trades), default=None)
     chart_end_date = max(date.today(), last_trade_date or date.today(), latest_close_date)
-    window_start_date = _lookback_window_start(date.today(), lookback_days)
+    if window_start_date is None:
+        window_start_date = _lookback_window_start(date.today(), lookback_days)
     has_opening_positions = any(abs(opening_positions.get(tid, 0.0)) > 1e-9 for tid in token_ids)
     chart_start_date = window_start_date if has_opening_positions else (first_visible_trade_date or window_start_date)
     baseline_date = chart_start_date - timedelta(days=1)
@@ -590,6 +675,126 @@ def build_chart_payload(wallet: str, game: str, lookback_days: int,
         },
         "series": series,
     }
+
+
+def get_wallet_curation_base_data(wallet: str, filter_value: str, filter_level: str = "detail") -> dict[str, Any] | None:
+    """Fetch lifetime scoped wallet data for deriving curation windows without refetching."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = ClickHouseClient()
+    token_scope = fetch_token_scope_all_history(client, wallet, filter_value, filter_level)
+    if not token_scope:
+        return None
+    token_ids = [t["token_id"] for t in token_scope]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        trades_future = pool.submit(fetch_trades, client, wallet, token_ids, None)
+        closes_future = pool.submit(fetch_daily_closes, client, token_ids)
+        resolutions_future = pool.submit(fetch_resolution_prices, client, token_ids)
+        trades = trades_future.result()
+        closes = closes_future.result()
+        resolutions = resolutions_future.result()
+
+    if not trades:
+        return None
+
+    return {
+        "wallet": wallet,
+        "filter_value": filter_value,
+        "filter_level": filter_level,
+        "token_scope": token_scope,
+        "trades": trades,
+        "closes": closes,
+        "resolutions": resolutions,
+    }
+
+
+def build_wallet_curation_payload_from_base(base_data: dict[str, Any], range_key: Any = CURATION_ALL_RANGE) -> dict[str, Any] | None:
+    """Derive an interval-specific curation payload from a cached lifetime base dataset."""
+    if not base_data:
+        return None
+
+    range_key = normalize_curation_range_key(range_key)
+    wallet = base_data["wallet"]
+    filter_value = base_data["filter_value"]
+    full_token_scope = base_data["token_scope"]
+    all_trades = base_data["trades"]
+    closes = base_data["closes"]
+    resolutions = base_data["resolutions"]
+
+    if not full_token_scope or not all_trades:
+        return None
+
+    if range_key == CURATION_ALL_RANGE:
+        window_start_date = min((t["trade_date"] for t in all_trades), default=date.today())
+    else:
+        window_start_date = _lookback_window_start(date.today(), CURATION_RANGE_DAYS[range_key])
+
+    opening_positions: dict[str, float] = {}
+    visible_trade_counts: dict[str, int] = {}
+    trades: list[dict[str, Any]] = []
+
+    for trade in all_trades:
+        token_id = trade["token_id"]
+        if trade["trade_date"] < window_start_date:
+            signed_shares = trade["shares"] if trade["side"] == "BUY" else -trade["shares"]
+            opening_positions[token_id] = opening_positions.get(token_id, 0.0) + signed_shares
+            continue
+        trades.append(trade)
+        visible_trade_counts[token_id] = visible_trade_counts.get(token_id, 0) + 1
+
+    token_scope = []
+    scoped_opening_positions = {}
+    for token in full_token_scope:
+        token_id = token["token_id"]
+        opening_shares = opening_positions.get(token_id, 0.0)
+        visible_trade_count = visible_trade_counts.get(token_id, 0)
+        if visible_trade_count <= 0 and abs(opening_shares) <= 1e-9:
+            continue
+        token_scope.append({
+            **token,
+            "opening_shares": opening_shares,
+            "visible_trade_count": visible_trade_count,
+        })
+        scoped_opening_positions[token_id] = opening_shares
+
+    if not token_scope:
+        return None
+
+    lookback_days = CURATION_RANGE_DAYS.get(range_key)
+    chart = build_chart_payload(
+        wallet,
+        filter_value,
+        lookback_days or 0,
+        token_scope,
+        trades,
+        closes,
+        resolutions,
+        opening_positions=scoped_opening_positions,
+        window_start_date=window_start_date,
+    )
+    if not chart:
+        return None
+
+    token_ids = [t["token_id"] for t in token_scope]
+    chart["meta"]["range_key"] = range_key
+    chart["meta"]["lookback_days"] = lookback_days
+
+    chart_end_date = _parse_date(chart["summary"]["chart_end_date"])
+    opening_date = _parse_date(chart["summary"]["first_trade_date"]) - timedelta(days=1)
+    final_prices = _build_final_price_lookup(token_ids, closes, resolutions, chart_end_date)
+    opening_prices = _build_final_price_lookup(token_ids, closes, resolutions, opening_date)
+    breakdown = compute_market_pnl_breakdown(token_scope, trades, final_prices, scoped_opening_positions, opening_prices)
+    chart["breakdown"] = breakdown
+    chart["signals"] = build_curation_signals(token_scope, trades, breakdown)
+
+    vol = chart["summary"]["total_volume_usd"]
+    pnl = chart["summary"]["final_pnl"]
+    chart["summary"]["roi_pct"] = round((pnl / vol * 100), 2) if vol else 0
+    chart["summary"]["win_rate"] = breakdown["win_rate"]
+    chart["summary"]["active_days"] = chart["signals"]["active_days"]
+    chart["summary"]["unique_markets"] = chart["signals"]["unique_markets"]
+    return chart
 
 
 def compute_market_pnl_breakdown(token_scope: list[dict], trades: list[dict],
