@@ -34,7 +34,11 @@ except ModuleNotFoundError:
 
 from lib.changelog import get_recent_changes
 from lib.charts import get_chart_payload, get_sync_status_summary, get_wallet_options, get_wallet_stats
-from lib.clickhouse_charts import CURATION_ALL_RANGE, normalize_curation_range_key
+from lib.clickhouse_charts import (
+    CURATION_ALL_RANGE,
+    build_wallet_trade_audit_payload_from_base,
+    normalize_curation_range_key,
+)
 from lib.daily_pnl import get_daily_breakdown
 from lib.db import get_connection, init_db
 from lib.pipeline import run_hourly_pipeline
@@ -560,11 +564,16 @@ def _pnl_combined_cell(total_pnl, since_promo):
     return html.Td([main, sub], className="pm-tier-table__cell pm-pnl-combined")
 
 
-def _sortable_th(label, sort_type="text"):
-    props = {"data-sortable": "true", "data-sort-dir": "none"}
+def _sortable_th(label, sort_type="text", sort_dir="none"):
+    props = {"data-sortable": "true", "data-sort-dir": sort_dir}
     if sort_type == "number":
         props["data-sort-type"] = "number"
-    return html.Th(label, className="pm-tier-table__th", **props)
+    class_name = "pm-tier-table__th"
+    if sort_dir == "asc":
+        class_name += " pm-sort-asc"
+    elif sort_dir == "desc":
+        class_name += " pm-sort-desc"
+    return html.Th(label, className=class_name, **props)
 
 
 def _render_wallet_row(wallet, tier_name, render_token):
@@ -1218,6 +1227,10 @@ def wallet_curation_layout():
             dcc.Store(id="cur-range", data=CURATION_ALL_RANGE),
             dcc.Store(id="cur-session-id", data=""),
             dcc.Store(id="cur-view", data={"status": "idle"}),
+            dcc.Store(id="cur-sim-session-id", data=""),
+            dcc.Store(id="cur-sim-active", data=False),
+            dcc.Store(id="cur-sim-overlay-visible", data=False),
+            dcc.Download(id="cur-trade-audit-download"),
             dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0, disabled=True),
 
             # Setup screen
@@ -1229,20 +1242,43 @@ def wallet_curation_layout():
                             html.Div("Wallet Curation", className="pm-kicker"),
                             html.H2("Swipe Review", className="pm-section-title pm-section-title--blue"),
                         ], className="pm-card-title-block"),
-                        html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
-                        dcc.Textarea(
-                            id="cur-wallet-input",
-                            className="pm-textarea pm-textarea--mono",
-                            placeholder="0xabc123...\n0xdef456...\n0x789...",
-                            style={"minHeight": "120px"},
+                        html.Div(
+                            [
+                                dcc.Upload(
+                                    id="cur-sim-upload",
+                                    children=html.Button("Upload Sharpsim", className="pm-button pm-button--secondary"),
+                                    accept=".xlsx",
+                                ),
+                                html.Button(
+                                    "Switch to manual",
+                                    id="cur-sim-clear",
+                                    className="pm-button pm-button--secondary",
+                                    n_clicks=0,
+                                    style={"display": "none"},
+                                ),
+                            ],
+                            style={"display": "flex", "gap": "12px", "marginBottom": "12px"},
                         ),
-                        html.Div([
-                            html.Div([
-                                html.Div("Category", className="pm-field-label"),
-                                dcc.Dropdown(id="cur-category", placeholder="Select category...",
-                                             searchable=True, className="pm-wallet-dropdown"),
-                            ], style={"flex": "1"}),
-                        ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                        html.Div(id="cur-sim-summary", className="pm-inline-message"),
+                        html.Div(
+                            id="cur-manual-fields",
+                            children=[
+                                html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
+                                dcc.Textarea(
+                                    id="cur-wallet-input",
+                                    className="pm-textarea pm-textarea--mono",
+                                    placeholder="0xabc123...\n0xdef456...\n0x789...",
+                                    style={"minHeight": "120px"},
+                                ),
+                                html.Div([
+                                    html.Div([
+                                        html.Div("Category", className="pm-field-label"),
+                                        dcc.Dropdown(id="cur-category", placeholder="Select category...",
+                                                     searchable=True, className="pm-wallet-dropdown"),
+                                    ], style={"flex": "1"}),
+                                ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                            ],
+                        ),
                         html.Div(
                             [
                                 html.Button(
@@ -1269,6 +1305,7 @@ def wallet_curation_layout():
                 children=[
                     html.Div(id="cur-progress", style={"marginBottom": "12px", "color": "var(--pm-text-secondary)", "fontSize": "13px"}),
                     html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
+                    html.Div(id="cur-sim-summary-panel", style={"marginBottom": "12px"}),
                     html.Div(
                         [
                             html.Button(
@@ -1313,7 +1350,7 @@ def wallet_curation_layout():
                         html.Div(id="cur-results-list", style={"marginTop": "12px", "fontFamily": "monospace", "fontSize": "13px"}),
                         html.Div([
                             dcc.Download(id="cur-download"),
-                            html.Button("Download Approved List", id="cur-download-btn",
+                            html.Button("Download Results", id="cur-download-btn",
                                         className="pm-button pm-button--primary", n_clicks=0),
                             html.Button("Start New Batch", id="cur-new-batch",
                                         className="pm-button pm-button--secondary", n_clicks=0),
@@ -1661,16 +1698,6 @@ def url_to_tab(pathname):
     if normalized != "/" and normalized.endswith("/"):
         normalized = normalized.rstrip("/")
     return PATH_TO_TAB.get(normalized, "overview")
-
-
-# Sync tab → URL when user clicks a tab
-@callback(
-    Output("url", "pathname"),
-    Input("tabs", "value"),
-    prevent_initial_call=True,
-)
-def tab_to_url(tab_value):
-    return TAB_PATHS.get(tab_value, "/")
 
 
 @callback(
@@ -2794,6 +2821,458 @@ def _build_top_markets_table(markets):
     ])
 
 
+def _format_compact_price(value, digits=3):
+    if value is None:
+        return "-"
+    return f"{float(value):.{digits}f}"
+
+
+def _format_share_count(value):
+    if value is None:
+        return "-"
+    return f"{float(value):,.2f}"
+
+
+def _format_curation_timestamp(value):
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _plain_money_cell(value):
+    return html.Td(_money(value), className="pm-tier-table__cell pm-num")
+
+
+def _value_cell(value):
+    return html.Td(value, className="pm-tier-table__cell")
+
+
+def _label_with_derived_note(label, is_derived):
+    parts = [html.Div(label or "Unknown", style={"fontWeight": 500})]
+    if is_derived:
+        parts.append(html.Div("(derived)", style={"fontSize": "11px", "color": COLORS["text_secondary"]}))
+    return parts
+
+
+def _count_label(count, singular):
+    suffix = singular if count == 1 else f"{singular}s"
+    return f"{count:,} {suffix}"
+
+
+def _build_curation_collapsible_table(title, meta_text, body, shell_style=None, section_id=None, meta_id=None, body_id=None):
+    meta_props = {"className": "pm-collapsible-meta"}
+    if meta_id:
+        meta_props["id"] = meta_id
+    body_props = {"className": "pm-daily-table-shell", "style": shell_style or {"maxHeight": "420px"}}
+    if body_id:
+        body_props["id"] = body_id
+    return html.Details(
+        [
+            html.Summary(
+                html.Div([
+                    html.Span(title, className="pm-collapsible-label"),
+                    html.Span(meta_text, **meta_props),
+                ], className="pm-collapsible-header-inner"),
+                className="pm-tier-summary",
+            ),
+            html.Div(body, **body_props),
+        ],
+        **({"id": section_id} if section_id else {}),
+        open=False,
+        className="pm-collapsible-section",
+    )
+
+
+def _build_curation_empty_table_state(message):
+    return html.Div(message, className="pm-empty-state__copy", style={"padding": "14px"})
+
+
+def _build_both_sides_table(rows):
+    rows = list(rows or [])
+    rows.sort(key=lambda row: (-float(row.get("combined_avg_buy") or 0.0), -float(row.get("total_pnl") or 0.0), str(row.get("market") or "")))
+    header = html.Tr([
+        _sortable_th("Market"),
+        _sortable_th("Outcome A"),
+        _sortable_th("Avg Buy A", "number"),
+        _sortable_th("Shares A", "number"),
+        _sortable_th("Dollars A", "number"),
+        _sortable_th("Sold A", "number"),
+        _sortable_th("P&L A", "number"),
+        _sortable_th("Outcome B"),
+        _sortable_th("Avg Buy B", "number"),
+        _sortable_th("Shares B", "number"),
+        _sortable_th("Dollars B", "number"),
+        _sortable_th("Sold B", "number"),
+        _sortable_th("P&L B", "number"),
+        _sortable_th("Combined Avg Buy", "number", "desc"),
+        _sortable_th("Total P&L", "number"),
+    ])
+    if not rows:
+        body = _build_curation_empty_table_state("No dual-outcome markets in this range.")
+    else:
+        table_rows = []
+        for row in rows:
+            outcome_summary = f"{row.get('outcome_a_label', 'Unknown')} vs {row.get('outcome_b_label', 'Unknown')}"
+            extra_count = int(row.get("extra_outcome_count") or 0)
+            notes = []
+            if row.get("has_paired_complements"):
+                notes.append("paired complement rotations present")
+            if extra_count > 0:
+                notes.append(f"+{extra_count} more outcome" if extra_count == 1 else f"+{extra_count} more outcomes")
+            market_cell = html.Td(
+                [
+                    html.Div(str(row.get("market") or "Unknown"), style={"fontWeight": 500, "whiteSpace": "normal"}),
+                    html.Div(outcome_summary, style={"fontSize": "11px", "color": COLORS["text_secondary"], "whiteSpace": "normal"}),
+                    html.Div(" · ".join(notes), style={"fontSize": "11px", "color": COLORS["text_secondary"], "whiteSpace": "normal"}) if notes else "",
+                ],
+                className="pm-tier-table__cell",
+                style={"minWidth": "320px", "whiteSpace": "normal", "verticalAlign": "top"},
+            )
+            table_rows.append(html.Tr([
+                market_cell,
+                html.Td(_label_with_derived_note(row.get("outcome_a_label"), row.get("outcome_a_is_derived")), className="pm-tier-table__cell", style={"minWidth": "160px", "whiteSpace": "normal", "verticalAlign": "top"}),
+                html.Td(_format_compact_price(row.get("avg_buy_a")), className="pm-tier-table__cell pm-num"),
+                html.Td(_format_share_count(row.get("bought_shares_a")), className="pm-tier-table__cell pm-num"),
+                _plain_money_cell(row.get("bought_dollars_a")),
+                html.Td(_format_share_count(row.get("sold_shares_a")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("side_pnl_a")),
+                html.Td(_label_with_derived_note(row.get("outcome_b_label"), row.get("outcome_b_is_derived")), className="pm-tier-table__cell", style={"minWidth": "160px", "whiteSpace": "normal", "verticalAlign": "top"}),
+                html.Td(_format_compact_price(row.get("avg_buy_b")), className="pm-tier-table__cell pm-num"),
+                html.Td(_format_share_count(row.get("bought_shares_b")), className="pm-tier-table__cell pm-num"),
+                _plain_money_cell(row.get("bought_dollars_b")),
+                html.Td(_format_share_count(row.get("sold_shares_b")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("side_pnl_b")),
+                html.Td(_format_compact_price(row.get("combined_avg_buy")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("total_pnl")),
+            ], className="pm-tier-table__row"))
+        body = html.Table(
+            [
+                html.Colgroup([
+                    html.Col(style={"width": "340px"}),
+                    html.Col(style={"width": "170px"}),
+                    html.Col(style={"width": "90px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "170px"}),
+                    html.Col(style={"width": "90px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "120px"}),
+                    html.Col(style={"width": "110px"}),
+                ]),
+                html.Thead(header),
+                html.Tbody(table_rows),
+            ],
+            className="pm-tier-table",
+            style={"minWidth": "1910px"},
+        )
+    return _build_curation_collapsible_table("Both-Sides Markets", _count_label(len(rows), "market"), body)
+
+
+def _build_all_trades_table(rows):
+    rows = list(rows or [])
+    rows.sort(key=lambda row: (-float(row.get("mtm_pnl") or 0.0), str(row.get("ts") or ""), str(row.get("market") or "")))
+    if not rows:
+        return _build_curation_empty_table_state("No trades in this range.")
+
+    header = html.Tr([
+        _sortable_th("Time"),
+        _sortable_th("Market"),
+        _sortable_th("Outcome"),
+        _sortable_th("Side"),
+        _sortable_th("Shares", "number"),
+        _sortable_th("Avg Price", "number"),
+        _sortable_th("Dollars", "number"),
+        _sortable_th("Fee", "number"),
+        _sortable_th("MTM P&L", "number", "desc"),
+    ])
+    table_rows = []
+    for row in rows:
+        table_rows.append(html.Tr([
+            html.Td(_format_curation_timestamp(row.get("ts")), className="pm-tier-table__cell"),
+            html.Td(str(row.get("market") or "Unknown"), className="pm-tier-table__cell", style={"minWidth": "320px", "whiteSpace": "normal"}),
+            html.Td(_label_with_derived_note(row.get("outcome_label"), row.get("outcome_is_derived")), className="pm-tier-table__cell", style={"minWidth": "180px", "whiteSpace": "normal", "verticalAlign": "top"}),
+            _value_cell(str(row.get("side") or "")),
+            html.Td(_format_share_count(row.get("shares")), className="pm-tier-table__cell pm-num"),
+            html.Td(_format_compact_price(row.get("price")), className="pm-tier-table__cell pm-num"),
+            _plain_money_cell(row.get("dollars")),
+            _plain_money_cell(row.get("fee")),
+            _pnl_cell(row.get("mtm_pnl")),
+        ], className="pm-tier-table__row"))
+    return html.Table(
+        [
+            html.Colgroup([
+                html.Col(style={"width": "150px"}),
+                html.Col(style={"width": "360px"}),
+                html.Col(style={"width": "200px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "95px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "110px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "110px"}),
+            ]),
+            html.Thead(header),
+            html.Tbody(table_rows),
+        ],
+        className="pm-tier-table",
+        style={"minWidth": "1295px"},
+    )
+
+
+def _build_lazy_all_trades_section():
+    return _build_curation_collapsible_table(
+        "All Trades",
+        "Open to load",
+        _build_curation_empty_table_state("Open to load the top winners and losers for this wallet."),
+        section_id="cur-all-trades-section",
+        meta_id="cur-all-trades-meta",
+        body_id="cur-all-trades-body",
+    )
+
+
+def _build_curation_trade_audit_body(audit_payload):
+    total_rows = int((audit_payload or {}).get("total_rows") or 0)
+    display_rows = list((audit_payload or {}).get("display_rows") or [])
+    if total_rows <= 0:
+        return _build_curation_empty_table_state("No trades in this range.")
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        "Top 50 winners and 50 losers by MTM P&L. Download CSV for the full in-range ledger.",
+                        className="pm-range-copy",
+                    ),
+                    html.Button(
+                        "Download Full CSV",
+                        id="cur-all-trades-download-btn",
+                        className="pm-button pm-button--secondary",
+                        n_clicks=0,
+                    ),
+                ],
+                style={"display": "flex", "gap": "12px", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "12px"},
+            ),
+            _build_all_trades_table(display_rows),
+        ]
+    )
+
+
+def _build_curation_bottom_sections(markets, both_sides_rows):
+    sections = []
+    top_markets = _build_top_markets_table(markets)
+    if top_markets:
+        sections.append(top_markets)
+    sections.append(_build_both_sides_table(both_sides_rows))
+    sections.append(_build_lazy_all_trades_section())
+    return html.Div(sections, style={"display": "grid", "gap": "12px"})
+
+
+def _build_sim_summary_strip(wallet_meta):
+    values = []
+    if wallet_meta.get("capital"):
+        values.append(html.Span(f"${wallet_meta['capital']:,.0f} capital"))
+    if wallet_meta.get("copy_ratio") is not None:
+        values.append(html.Span(f"{wallet_meta['copy_ratio']:.0%} copy ratio"))
+    if wallet_meta.get("execution_mode"):
+        values.append(html.Span(wallet_meta["execution_mode"]))
+    values.append(html.Span(f"{wallet_meta.get('copied', 0):,} copied / {wallet_meta.get('skipped', 0):,} skipped"))
+    return html.Div(values, className="pm-sim-summary-strip")
+
+
+def _build_sim_validation(validation):
+    if not validation:
+        return ""
+    if validation.get("workbook_value") is None:
+        note = str(validation.get("range_note") or "").strip()
+        if not note:
+            return ""
+        return html.Div(note, className="pm-sim-validation pm-sim-validation--note")
+    delta = float(validation.get("delta") or 0.0)
+    if abs(delta) <= 10:
+        tone = "pm-sim-validation--ok"
+    elif abs(delta) <= 100:
+        tone = "pm-sim-validation--warn"
+    else:
+        tone = "pm-sim-validation--bad"
+    return html.Div(
+        f"Workbook: ${validation['workbook_value']:,.2f} · Recomputed: ${validation['recomputed_value']:,.2f} · Δ ${delta:,.2f}",
+        className=f"pm-sim-validation {tone}",
+    )
+
+
+def _build_curation_stats(actual_summary, sim_payload, wallet_meta):
+    sim_summary = (sim_payload or {}).get("summary", {})
+    sim_pnl = sim_summary.get("final_pnl")
+    sim_roi = sim_summary.get("roi_pct")
+    actual_pnl = float(actual_summary.get("final_pnl", 0.0) or 0.0)
+    actual_roi = float(actual_summary.get("roi_pct", 0.0) or 0.0)
+    return html.Div([
+        _stat_tile("Final P&L", f"${actual_pnl:,.2f}", tone="positive" if actual_pnl >= 0 else "negative"),
+        html.Div([
+            _stat_tile("Sim P&L", "N/A" if sim_pnl is None else f"${float(sim_pnl):,.2f}",
+                       tone="positive" if float(sim_pnl or 0.0) >= 0 else "negative"),
+        ], className="pm-sim-stat"),
+        _stat_tile("ROI", f"{actual_roi:.1f}%"),
+        html.Div([
+            _stat_tile("Sim ROI", "N/A" if sim_roi is None else f"{float(sim_roi):.1f}%"),
+        ], className="pm-sim-stat"),
+        _stat_tile("Trades", f"{int(actual_summary.get('total_trades', 0) or 0):,}"),
+        html.Div([
+            _stat_tile("Copied", f"{int(wallet_meta.get('copied', 0) or 0):,}"),
+        ], className="pm-sim-stat"),
+    ], className="pm-wallet-stat-grid pm-wallet-stat-grid--sim")
+
+
+def _add_curation_pnl_trace(fig, series, color, fillcolor, name, hovertemplate, row=1, col=1):
+    import plotly.graph_objects as go
+
+    customdata = [[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series]
+    trace = go.Scatter(
+        x=[s["date"] for s in series],
+        y=[s["pnl"] for s in series],
+        mode="lines",
+        line=dict(color=color, width=2),
+        fill="tozeroy",
+        fillcolor=fillcolor,
+        customdata=customdata,
+        hovertemplate=hovertemplate,
+        name=name,
+        showlegend=False,
+    )
+    if row is None or col is None:
+        fig.add_trace(trace)
+        return
+    fig.add_trace(trace, row=row, col=col)
+
+
+def _build_curation_chart_figure(actual_series, sim_series=None):
+    import plotly.graph_objects as go
+
+    if sim_series:
+        from plotly.subplots import make_subplots
+
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            horizontal_spacing=0.08,
+            subplot_titles=("Actual P&L", "Sim P&L"),
+        )
+        _add_curation_pnl_trace(
+            fig,
+            actual_series,
+            COLORS["chart_line"],
+            COLORS["chart_fill"],
+            "Actual P&L",
+            "<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+            row=1,
+            col=1,
+        )
+        _add_curation_pnl_trace(
+            fig,
+            sim_series,
+            "#9B51E0",
+            "rgba(155, 81, 224, 0.12)",
+            "Sim P&L",
+            "<b>%{x}</b><br>Sim P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+            row=1,
+            col=2,
+        )
+        _polymarket_chart_layout(fig)
+        date_values = [s["date"] for s in actual_series] + [s["date"] for s in sim_series]
+        if date_values:
+            date_range = [min(date_values), max(date_values)]
+            fig.update_xaxes(range=date_range, row=1, col=1)
+            fig.update_xaxes(range=date_range, row=1, col=2)
+        fig.update_xaxes(showgrid=False, zeroline=False)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(122,145,173,0.08)", zeroline=False, tickprefix="$")
+        fig.update_layout(margin=dict(l=50, r=20, t=44, b=40), hovermode="x")
+        return fig
+
+    fig = go.Figure()
+    _add_curation_pnl_trace(
+        fig,
+        actual_series,
+        COLORS["chart_line"],
+        COLORS["chart_fill"],
+        "Actual P&L",
+        "<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+        row=None,
+        col=None,
+    )
+    _polymarket_chart_layout(fig)
+    return fig
+
+
+def _load_sim_payload(sim_session_id, wallet, range_key, base_payload):
+    if not sim_session_id or not base_payload:
+        return None, None
+
+    from lib.sharpsim_parser import build_sim_payload
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    session = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_meta = (session.get("wallets") or {}).get(wallet)
+    if not wallet_meta:
+        return None, None
+
+    wallet_meta = {
+        **wallet_meta,
+        "capital": (session.get("session_meta") or {}).get("capital"),
+        "copy_ratio": (session.get("session_meta") or {}).get("copy_ratio"),
+        "execution_mode": (session.get("session_meta") or {}).get("execution_mode"),
+    }
+    sim_payload = None
+    if wallet_meta.get("sim_status") == "ready":
+        sim_payload = build_sim_payload(
+            wallet_meta,
+            (session.get("drl") or {}).get(wallet, []),
+            base_payload.get("closes", []),
+            base_payload.get("resolutions", {}),
+            range_key,
+        )
+    return wallet_meta, sim_payload
+
+
+def _build_curation_decision_row(view, decision, sim_session_id):
+    from lib.curation_prefetch import get_curation_prefetch_manager
+
+    manager = get_curation_prefetch_manager()
+    wallet = view["wallet"]
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    range_key = _normalize_curation_range(view.get("range"))
+    key = manager.make_base_key(wallet, filter_level, filter_value)
+    actual_payload = manager.get_payload(key, range_key) or {}
+    base_payload = manager.get_base_payload(key) or {}
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, range_key, base_payload)
+    actual_summary = actual_payload.get("summary", {})
+    sim_summary = (sim_payload or {}).get("summary", {})
+    return {
+        "wallet": wallet,
+        "filter_level": filter_level,
+        "filter_value": filter_value,
+        "decision": decision,
+        "actual_final_pnl": actual_summary.get("final_pnl", 0.0),
+        "actual_roi_pct": actual_summary.get("roi_pct", 0.0),
+        "sim_final_pnl": sim_summary.get("final_pnl"),
+        "sim_roi_pct": sim_summary.get("roi_pct"),
+        "sim_copied": (wallet_meta or {}).get("copied", 0),
+        "sim_skipped": (wallet_meta or {}).get("skipped", 0),
+        "sim_status": sim_summary.get("sim_status") or (wallet_meta or {}).get("sim_status", "missing_drl"),
+    }
+
+
 @callback(
     [
         Output("sc-chart", "figure"),
@@ -3078,34 +3557,145 @@ def highlight_cur_range(selected):
 
 
 @callback(
+    [
+        Output("cur-sim-session-id", "data"),
+        Output("cur-sim-active", "data"),
+        Output("cur-sim-overlay-visible", "data"),
+        Output("cur-sim-summary", "children"),
+        Output("cur-manual-fields", "style"),
+        Output("cur-sim-clear", "style"),
+        Output("cur-setup-msg", "children", allow_duplicate=True),
+    ],
+    Input("cur-sim-upload", "contents"),
+    State("cur-sim-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_sim_upload(contents, filename):
+    if not contents:
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+    try:
+        from base64 import b64decode
+        from lib.sharpsim_parser import parse_sharpsim
+        from lib.sharpsim_session import get_sharpsim_session_manager
+
+        _, encoded = contents.split(",", 1)
+        payload = parse_sharpsim(b64decode(encoded), filename or "")
+        session_id = get_sharpsim_session_manager().create_session(payload)
+        summary = " | ".join(
+            [f"{len(payload['wallet_order'])} wallets loaded from Sharpsim"]
+            + [f"{label} ({count})" for label, count in payload.get("filter_summary", {}).items()]
+        )
+        return (
+            session_id,
+            True,
+            True,
+            dbc.Alert(summary, color="secondary"),
+            {"display": "none"},
+            {"display": "inline-flex"},
+            "",
+        )
+    except Exception as exc:
+        logger.exception("Sharpsim upload failed")
+        return (
+            "",
+            False,
+            False,
+            "",
+            {"display": "block"},
+            {"display": "none"},
+            dbc.Alert(f"Invalid Sharpsim workbook: {exc}", color="danger"),
+        )
+
+
+@callback(
+    [
+        Output("cur-sim-session-id", "data", allow_duplicate=True),
+        Output("cur-sim-active", "data", allow_duplicate=True),
+        Output("cur-sim-overlay-visible", "data", allow_duplicate=True),
+        Output("cur-sim-summary", "children", allow_duplicate=True),
+        Output("cur-manual-fields", "style", allow_duplicate=True),
+        Output("cur-sim-clear", "style", allow_duplicate=True),
+    ],
+    Input("cur-sim-clear", "n_clicks"),
+    State("cur-sim-session-id", "data"),
+    prevent_initial_call=True,
+)
+def clear_sim_session(n_clicks, sim_session_id):
+    if not n_clicks:
+        return [no_update] * 6
+
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    if sim_session_id:
+        get_sharpsim_session_manager().clear_session(sim_session_id)
+    return "", False, False, "", {"display": "block"}, {"display": "none"}
+
+
+def _wallet_configs_from_manual_inputs(wallet_text, category):
+    wallets = [wallet.strip().lower() for wallet in (wallet_text or "").splitlines() if wallet.strip().startswith("0x")]
+    if "::" in (category or ""):
+        filter_level, filter_value = category.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", category or ""
+    wallet_configs = [
+        {"address": wallet, "filter_level": filter_level, "filter_value": filter_value}
+        for wallet in wallets
+    ]
+    return wallets, wallet_configs, f"{filter_level}::{filter_value}"
+
+
+def _wallet_configs_from_sim_session(sim_session_id):
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    payload = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_configs = [
+        {
+            "address": wallet,
+            "filter_level": payload["wallets"][wallet]["filter_level"],
+            "filter_value": payload["wallets"][wallet]["filter_value"],
+        }
+        for wallet in payload.get("wallet_order", [])
+    ]
+    filter_raw = ""
+    if wallet_configs:
+        filter_raw = f"{wallet_configs[0]['filter_level']}::{wallet_configs[0]['filter_value']}"
+    return payload.get("wallet_order", []), wallet_configs, filter_raw
+
+
+@callback(
     [Output("cur-wallets", "data"), Output("cur-filter", "data"),
      Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
      Output("cur-session-id", "data"),
      Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
      Output("cur-setup-msg", "children")],
     Input("cur-start", "n_clicks"),
-    [State("cur-wallet-input", "value"), State("cur-category", "value"), State("cur-range", "data")],
+    [
+        State("cur-wallet-input", "value"),
+        State("cur-category", "value"),
+        State("cur-range", "data"),
+        State("cur-sim-active", "data"),
+        State("cur-sim-session-id", "data"),
+    ],
     prevent_initial_call=True,
 )
-def start_curation(n_clicks, wallet_text, category, selected_range):
+def start_curation(n_clicks, wallet_text, category, selected_range, sim_active, sim_session_id):
     if not n_clicks:
         return [no_update] * 10
 
-    if not wallet_text or not wallet_text.strip():
-        return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
-    if not category:
-        return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
-
-    wallets = [w.strip().lower() for w in wallet_text.strip().split("\n") if w.strip().startswith("0x")]
-    if not wallets:
-        return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+    if sim_active and sim_session_id:
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_sim_session(sim_session_id)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("Uploaded Sharpsim session has no wallets.", color="warning")]
+    else:
+        if not wallet_text or not wallet_text.strip():
+            return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+        if not category:
+            return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_manual_inputs(wallet_text, category)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
 
     selected_range = _normalize_curation_range(selected_range)
-
-    if "::" in category:
-        filter_level, filter_value = category.split("::", 1)
-    else:
-        filter_level, filter_value = "detail", category
 
     session_id = uuid.uuid4().hex
     try:
@@ -3113,16 +3703,14 @@ def start_curation(n_clicks, wallet_text, category, selected_range):
 
         get_curation_prefetch_manager().prime_session(
             session_id=session_id,
-            wallets=wallets,
-            filter_level=filter_level,
-            filter_value=filter_value,
+            wallet_configs=wallet_configs,
             warm_count=6,
         )
     except Exception:
         logger.exception("Failed to seed curation prefetch session")
 
     return (
-        wallets, category, 0, [], {}, session_id,
+        wallets, filter_raw, 0, [], {}, session_id,
         {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
     )
 
@@ -3151,14 +3739,22 @@ def update_curation_status(index, session_id, selected_range, _poll, wallets, fi
 
 
 @callback(
-    [Output("cur-warnings", "children"), Output("cur-read", "children"),
-     Output("cur-chart", "figure"), Output("cur-stats", "children"),
-     Output("cur-concentration", "children"), Output("cur-top-markets", "children")],
+    [
+        Output("cur-warnings", "children"),
+        Output("cur-read", "children"),
+        Output("cur-sim-summary-panel", "children"),
+        Output("cur-chart", "figure"),
+        Output("cur-stats", "children"),
+        Output("cur-concentration", "children"),
+        Output("cur-top-markets", "children"),
+    ],
     Input("cur-view", "data"),
+    Input("cur-sim-overlay-visible", "data"),
+    State("cur-sim-session-id", "data"),
 )
-def render_curation_wallet(view):
+def render_curation_wallet(view, sim_overlay_visible, sim_session_id):
     if not view or view.get("status") == "idle":
-        return "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
+        return "", "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
 
     wallet = view.get("wallet", "")
     filter_level = view.get("filter_level", "detail")
@@ -3169,6 +3765,7 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure("Wallet fetch failed"),
             dbc.Alert(view.get("error") or f"Failed to fetch {wallet[:12]}...", color="danger"),
             "",
@@ -3177,6 +3774,7 @@ def render_curation_wallet(view):
 
     if view["status"] == "empty":
         return [
+            "",
             "",
             "",
             _build_curation_loading_figure("No trades found"),
@@ -3194,6 +3792,7 @@ def render_curation_wallet(view):
         return [
             loading_warning,
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
             dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
             "",
@@ -3211,6 +3810,7 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure("Wallet fetch failed"),
             dbc.Alert(f"Error: {exc}", color="danger"),
             "",
@@ -3221,48 +3821,141 @@ def render_curation_wallet(view):
         return [
             html.Div([_status_chip("Loading wallet data", tone="warning")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
             _build_curation_loading_read(),
+            "",
             _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
             dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
             "",
             "",
         ]
 
-    # Chart
-    import plotly.graph_objects as go
-
     series = data["series"]
     summary = data["summary"]
-    final_pnl = summary["final_pnl"]
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=[s["date"] for s in series], y=[s["pnl"] for s in series],
-        mode="lines", line=dict(color=COLORS["chart_line"], width=2),
-        fill="tozeroy", fillcolor=COLORS["chart_fill"],
-        customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
-        hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
-    ))
-    _polymarket_chart_layout(fig)
+    base_payload = manager.get_base_payload(key)
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, selected_range, base_payload)
+    sim_series = (sim_payload or {}).get("series") or None
+    fig = _build_curation_chart_figure(series, sim_series=sim_series)
 
-    # Stats
-    pnl_color = "positive" if final_pnl >= 0 else "negative"
-    stats = html.Div([
-        _stat_tile("Final P&L", f"${final_pnl:,.2f}", tone=pnl_color),
-        _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
-        _stat_tile("Trades", f"{summary['total_trades']:,}"),
-        _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
-        _stat_tile("Unique Markets", f"{summary.get('unique_markets', 0):,}"),
-        _stat_tile("Active Days", f"{summary.get('active_days', 0):,}"),
-    ], className="pm-wallet-stat-grid")
+    sim_panel = ""
+    if wallet_meta:
+        sim_panel = html.Div(
+            [
+                _build_sim_summary_strip(wallet_meta),
+                _build_sim_validation((sim_payload or {}).get("validation")),
+                dbc.Alert("Sim data unavailable for this wallet.", color="secondary", className="pm-inline-message")
+                if wallet_meta.get("sim_status") != "ready" or not sim_payload
+                else "",
+            ],
+            className="pm-sim-panel",
+        )
+
+    stats = _build_curation_stats(summary, sim_payload, wallet_meta or {})
 
     signals = data.get("signals", {})
     warnings = _build_curation_warning_strip(signals)
     curation_read = _build_curation_read(summary, signals)
     concentration = _build_curation_signal_badges(signals)
     breakdown = data.get("breakdown", {})
-    top_markets = _build_top_markets_table(breakdown.get("markets", []))
+    top_markets = _build_curation_bottom_sections(
+        breakdown.get("markets", []),
+        data.get("both_sides_rows", []),
+    )
 
-    return [warnings, curation_read, fig, stats, concentration, top_markets]
+    return [warnings, curation_read, sim_panel, fig, stats, concentration, top_markets]
+
+
+def render_curation_trade_audit(is_open, view):
+    if not is_open:
+        return no_update, no_update
+    if not view or view.get("status") != "ready":
+        return "Loading...", _build_curation_empty_table_state("Trade audit will load when wallet data is ready.")
+
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        base_payload = manager.get_base_payload(key)
+    except Exception as exc:
+        logger.exception("Failed to load curation trade audit")
+        return "Unavailable", dbc.Alert(f"Trade audit unavailable: {exc}", color="danger", className="pm-inline-message")
+
+    if not base_payload:
+        return "Loading...", _build_curation_empty_table_state("Trade audit will load when wallet data is ready.")
+
+    audit_payload = build_wallet_trade_audit_payload_from_base(base_payload, selected_range)
+    total_rows = int(audit_payload.get("total_rows") or 0)
+    display_rows = list(audit_payload.get("display_rows") or [])
+    if total_rows <= 0:
+        return "0 rows", _build_curation_empty_table_state("No trades in this range.")
+    return f"{len(display_rows):,} shown of {total_rows:,} rows", _build_curation_trade_audit_body(audit_payload)
+
+
+@callback(
+    Output("cur-all-trades-meta", "children"),
+    Output("cur-all-trades-body", "children"),
+    Input("cur-all-trades-section", "open"),
+    State("cur-view", "data"),
+    prevent_initial_call=True,
+)
+def update_curation_trade_audit(is_open, view):
+    return render_curation_trade_audit(is_open, view)
+
+
+@callback(
+    Output("cur-trade-audit-download", "data"),
+    Input("cur-all-trades-download-btn", "n_clicks"),
+    State("cur-view", "data"),
+    prevent_initial_call=True,
+)
+def download_curation_trade_audit(n_clicks, view):
+    import csv
+    import io
+
+    if not n_clicks or not view or view.get("status") != "ready":
+        return no_update
+
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        base_payload = manager.get_base_payload(key)
+    except Exception:
+        logger.exception("Failed to prepare curation trade audit export")
+        return no_update
+
+    if not base_payload:
+        return no_update
+
+    audit_payload = build_wallet_trade_audit_payload_from_base(base_payload, selected_range, limit_per_side=None)
+    rows = list(audit_payload.get("rows") or [])
+    if not rows:
+        return no_update
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["ts", "market", "outcome_label", "side", "shares", "price", "dollars", "fee", "mtm_pnl"],
+    )
+    writer.writeheader()
+    for row in sorted(rows, key=lambda item: (str(item.get("ts") or ""), str(item.get("market") or ""), str(item.get("outcome_label") or "")), reverse=True):
+        writer.writerow({field: row.get(field) for field in writer.fieldnames})
+
+    wallet_slug = (wallet or "wallet")[:10]
+    range_slug = selected_range.lower()
+    filename = f"curation_trades_{wallet_slug}_{range_slug}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    return dict(content=buffer.getvalue(), filename=filename)
 
 
 @callback(
@@ -3276,11 +3969,22 @@ def render_curation_wallet(view):
      Output("cur-results-list", "children")],
     [Input("cur-approve", "n_clicks"), Input("cur-skip", "n_clicks"), Input("cur-back", "n_clicks")],
     [State("cur-index", "data"), State("cur-wallets", "data"),
-     State("cur-approved", "data"), State("cur-decisions", "data")],
+     State("cur-approved", "data"), State("cur-decisions", "data"),
+     State("cur-view", "data"), State("cur-sim-session-id", "data")],
     prevent_initial_call=True,
 )
-def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions):
-    triggered = dash.ctx.triggered_id
+def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions, current_view, sim_session_id):
+    try:
+        triggered = dash.ctx.triggered_id
+    except Exception:
+        triggered = None
+    if not triggered:
+        if approve_clicks:
+            triggered = "cur-approve"
+        elif skip_clicks:
+            triggered = "cur-skip"
+        elif back_clicks:
+            triggered = "cur-back"
     if not triggered or not wallets:
         return [no_update] * 8
 
@@ -3290,21 +3994,20 @@ def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wall
         return [no_update] * 8
 
     wallet = wallets[index] if index < len(wallets) else None
-    if not wallet:
+    if not wallet or not current_view:
         return [no_update] * 8
 
     if triggered == "cur-approve" and approve_clicks:
         if wallet not in approved:
             approved = approved + [wallet]
-        decisions = {**decisions, wallet: "approved"}
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "approved", sim_session_id)}
     elif triggered == "cur-skip" and skip_clicks:
-        decisions = {**decisions, wallet: "skipped"}
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "skipped", sim_session_id)}
     else:
         return [no_update] * 8
 
     next_index = index + 1
     if next_index >= len(wallets):
-        # Done — show results
         title = f"Approved {len(approved)} of {len(wallets)} wallets"
         wallet_list = html.Div([html.Div(w, style={"fontFamily": "monospace", "padding": "2px 0"}) for w in approved]) if approved else html.Div("No wallets approved.", style={"color": "var(--pm-text-secondary)"})
         return [next_index, approved, decisions,
@@ -3317,14 +4020,37 @@ def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wall
 @callback(
     Output("cur-download", "data"),
     Input("cur-download-btn", "n_clicks"),
-    State("cur-approved", "data"),
+    State("cur-decisions", "data"),
     prevent_initial_call=True,
 )
-def download_approved(n_clicks, approved):
-    if not n_clicks or not approved:
+def download_curation_results(n_clicks, decisions):
+    import csv
+    import io
+
+    if not n_clicks or not decisions:
         return no_update
-    txt = "\n".join(approved) + "\n"
-    return dict(content=txt, filename=f"approved_wallets_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "wallet",
+            "filter_level",
+            "filter_value",
+            "decision",
+            "actual_final_pnl",
+            "actual_roi_pct",
+            "sim_final_pnl",
+            "sim_roi_pct",
+            "sim_copied",
+            "sim_skipped",
+            "sim_status",
+        ],
+    )
+    writer.writeheader()
+    for row in decisions.values():
+        writer.writerow(row)
+    return dict(content=buffer.getvalue(), filename=f"curation_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
 
 
 @callback(

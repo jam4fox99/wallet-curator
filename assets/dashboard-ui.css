@@ -1876,3 +1876,48 @@ input.pm-settings-input {
   font-size: 12px;
   font-weight: 600;
 }
+
+.pm-sim-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.pm-sim-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--pm-border);
+  border-radius: var(--pm-radius-md);
+  background: var(--pm-surface-alt);
+}
+
+.pm-sim-summary-strip span {
+  color: var(--pm-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pm-wallet-stat-grid--sim .pm-sim-stat .pm-metric-value {
+  color: #9b51e0;
+  font-size: 18px;
+}
+
+.pm-sim-validation {
+  color: var(--pm-text-secondary);
+  font-size: 11px;
+}
+
+.pm-sim-validation--ok {
+  color: var(--pm-green);
+}
+
+.pm-sim-validation--warn {
+  color: var(--pm-warning);
+}
+
+.pm-sim-validation--bad {
+  color: var(--pm-red);
+}

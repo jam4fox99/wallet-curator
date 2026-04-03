@@ -11,17 +11,35 @@ class CurationPrefetchManagerTests(unittest.TestCase):
         started = []
 
         def fake_fetch(wallet, filter_value, filter_level):
-            started.append(wallet)
+            started.append((wallet, filter_value, filter_level))
             time.sleep(0.05)
-            return {"wallet": wallet}
+            return {"wallet": wallet, "filter_value": filter_value}
 
         with patch("lib.curation_prefetch.get_wallet_curation_base_data", side_effect=fake_fetch):
-            manager.prime_session("session-a", ["0xa0", "0xa1", "0xa2"], "detail", "Esports", warm_count=2)
-            manager.prime_session("session-b", ["0xb0"], "detail", "Esports", warm_count=1)
-            time.sleep(0.35)
+            manager.prime_session(
+                "session-a",
+                [
+                    {"address": "0xa0", "filter_level": "detail", "filter_value": "League of Legends"},
+                    {"address": "0xa1", "filter_level": "detail", "filter_value": "Valorant"},
+                ],
+                warm_count=2,
+            )
+            manager.prime_session(
+                "session-b",
+                [{"address": "0xb0", "filter_level": "subcategory", "filter_value": "Esports"}],
+                warm_count=1,
+            )
+            time.sleep(0.25)
 
-        self.assertEqual(started, ["0xa0", "0xb0", "0xa1", "0xa2"])
-        self.assertEqual(manager.get_session_progress("session-a")["ready"], 3)
+        self.assertEqual(
+            started,
+            [
+                ("0xa0", "League of Legends", "detail"),
+                ("0xb0", "Esports", "subcategory"),
+                ("0xa1", "Valorant", "detail"),
+            ],
+        )
+        self.assertEqual(manager.get_session_progress("session-a")["ready"], 2)
         self.assertEqual(manager.get_session_progress("session-b")["ready"], 1)
 
     def test_stale_sessions_are_dropped_during_eviction(self):
@@ -31,12 +49,27 @@ class CurationPrefetchManagerTests(unittest.TestCase):
             return {"wallet": wallet}
 
         with patch("lib.curation_prefetch.get_wallet_curation_base_data", side_effect=fake_fetch):
-            manager.prime_session("session-a", ["0xa0"], "detail", "Esports", warm_count=1)
+            manager.prime_session(
+                "session-a",
+                [{"address": "0xa0", "filter_level": "detail", "filter_value": "Esports"}],
+                warm_count=1,
+            )
             time.sleep(0.05)
             manager._session_last_access["session-a"] = time.time() - 5
             manager._evict_locked()
 
         self.assertEqual(manager.get_session_progress("session-a")["total"], 0)
+
+    def test_get_base_payload_returns_cached_lifetime_payload(self):
+        manager = CurationPrefetchManager(max_workers=1, ttl_seconds=60, max_ready_entries=20)
+        base_key = manager.make_base_key("0xabc", "detail", "League of Legends")
+        manager._cache[base_key] = CacheEntry(
+            key=base_key,
+            status="ready",
+            payload={"wallet": "0xabc", "closes": [1]},
+        )
+
+        self.assertEqual(manager.get_base_payload(base_key), {"wallet": "0xabc", "closes": [1]})
 
     def test_interval_payloads_are_cached_per_base_wallet(self):
         manager = CurationPrefetchManager(max_workers=1, ttl_seconds=60, max_ready_entries=20)
