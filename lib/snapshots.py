@@ -110,13 +110,13 @@ def _save_snapshot_data(conn, snap_id):
         conn.execute("""
             INSERT INTO pnl_snapshot_data (snapshot_id, master_wallet, game, filter_game,
                 total_invested, realized_pnl, unrealized_value, unrealized_pnl, total_pnl,
-                unique_markets, total_trades, in_csv, incomplete_positions, sim_number)
+                unique_markets, total_trades, in_csv, excluded_positions, sim_number)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             snap_id, wallet, w['game'], filter_game,
             w['total_invested'], w['realized_pnl'], w['unrealized_value'], w['unrealized_pnl'],
             w['realized_pnl'] + w['unrealized_pnl'],
-            w['unique_markets'], w['total_trades'], in_csv, w['incomplete_positions'], sim_num,
+            w['unique_markets'], w['total_trades'], in_csv, w['excluded_positions'], sim_num,
         ))
 
 
@@ -229,7 +229,7 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
                 'markets': int(data.get('unique_markets') or 0),
                 'trades': int(data.get('total_trades') or 0),
                 'in_csv': 'Yes' if data.get('in_csv') else 'No',
-                'excluded': int(data.get('incomplete_positions') or 0),
+                'excluded': int(data.get('excluded_positions') or 0),
             })
         return pd.DataFrame(rows)
 
@@ -297,7 +297,7 @@ def get_combined_dataframe(conn, snapshot_ids, include_hidden=False):
         row['combined'] = round(combined_total, 2)
         row['markets'] = int(latest_data.get('unique_markets', 0)) if latest_data else 0
         row['trades'] = int(latest_data.get('total_trades', 0)) if latest_data else 0
-        row['excluded'] = int(latest_data.get('incomplete_positions', 0)) if latest_data else 0
+        row['excluded'] = int(latest_data.get('excluded_positions', 0)) if latest_data else 0
 
         rows.append(row)
 

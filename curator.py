@@ -1,260 +1,131 @@
 #!/usr/bin/env python3
-"""Wallet Curator Agent — CLI entry point."""
+"""Wallet Curator CLI entry point."""
 import argparse
 import logging
+import os
 import sys
 
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(levelname)s: %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-def cmd_ingest(args):
+def cmd_ingest(_args):
     from lib.ingest_sharp import run as ingest_run
-    from lib.db import get_connection
+    from lib.pipeline import run_hourly_pipeline
 
-    excluded_counts = ingest_run()
-
-    # Run resolver + P&L after ingest
-    conn = get_connection()
-    try:
-        from lib.resolver import check_resolutions
-        print("Checking resolutions...")
-        newly_resolved = check_resolutions(conn)
-        if newly_resolved:
-            print(f"  {newly_resolved} tokens newly resolved.")
-    except Exception as e:
-        print(f"⚠️ Resolution check failed: {e}")
-        newly_resolved = 0
-
-    # Fetch live prices for open positions
-    current_prices = {}
-    try:
-        from lib.pricing import fetch_prices
-        current_prices = fetch_prices(conn)
-    except Exception as e:
-        print(f"⚠️ Live pricing failed: {e}")
-
-    try:
-        from lib.pnl import compute_wallet_pnl
-        print("Computing P&L...")
-        compute_wallet_pnl(conn, excluded_counts or {}, current_prices=current_prices)
-    except Exception as e:
-        print(f"⚠️ P&L computation failed: {e}")
-
-    # Create/update snapshot
-    try:
-        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
-        from lib.ingest_sharp import run as _dummy  # noqa - just to check new_trade_count
-        maybe_create_snapshot(conn, new_trade_count=0)
-        save_csv_if_changed(conn)
-    except Exception as e:
-        print(f"⚠️ Snapshot creation failed: {e}")
-
-    # Run changelog
-    try:
-        from lib.changelog import detect_changes
-        detect_changes(conn)
-    except Exception as e:
-        print(f"⚠️ Changelog detection failed: {e}")
-
-    conn.close()
+    ingest_run()
+    result = run_hourly_pipeline(trigger="cli-ingest")
+    if result["status"] == "error":
+        print(f"Pipeline failed after ingest: {result['error']}")
 
 
-def cmd_ingest_sim(args):
-    from lib.ingest_sim import run as sim_run
-    sim_run()
-
-
-def cmd_pnl(args):
+def cmd_pnl(_args):
     from lib.pnl import run as pnl_run
+
     pnl_run()
 
 
-def cmd_status(args):
-    import os
-    from lib.db import DB_PATH, init_db, get_connection
-    from lib.file_manager import scan_sharp_logs, scan_sims, scan_malformed
+def cmd_status(_args):
+    from lib.db import DB_PATH, get_backend_name, get_connection, init_db
+    from lib.time_utils import parse_db_timestamp
 
     init_db()
-
-    print("Wallet Curator Status")
-    print("─────────────────────")
-
-    # Database
-    db_exists = os.path.exists(DB_PATH)
-    print(f"Database: {DB_PATH} ({'exists' if db_exists else 'not found'})")
-
-    if not db_exists:
-        print("Run `python curator.py ingest` to get started.")
-        return
-
     conn = get_connection()
-
-    # Active wallets
     try:
-        import csv
-        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'active_wallets.csv')
-        with open(csv_path) as f:
-            reader = csv.DictReader(f)
-            wallets = [r for r in reader if r['address'] != '__global__']
-        print(f"Active wallets: {len(wallets)} in active_wallets.csv")
-    except Exception:
-        print("Active wallets: active_wallets.csv not found")
-
-    # Sharp logs
-    ingests = conn.execute("SELECT COUNT(*), COALESCE(SUM(new_trades), 0) FROM ingest_registry").fetchone()
-    total_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    print(f"Sharp logs ingested: {ingests[0]} files, {total_trades} total trades")
-
-    # Sims
-    sims = conn.execute("SELECT sim_number, wallet_count FROM sim_registry ORDER BY sim_number").fetchall()
-    if sims:
-        sim_parts = [f"Sim #{s['sim_number']}: {s['wallet_count']} wallets" for s in sims]
-        print(f"Sharp sims ingested: {len(sims)} files ({', '.join(sim_parts)})")
-    else:
-        print("Sharp sims ingested: 0 files")
-
-    # Tokens
-    res = conn.execute("""
-        SELECT resolved, COUNT(*) FROM resolutions GROUP BY resolved
-    """).fetchall()
-    res_map = {r['resolved']: r[1] for r in res}
-    total_tokens = sum(res_map.values())
-    resolved = res_map.get(1, 0) + res_map.get(-1, 0)
-    pending = res_map.get(0, 0)
-    unresolvable = res_map.get(-2, 0)
-    print(f"Tokens tracked: {total_tokens} ({resolved} resolved, {pending} pending, {unresolvable} unresolvable)")
-
-    # Positions
-    valid_pos = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
-    all_pos_groups = conn.execute(
-        "SELECT COUNT(*) FROM (SELECT DISTINCT master_wallet, token_id FROM trades)"
-    ).fetchone()[0]
-    excluded = all_pos_groups - valid_pos
-    print(f"Positions: {valid_pos} valid, {excluded} excluded (missing buy data)")
-
-    # Timestamps
-    last_ingest = conn.execute(
-        "SELECT MAX(ingested_at) FROM ingest_registry"
-    ).fetchone()[0]
-    if last_ingest:
-        print(f"Last ingest: {last_ingest}")
-
-    last_eval = conn.execute(
-        "SELECT MAX(eval_date) FROM evaluation_log"
-    ).fetchone()[0]
-    if last_eval:
-        print(f"Last evaluation: {last_eval}")
-        # Since last eval
-        new_ingests = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(new_trades), 0) FROM ingest_registry WHERE ingested_at > ?",
-            (last_eval,)
+        backend = get_backend_name()
+        trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        positions = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        wallets = conn.execute("SELECT COUNT(*) FROM wallet_pnl").fetchone()[0]
+        hidden = conn.execute("SELECT COUNT(*) FROM hidden_wallets").fetchone()[0]
+        resolutions = conn.execute(
+            "SELECT resolved, COUNT(*) AS count FROM resolutions GROUP BY resolved"
+        ).fetchall()
+        resolution_map = {row["resolved"]: row["count"] for row in resolutions}
+        latest_pipeline = conn.execute(
+            "SELECT * FROM pipeline_log ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
-        new_sims = conn.execute(
-            "SELECT COUNT(*) FROM sim_registry WHERE ingested_at > ?", (last_eval,)
-        ).fetchone()[0]
-        new_changes = conn.execute(
-            "SELECT COUNT(*) FROM wallet_changes WHERE change_date > ?", (last_eval,)
-        ).fetchone()[0]
-        print(f"Since last eval: {new_ingests[0]} new ingest(s) ({new_ingests[1]} trades), "
-              f"{new_sims} new sim(s), {new_changes} wallet change(s)")
-    else:
-        print("Last evaluation: No evaluations yet")
+        sync_status = conn.execute("SELECT * FROM sync_status WHERE id = 1").fetchone()
 
-    # Pending files
-    pending_logs = scan_sharp_logs()
-    pending_sims = scan_sims()
-    pending_malformed = scan_malformed()
-    print(f"Pending in data/sharp_logs/: {len(pending_logs)} unprocessed file(s)")
-    print(f"Pending in data/sims/: {len(pending_sims)} unprocessed file(s)")
-    if pending_malformed:
-        total_malformed_rows = 0
-        for f in pending_malformed:
-            with open(f) as mf:
-                total_malformed_rows += max(0, sum(1 for _ in mf) - 1)  # subtract header
-        print(f"Malformed rows awaiting repair: {total_malformed_rows} (in data/malformed/)")
+        print("Wallet Curator Status")
+        print("---------------------")
+        if backend == "postgres":
+            print("Backend: Postgres (DATABASE_URL)")
+        else:
+            print(f"Backend: SQLite ({DB_PATH})")
 
-    # Snapshots
-    snap_count = conn.execute("SELECT COUNT(*) FROM pnl_snapshots").fetchone()[0]
-    if snap_count:
-        print(f"PnL snapshots: {snap_count}")
+        print(f"Trades: {trades:,}")
+        print(f"Positions: {positions:,}")
+        print(f"Wallets with P&L: {wallets:,}")
+        print(
+            "Tokens tracked: "
+            f"{sum(resolution_map.values()):,} "
+            f"({resolution_map.get(1, 0) + resolution_map.get(-1, 0) + resolution_map.get(2, 0)} resolved, "
+            f"{resolution_map.get(0, 0)} pending, {resolution_map.get(-2, 0)} unresolvable)"
+        )
+        print(f"Hidden wallets: {hidden}")
 
-    conn.close()
+        if sync_status:
+            last_sync = parse_db_timestamp(sync_status["last_sync_at"]).strftime("%Y-%m-%d %H:%M UTC")
+            print(
+                f"Sync status: folder={sync_status['current_version_folder'] or 'unknown'} | "
+                f"last sync={last_sync} | last cycle={sync_status['trades_synced_this_cycle']} trades"
+            )
+            if sync_status["last_error"]:
+                print(f"Last sync error: {sync_status['last_error']}")
 
-
-def cmd_repair(args):
-    from lib.repair import run as repair_run
-    repair_run()
+        if latest_pipeline:
+            started_at = parse_db_timestamp(latest_pipeline["started_at"]).strftime("%Y-%m-%d %H:%M UTC")
+            print(
+                f"Last pipeline: {started_at} | positions={latest_pipeline['positions_rebuilt'] or 0} | "
+                f"resolved={latest_pipeline['tokens_resolved'] or 0} | history rows={latest_pipeline['history_recorded'] or 0}"
+            )
+            if latest_pipeline["error"]:
+                print(f"Pipeline error: {latest_pipeline['error']}")
+    finally:
+        conn.close()
 
 
 def cmd_run(args):
-    """Run the full pipeline: ingest → ingest-sim → pnl."""
-    from lib.file_manager import scan_sharp_logs, scan_sims
+    from lib.file_manager import scan_sharp_logs
+    from lib.pipeline import run_hourly_pipeline
 
-    # Only run ingest steps if there are unprocessed files
     logs = scan_sharp_logs()
     if logs:
-        print(f"=== Ingest ({len(logs)} file(s)) ===")
         cmd_ingest(args)
-        print()
     else:
-        # Still need to resolve + price even if no new files
-        from lib.db import init_db, get_connection, ensure_resolution_entries
-        init_db()
-        conn = get_connection()
-        pos_count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
-        if pos_count == 0:
-            print("No data yet. Drop CSV files into data/sharp_logs/ first.")
-            conn.close()
-            return
-        conn.close()
-
-    sims = scan_sims()
-    if sims:
-        print(f"=== Ingest Sim ({len(sims)} file(s)) ===")
-        cmd_ingest_sim(args)
-        print()
-
-    print("=== P&L Dashboard ===")
-    cmd_pnl(args)
+        result = run_hourly_pipeline(trigger="cli-run")
+        if result["status"] == "error":
+            print(f"Pipeline failed: {result['error']}")
+    cmd_status(args)
 
 
 def main():
     setup_logging()
 
     parser = argparse.ArgumentParser(
-        description='Wallet Curator Agent — Polymarket esports copy-trading tool'
+        description="Wallet Curator CLI - cloud-ready Polymarket P&L tooling"
     )
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    subparsers.add_parser('run', help='Run full pipeline: ingest + ingest-sim + pnl')
-    subparsers.add_parser('ingest', help='Ingest Sharp log CSVs from data/sharp_logs/')
-    subparsers.add_parser('ingest-sim', help='Ingest Sharp sim xlsx from data/sims/')
-    subparsers.add_parser('pnl', help='Display P&L dashboard')
-    subparsers.add_parser('status', help='Show system status')
-    subparsers.add_parser('repair', help='Repair malformed rows (requires API key)')
+    subparsers.add_parser("run", help="Run local ingest if files exist, then refresh pipeline")
+    subparsers.add_parser("ingest", help="Ingest local Sharp CSVs, then refresh pipeline")
+    subparsers.add_parser("pnl", help="Refresh pipeline and print wallet P&L")
+    subparsers.add_parser("status", help="Show database, sync, and pipeline status")
 
     args = parser.parse_args()
-
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
     commands = {
-        'run': cmd_run,
-        'ingest': cmd_ingest,
-        'ingest-sim': cmd_ingest_sim,
-        'pnl': cmd_pnl,
-        'status': cmd_status,
-        'repair': cmd_repair,
+        "run": cmd_run,
+        "ingest": cmd_ingest,
+        "pnl": cmd_pnl,
+        "status": cmd_status,
     }
-
     commands[args.command](args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

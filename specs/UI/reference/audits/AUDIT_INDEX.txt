@@ -1,0 +1,360 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                    WALLET CURATOR DASHBOARD UI AUDIT                      ║
+║                             Complete Index                                ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+Generated: April 3, 2026
+Project: Wallet Curator Dashboard (Dash Python + Custom CSS)
+Location: /Users/jakemilken/Desktop/Manual Library/wallet-curator/
+
+═══════════════════════════════════════════════════════════════════════════
+
+AUDIT DELIVERABLES (4 documents, 76 KB total, 1,889 lines)
+
+1. AUDIT_README.md (12 KB)
+   ├─ Overview of audit objectives and structure
+   ├─ Key findings summary
+   ├─ How to use the audit documents
+   ├─ Component categories breakdown
+   ├─ Implementation time estimates
+   └─ Next steps for Polymarket redesign
+
+2. UI_AUDIT.md (32 KB - PRIMARY REFERENCE)
+   ├─ Complete detailed audit of all 150+ CSS classes
+   ├─ Section 1: CSS color tokens (13 variables)
+   ├─ Section 2: Layout components (20 classes)
+   ├─ Section 3: Card & surface components (15 classes)
+   ├─ Section 4: Typography components (15 classes)
+   ├─ Section 5: Button components (8 variants)
+   ├─ Section 6: Input & form components (10 types)
+   ├─ Section 7: Badge & status components (12 types)
+   ├─ Section 8: Table components (8 classes)
+   ├─ Section 9: Messages & alerts (8 classes)
+   ├─ Section 10: Collapsible components (8 classes)
+   ├─ Section 11: History & change lists (12 classes)
+   ├─ Section 12: Sidebar & control components (8 classes)
+   ├─ Section 13: Wallet management (12 classes)
+   ├─ Section 14: Settings components (6 classes)
+   ├─ Section 15: Component builder functions (20+)
+   ├─ Section 16: Page layouts (4-5 main layouts)
+   ├─ Section 17: DBC components
+   ├─ Section 18: DCC components
+   ├─ Section 19: Responsive design details
+   ├─ Section 20: Polymarket mapping recommendations
+   └─ Section 21: Summary of changes needed
+
+3. COMPONENT_INVENTORY.txt (24 KB - VISUAL REFERENCE)
+   ├─ ASCII art diagram of CSS color tokens
+   ├─ Component breakdown table (13 categories)
+   ├─ Key UI component functions (15 functions listed)
+   ├─ Modal dialogs (3 dbc.Modal components)
+   ├─ DCC components detailed (9 types)
+   ├─ Component hierarchy tree (ASCII visual)
+   ├─ Table structure details
+   ├─ Responsive breakpoints explanation
+   ├─ Button variants breakdown (6 types)
+   ├─ Form input styling details (5 types)
+   ├─ Badge & chip components breakdown (14 types)
+   ├─ Empty states & messages structure
+   ├─ Collapsible & details structure
+   ├─ History & change list structure
+   ├─ What needs Polymarket styling (3 priority levels)
+   ├─ Implementation approach phases (4 phases)
+   └─ Statistics summary
+
+4. QUICK_REFERENCE.md (8 KB - IMPLEMENTATION GUIDE)
+   ├─ Files generated summary
+   ├─ Quick stats (4-5 items)
+   ├─ Color variables to update (13 variables)
+   ├─ Critical components table (High Priority)
+   ├─ Component hierarchy quick view
+   ├─ High priority changes (4 sections)
+   ├─ Medium priority changes (3 sections)
+   ├─ Low priority changes (no action needed)
+   ├─ Implementation roadmap (5 phases)
+   ├─ Pages to test (5 pages listed)
+   ├─ CSS file locations
+   ├─ Python entry points
+   ├─ CSS class naming convention
+   ├─ Key responsive breakpoints
+   ├─ Browser compatibility
+   ├─ Dependencies list
+   ├─ What NOT to change
+   └─ Next actions checklist
+
+═══════════════════════════════════════════════════════════════════════════
+
+HOW TO USE THIS AUDIT
+
+Quick Start (25 minutes):
+  1. Read AUDIT_README.md (5 min) - understand the overview
+  2. Read QUICK_REFERENCE.md (10 min) - learn the scope
+  3. Skim COMPONENT_INVENTORY.txt (10 min) - see visual breakdown
+
+For Planning (1 hour):
+  1. Review QUICK_REFERENCE.md > Implementation Roadmap
+  2. Check COMPONENT_INVENTORY.txt for component counts
+  3. Review UI_AUDIT.md section 20 for Polymarket recommendations
+  4. Create task list based on phases
+
+For Implementation (6-7 hours):
+  1. Have QUICK_REFERENCE.md open for quick lookups
+  2. Refer to UI_AUDIT.md for each component's current styling
+  3. Use COMPONENT_INVENTORY.txt for hierarchy/structure reference
+  4. Follow 5-phase approach from QUICK_REFERENCE.md
+
+For Testing (1-2 hours):
+  1. Use QUICK_REFERENCE.md "Pages to Test" checklist
+  2. Verify responsive design using breakpoint info
+  3. Cross-reference with UI_AUDIT.md for component details
+
+═══════════════════════════════════════════════════════════════════════════
+
+WHAT'S DOCUMENTED
+
+✓ All 150+ CSS classes catalogued with:
+  - Current CSS styling
+  - Current visual appearance
+  - Purpose and usage
+  - Which Polymarket component it maps to
+
+✓ All 20+ component builder functions documented with:
+  - Function name and purpose
+  - HTML return structure
+  - CSS classes used
+  - Location in app.py
+
+✓ All 4-5 page layouts documented with:
+  - Layout name and location
+  - Component hierarchy
+  - Key elements
+  - Current styling status
+
+✓ All form components documented:
+  - Input types (date, text, number, dropdown)
+  - Textarea styling
+  - Date range picker
+  - Dropdown with 40+ Dash CSS overrides
+
+✓ All modal dialogs documented:
+  - add-wallet-modal (dbc.Modal)
+  - push-preview-modal (dbc.Modal)
+  - revert-preview-modal (dbc.Modal)
+
+✓ All DBC and DCC components listed:
+  - 6 dbc component types used
+  - 10+ dcc component types used
+  - Current styling and CSS classes
+
+✓ Responsive design details:
+  - 2 media query breakpoints (1100px, 720px)
+  - Layout changes at each breakpoint
+  - Component sizing changes
+
+✓ Implementation roadmap:
+  - 5 phases of work
+  - 4-7 hours total time estimate
+  - Detailed checklist for each phase
+
+═══════════════════════════════════════════════════════════════════════════
+
+QUICK NAVIGATION
+
+Looking for...                          See document...
+───────────────────────────────────────────────────────────────────────────
+Overview of the project                AUDIT_README.md (top section)
+Quick start guide                       QUICK_REFERENCE.md (top)
+Button styling details                  UI_AUDIT.md section 5
+Form input styling                      UI_AUDIT.md section 6
+Table styling                           UI_AUDIT.md section 8
+Modal dialogs info                      UI_AUDIT.md section 17
+Component functions                     UI_AUDIT.md section 15
+Page layouts                            UI_AUDIT.md section 16
+Responsive breakpoints                  COMPONENT_INVENTORY.txt
+Component counts                        COMPONENT_INVENTORY.txt
+Implementation phases                   QUICK_REFERENCE.md
+Pages to test                          QUICK_REFERENCE.md
+What needs changing                     QUICK_REFERENCE.md
+Component hierarchy                     COMPONENT_INVENTORY.txt
+CSS color variables                     UI_AUDIT.md section 1
+High priority items                     QUICK_REFERENCE.md
+Time estimate for work                  QUICK_REFERENCE.md
+
+═══════════════════════════════════════════════════════════════════════════
+
+DOCUMENT STATISTICS
+
+Files Analyzed:
+  • app.py (3,217 lines)
+  • assets/dashboard-ui.css (1,569 lines)
+
+Components Documented:
+  • CSS Classes: 150+
+  • Component Functions: 20+
+  • Page Layouts: 4-5
+  • Modal Dialogs: 3
+  • DBC Components: 6 types
+  • DCC Components: 10+ types
+  • CSS Variables: 13
+
+Audit Output:
+  • Total documents: 4
+  • Total size: 76 KB
+  • Total lines: 1,889
+  • Time to review: 25 minutes (quick) to 2 hours (thorough)
+  • Time to implement: 4-7 hours
+
+═══════════════════════════════════════════════════════════════════════════
+
+KEY FINDINGS
+
+What Needs Polymarket Styling:
+
+HIGH PRIORITY (3-4 hours):
+  ✓ Root CSS variables (13 colors)
+  ✓ Button variants (8 types)
+  ✓ Form inputs (4 types + 40 dropdown overrides)
+  ✓ Status badges (7-12 types)
+  ✓ Table styling (8 classes)
+  ✓ Modal components (dbc overrides)
+  ✓ Top navigation (8 classes)
+
+MEDIUM PRIORITY (1-2 hours):
+  ✓ Card surfaces (15 classes)
+  ✓ Messages/alerts (8 classes)
+  ✓ Collapsibles (8 classes)
+  ✓ History lists (12 classes)
+  ✓ Typography colors (15 classes)
+
+LOW PRIORITY (No changes needed):
+  • Layout structure (grids, flex, spacing)
+  • Responsive breakpoints (structure OK)
+  • Z-index stacking
+  • Column widths
+
+═══════════════════════════════════════════════════════════════════════════
+
+IMPLEMENTATION APPROACH
+
+Phase 1: Setup (5 minutes)
+  - Create Polymarket color mappings
+  - Create CSS variable replacement list
+  - Back up original dashboard-ui.css
+
+Phase 2: Colors (30 minutes)
+  - Update all 13 root CSS variables
+  - Global find-replace for colors
+  - Test color consistency
+
+Phase 3: Components (2-3 hours)
+  - Update buttons (8 variants)
+  - Update form inputs (4 types + dropdown)
+  - Update badges/chips (7-12 types)
+  - Update tables
+  - Update modals
+  - Update cards/surfaces
+
+Phase 4: Polish (1-2 hours)
+  - Update typography colors
+  - Update messages/alerts
+  - Update collapsibles
+  - Test all pages
+
+Phase 5: Testing (1-2 hours)
+  - Visual verification on 5 pages
+  - Responsive design testing
+  - Component interaction testing
+  - Cross-browser testing
+
+═══════════════════════════════════════════════════════════════════════════
+
+PAGES TO TEST
+
+After implementing Polymarket styling, test these pages:
+
+1. Overview Page (overview_layout)
+   - Portfolio overview with chart
+   - Recent changes feed
+   - Daily breakdown table
+   - Range selector buttons
+
+2. Wallet Page (wallet_layout)
+   - Wallet dropdown selector
+   - Per-wallet P&L chart
+   - Position context summary
+   - Stat tiles
+
+3. Wallet Management (wallet_management_layout)
+   - Wallet admin cards
+   - Tier collapsible sections
+   - Action buttons (Add, Export, Push)
+   - Modals (Add, Push, Revert)
+
+4. Subcategory Charts (subcategory_charts_layout)
+   - Category selector
+   - Generated charts
+   - Concentration badges
+   - Top markets table
+
+5. Wallet Curation (wallet_curation_layout)
+   - Wallet navigation
+   - Curation signals
+   - Decision interface
+   - Status display
+
+═══════════════════════════════════════════════════════════════════════════
+
+NEXT STEPS
+
+1. Read AUDIT_README.md for overview (5 minutes)
+2. Read QUICK_REFERENCE.md for scope (10 minutes)
+3. Review COMPONENT_INVENTORY.txt for structure (10 minutes)
+4. Dive into UI_AUDIT.md for specific components (as needed)
+5. Start implementation following 5-phase roadmap
+6. Test using the 5-page checklist
+7. Deploy when ready
+
+═══════════════════════════════════════════════════════════════════════════
+
+FILES IN THIS PROJECT
+
+Source Files:
+  /app.py                           - Main Dash application (3,217 lines)
+  /assets/dashboard-ui.css          - All custom styling (1,569 lines)
+  /assets/                          - Images, icons, fonts
+
+Audit Documents:
+  /AUDIT_INDEX.txt                  - This file (index and navigation)
+  /AUDIT_README.md                  - Overview and guide
+  /UI_AUDIT.md                      - Complete detailed audit
+  /COMPONENT_INVENTORY.txt          - Visual summary with statistics
+  /QUICK_REFERENCE.md               - Quick lookup reference
+
+═══════════════════════════════════════════════════════════════════════════
+
+START HERE
+
+For a quick understanding (25 minutes):
+  1. AUDIT_README.md
+  2. QUICK_REFERENCE.md
+  3. COMPONENT_INVENTORY.txt
+
+For detailed implementation (2+ hours):
+  1. QUICK_REFERENCE.md > Implementation Roadmap
+  2. UI_AUDIT.md > [specific sections]
+  3. COMPONENT_INVENTORY.txt > [reference as needed]
+
+═══════════════════════════════════════════════════════════════════════════
+
+Questions? Issues? Missing information?
+
+Check this index first, then navigate to the appropriate document:
+  • "What's in this component?" → UI_AUDIT.md
+  • "How long will this take?" → QUICK_REFERENCE.md
+  • "Show me the structure" → COMPONENT_INVENTORY.txt
+  • "What am I doing?" → AUDIT_README.md
+
+═══════════════════════════════════════════════════════════════════════════
+
+Audit Complete! Ready for Polymarket Redesign.
+

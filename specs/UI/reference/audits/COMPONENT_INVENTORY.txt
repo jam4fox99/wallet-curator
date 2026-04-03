@@ -1,0 +1,452 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         WALLET CURATOR DASHBOARD - UI COMPONENT INVENTORY SUMMARY             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+PROJECT LOCATION: /Users/jakemilken/Desktop/Manual Library/wallet-curator/
+
+FILE STRUCTURE:
+  ├── app.py                          (3,217 lines - main Dash application)
+  ├── assets/dashboard-ui.css        (1,569 lines - all styling)
+  └── UI_AUDIT.md                    (NEW - complete audit report)
+
+═══════════════════════════════════════════════════════════════════════════════
+                            CSS COLOR TOKENS
+═══════════════════════════════════════════════════════════════════════════════
+
+Current Theme Variables (all need Polymarket mapping):
+  --pm-bg: #15191d                  (page background)
+  --pm-surface: #181d21             (card backgrounds)
+  --pm-surface-alt: #1e2428         (alternative surface)
+  --pm-border: #242b32              (borders)
+  --pm-text: #dee3e7                (main text)
+  --pm-text-secondary: #7b8996      (secondary text)
+  --pm-blue: #0093fd                (primary accent)
+  --pm-green: #3db468               (success/positive)
+  --pm-red: #ff4d4d                 (danger/negative)
+  --pm-purple: #9B51E0              (secondary accent)
+
+═══════════════════════════════════════════════════════════════════════════════
+                         UI COMPONENT BREAKDOWN
+═══════════════════════════════════════════════════════════════════════════════
+
+CATEGORY                          COUNT    STATUS               PRIORITY
+────────────────────────────────────────────────────────────────────────────
+1. Layout Components               20      Color/Style update   MEDIUM
+2. Card & Surface Components       15      Style update        MEDIUM
+3. Typography Components           15      Color update         LOW
+4. Button Components               8       Complete restyle    HIGH
+5. Input & Form Components         10      Complete restyle    HIGH
+6. Badge & Status Components       12      Color update        HIGH
+7. Table Components                8       Style update        HIGH
+8. Messages & Alerts               8       Style update        MEDIUM
+9. Collapsible Components          8       Style update        MEDIUM
+10. History & Change Lists         12      Style update        MEDIUM
+11. Sidebar & Control Components   8       Layout only         LOW
+12. Wallet Management              12      Style update        MEDIUM
+13. Settings Components            6       Style update        MEDIUM
+
+Total Unique CSS Classes:           150+    (all catalogued in audit)
+
+═══════════════════════════════════════════════════════════════════════════════
+                      KEY UI COMPONENT FUNCTIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+LAYOUT BUILDERS (define page structure):
+  • overview_layout()                - Portfolio overview page
+  • wallet_layout()                  - Per-wallet analysis page
+  • wallet_management_layout()       - Wallet management/admin page
+  • subcategory_charts_layout()      - Subcategory analysis page
+  • wallet_curation_layout()         - Curation management page
+
+COMPONENT BUILDERS (reusable UI elements):
+  • _card()                          - Surface card wrapper
+  • _range_buttons()                 - Date range selector
+  • _status_chip()                   - Status indicator badge
+  • _stat_tile()                     - Metric display tile
+  • _metric_chip()                   - Metric badge
+  • _brand()                         - Header logo/branding
+  • _build_recent_changes()          - Recent changes list
+  • _tier_table()                    - Wallet tier table
+  • _render_wallet_row()             - Table row for wallet
+  • _render_management_sections()    - Collapsible tier sections
+  • _render_push_list()              - Push history list
+  • _render_push_detail()            - Push detail view
+  • _pnl_combined_cell()             - P&L cell with subtext
+  • _game_badge()                    - Game emoji display
+  • _daily_breakdown_table()         - Daily holdings table
+
+═══════════════════════════════════════════════════════════════════════════════
+                          MODAL DIALOGS (dbc)
+═══════════════════════════════════════════════════════════════════════════════
+
+  1. add-wallet-modal                - Add wallet to portfolio
+  2. push-preview-modal              - Confirm changes push to VPS
+  3. revert-preview-modal            - Confirm push revert
+  
+  All use dbc.Modal components which currently use DARKLY theme and need
+  CSS overrides for Polymarket styling.
+
+═══════════════════════════════════════════════════════════════════════════════
+                        DCC (DASH CORE) COMPONENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+INPUT ELEMENTS:
+  • dcc.Input()                      - Text/date inputs (needs .pm-date-input)
+  • dcc.Textarea()                   - Multi-line input (needs .pm-textarea)
+  • dcc.Dropdown()                   - Select dropdowns (40+ CSS overrides)
+
+DATA/STATE:
+  • dcc.Store()                      - Client-side storage (no styling)
+  • dcc.Interval()                   - Polling trigger (no styling)
+
+VISUALIZATION:
+  • dcc.Graph()                      - Chart display (external Lightweight Charts)
+  • dcc.Loading()                    - Loading spinner (dbc.Spinner)
+
+UTILITY:
+  • dcc.Location()                   - URL routing (no styling)
+  • dcc.Tabs()                       - Tab navigation (needs .pm-tab styling)
+  • dcc.Download()                   - File download (no styling)
+
+═══════════════════════════════════════════════════════════════════════════════
+                         COMPONENT HIERARCHY TREE
+═══════════════════════════════════════════════════════════════════════════════
+
+.pm-app-shell
+├── .pm-topbar (sticky header)
+│   ├── .pm-brand (logo section)
+│   ├── .pm-header-center (title)
+│   └── .pm-status-bar (status chips)
+├── .pm-tab-rail (navigation tabs)
+├── .pm-main-shell
+│   └── .pm-main-column (max-width 1540px)
+│       └── .pm-page-stack (content container)
+│           ├── Page-specific layouts
+│           │   ├── .pm-overview-grid
+│           │   ├── .pm-wallet-grid
+│           │   ├── .pm-changes-grid
+│           │   └── .pm-settings-grid
+│           └── Card sections
+│               ├── .pm-surface (base card)
+│               ├── .pm-overview-hero
+│               ├── .pm-wallet-hero
+│               ├── .pm-side-rail
+│               └── .pm-admin-card
+
+═══════════════════════════════════════════════════════════════════════════════
+                         TABLE STRUCTURE DETAILS
+═══════════════════════════════════════════════════════════════════════════════
+
+TIER TABLE (.pm-tier-table):
+  ├── Column header (.pm-tier-table__th) with sort indicators
+  ├── Table rows (.pm-tier-table__row)
+  │   └── Table cells (.pm-tier-table__cell)
+  ├── Special cells:
+  │   ├── .pm-wallet-copyable (wallet address - clickable)
+  │   ├── .pm-pnl-combined (P&L with subtext)
+  │   ├── .pm-num (numeric alignment)
+  │   └── .pm-game-badge (emoji)
+  └── Font: JetBrains Mono, 13px
+  
+DAILY BREAKDOWN TABLE:
+  ├── Container: .pm-daily-table-shell
+  ├── Max-height: 760px (scrollable)
+  ├── Dash DataTable with custom CSS
+  └── 12 column types defined
+
+═══════════════════════════════════════════════════════════════════════════════
+                         RESPONSIVE BREAKPOINTS
+═══════════════════════════════════════════════════════════════════════════════
+
+Mobile-first approach with breakpoints:
+
+1100px breakpoint (large → medium):
+  • Topbar: 3-column → 1-column layout
+  • Status bar: right → left alignment
+  • Grids: 2-column → 1-column collapse
+  • Overview grid: auto-rows 460px → auto
+
+720px breakpoint (medium → small):
+  • Card headers: stack vertically
+  • Metric value: 56px → 42px font size
+  • Action rows: 2-column → 1-column
+  • Settings rows: 3-column → 1-column
+  • All padding/gaps reduce proportionally
+
+═══════════════════════════════════════════════════════════════════════════════
+                      BUTTON VARIANTS (8 types)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. .pm-button.pm-button--primary
+   - Blue→Purple gradient
+   - White text
+   - 46px height, full styling
+
+2. .pm-button.pm-button--secondary
+   - Transparent + border
+   - 46px height
+
+3. .pm-button.pm-button--danger
+   - Red styling
+   - 46px height
+
+4. .pm-button.pm-button--inline
+   - Compact: 38px height
+   - Sub-variants:
+     └─ .pm-button--remove (red)
+     └─ .pm-button--promote (green)
+     └─ .pm-button--demote (orange)
+
+5. .pm-range-pill / .pm-range-pill--active
+   - Date range selector
+   - 34px height, 12px padding
+   - Active state: blue background
+
+6. .pm-range-pill-group (container)
+
+═══════════════════════════════════════════════════════════════════════════════
+                      FORM INPUT STYLING (10 types)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. .pm-date-input
+   - Width: 130px, Height: 42px
+   - Transparent background
+   - Custom webkit picker styling
+
+2. .pm-textarea
+   - Full width
+   - 14px 16px padding
+   - 14px border-radius
+   - Multi-line with vertical resize
+
+3. .pm-settings-input (number)
+   - Width: 100px, Height: 42px
+   - Right-aligned text
+   - Tabular numerals
+
+4. .pm-wallet-dropdown (40+ CSS overrides)
+   - Min-height: 52px
+   - 14px border-radius
+   - Menu styling
+   - Option hover states
+   - Extensive Dash-specific overrides for Select components
+
+5. .pm-date-range (container)
+   - Flex layout with start/end inputs
+   - Arrow separator
+
+═══════════════════════════════════════════════════════════════════════════════
+                      BADGE & CHIP COMPONENTS (12)
+═══════════════════════════════════════════════════════════════════════════════
+
+STATUS CHIPS:
+  1. .pm-status-chip (base)
+  2. .pm-status-chip--success (green)
+  3. .pm-status-chip--info (blue)
+  4. .pm-status-chip--danger (red)
+
+CHANGE BADGES:
+  5. .pm-change-badge--positive (green)
+  6. .pm-change-badge--negative (red)
+
+HISTORY STATUS:
+  7. .pm-history-status--pending (blue)
+  8. .pm-history-status--applied (green)
+  9. .pm-history-status--reverted (yellow)
+
+METRIC CHIPS:
+  10. .pm-metric-chip (base)
+  11. .pm-metric-chip--positive (green value)
+  12. .pm-metric-chip--negative (red value)
+
+SUMMARY PILLS:
+  13. .pm-summary-strip span (pill badges)
+  14. .pm-settings-row__count-pill
+
+═══════════════════════════════════════════════════════════════════════════════
+                     EMPTY STATES & MESSAGES
+═══════════════════════════════════════════════════════════════════════════════
+
+EMPTY STATE:
+  .pm-empty-state (container)
+    ├── .pm-empty-state__title (14px, bold)
+    └── .pm-empty-state__copy (13px, secondary color)
+  - Dashed border, subtle background
+  - Used for "no data" states
+
+INLINE MESSAGES:
+  .pm-inline-message (container)
+    └── .alert (dbc.Alert styling)
+  - Border-radius: 14px
+  - Semi-transparent background
+
+READ-ONLY ALERT:
+  .pm-readonly-alert
+  - Same as inline message
+  - Secondary text color
+
+═══════════════════════════════════════════════════════════════════════════════
+                   COLLAPSIBLE & DETAILS COMPONENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+TIER COLLAPSIBLE:
+  <details class="pm-tier-collapsible">
+    <summary class="pm-tier-summary">
+      <div class="pm-tier-header-inner">
+        <span class="pm-tier-label-text">Label ▾/▸</span>
+        <span class="pm-tier-meta-inline">Meta info</span>
+      </div>
+    </summary>
+    Content here
+  </details>
+
+GENERIC COLLAPSIBLE:
+  <details class="pm-collapsible-section">
+    <summary>
+      <div class="pm-collapsible-header-inner">
+        <span class="pm-collapsible-label">Label</span>
+        <span class="pm-collapsible-meta">Meta</span>
+      </div>
+    </summary>
+    Content here
+  </details>
+
+═══════════════════════════════════════════════════════════════════════════════
+                      HISTORY & CHANGE LIST ITEMS
+═══════════════════════════════════════════════════════════════════════════════
+
+CHANGE ROW:
+  .pm-change-row
+    ├── .pm-change-top
+    │   ├── .pm-change-badge (positive/negative)
+    │   └── .pm-change-meta (filter info)
+    └── .pm-change-wallet (wallet address)
+
+HISTORY ROW:
+  .pm-history-row
+    ├── .pm-history-row__top
+    ├── .pm-history-row__header
+    │   ├── .pm-history-row__title
+    │   └── (action button)
+    ├── .pm-history-row__subtitle
+    ├── .pm-history-row__metrics
+    └── .pm-history-row__meta
+
+═══════════════════════════════════════════════════════════════════════════════
+                         WHAT NEEDS POLYMARKET STYLING
+═══════════════════════════════════════════════════════════════════════════════
+
+MUST UPDATE (High Priority):
+  ✓ Root CSS variables (colors)
+  ✓ All button variants (8 types)
+  ✓ All form inputs (4 types + 40 dropdown overrides)
+  ✓ All status badges (7 types)
+  ✓ Table styling (headers, cells, rows)
+  ✓ Modal styling (dbc components)
+  ✓ Top navigation bar
+  ✓ Card/surface backgrounds
+
+SHOULD UPDATE (Medium Priority):
+  ✓ Typography colors
+  ✓ Alert/message styling
+  ✓ Collapsible styling
+  ✓ History list items
+  ✓ Metric chips
+
+NO CHANGES NEEDED (Layout only):
+  ✓ Grid layouts and spacing (structure OK)
+  ✓ Responsive breakpoints (already working)
+  ✓ Flex containers
+  ✓ Column widths
+  ✓ Z-index stacking
+
+═══════════════════════════════════════════════════════════════════════════════
+                         IMPLEMENTATION APPROACH
+═══════════════════════════════════════════════════════════════════════════════
+
+Phase 1 - Update CSS Variables
+  1. Replace all 13 CSS custom properties with Polymarket colors
+  2. Test color consistency across entire app
+  3. Minimal changes to app.py needed
+
+Phase 2 - Update Component Styles
+  1. Buttons (8 variants)
+  2. Form inputs (4 main types + dropdown overrides)
+  3. Badges/status chips (12 types)
+  4. Tables and cells
+
+Phase 3 - Update Complex Overrides
+  1. Dropdown styling (40+ selector overrides)
+  2. Modal/dbc component styling
+  3. Alert and message styling
+
+Phase 4 - Testing
+  1. Visual verification on all pages
+  2. Responsive design check (1100px, 720px breakpoints)
+  3. Component interaction testing
+  4. Cross-browser compatibility
+
+═══════════════════════════════════════════════════════════════════════════════
+                           AUDIT DELIVERABLE
+═══════════════════════════════════════════════════════════════════════════════
+
+Complete audit saved to: UI_AUDIT.md (29 KB)
+
+Contains:
+  ✓ All 150+ CSS classes documented
+  ✓ Current styling for each class
+  ✓ Current appearance description
+  ✓ Purpose and usage for each component
+  ✓ Component builder functions listed
+  ✓ Page layouts documented
+  ✓ Responsive breakpoint details
+  ✓ Polymarket mapping recommendations
+  ✓ Priority levels for each update
+  ✓ Summary of changes needed
+  ✓ Visual component hierarchy
+
+═══════════════════════════════════════════════════════════════════════════════
+                              STATISTICS
+═══════════════════════════════════════════════════════════════════════════════
+
+CSS File:
+  • 1,569 lines total
+  • 150+ custom classes
+  • 13 root CSS variables
+  • 1 media query breakpoint at 1100px
+  • 1 media query breakpoint at 720px
+
+Python File (app.py):
+  • 3,217 lines total
+  • 20+ component builder functions
+  • 4 page layout functions
+  • 3 modal dialogs
+  • 10+ DCC components used
+  • 6 dbc component types used
+
+UI Component Count:
+  • 20 layout components
+  • 15 card/surface variants
+  • 15 typography styles
+  • 8 button variants
+  • 10 input field types
+  • 12 badge/chip types
+  • 8 table-related styles
+  • 8 message/alert styles
+  • 8 collapsible variants
+  • 12 history/list styles
+  • Plus 40+ dropdown CSS overrides
+
+═══════════════════════════════════════════════════════════════════════════════
+
+NEXT STEPS FOR POLYMARKET REDESIGN:
+
+1. Define Polymarket color palette mapping to current CSS variables
+2. Create Polymarket button design specifications
+3. Create Polymarket form/input design specifications
+4. Update dashboard-ui.css with Polymarket styling
+5. Verify all pages and interactions work correctly
+6. Test responsive design at all breakpoints
+7. Consider any Polymarket-specific component patterns to add
+
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,658 +1,4120 @@
 #!/usr/bin/env python3
-"""Wallet Curator — Dash Web UI Dashboard."""
+"""Wallet Curator cloud dashboard."""
 import logging
-import threading
+import os
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Load .env if present (for local dev)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 
 import dash
-from dash import html, dcc, dash_table, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
-import pandas as pd
+from dash import ALL, Input, Output, State, callback, clientside_callback, dash_table, dcc, html, no_update
 
-from lib.db import init_db, get_connection
+try:
+    import dash_auth
+except ModuleNotFoundError:
+    dash_auth = None
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ModuleNotFoundError:
+    BackgroundScheduler = None
+
+from lib.changelog import get_recent_changes
+from lib.charts import get_chart_payload, get_sync_status_summary, get_wallet_options, get_wallet_stats
+from lib.clickhouse_charts import (
+    CURATION_ALL_RANGE,
+    build_wallet_trade_audit_payload_from_base,
+    normalize_curation_range_key,
+)
+from lib.daily_pnl import get_daily_breakdown
+from lib.db import get_connection, init_db
+from lib.pipeline import run_hourly_pipeline
+from lib.push_history import create_push_from_pending_changes, create_revert_push, get_push_detail, list_push_history
+from lib.time_utils import now_utc, parse_db_timestamp
+from lib.wallet_management import (
+    add_wallet_from_csv_line,
+    get_tier_configs,
+    get_wallet_management_snapshot,
+    promote_or_demote_wallet,
+    remove_pending_change,
+    remove_wallet,
+    save_tier_config_changes,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+COLORS = {
+    "background": "#15191d",
+    "card": "#181d21",
+    "card_alt": "#1e2428",
+    "surface_soft": "#15191d",
+    "text": "#dee3e7",
+    "text_strong": "#ffffff",
+    "text_secondary": "#7b8996",
+    "buy": "#359a5e",
+    "positive": "#3db468",
+    "positive_soft": "rgba(61, 180, 104, 0.12)",
+    "positive_muted": "rgba(61, 180, 104, 0.55)",
+    "sell": "#cb3131",
+    "negative": "#ff4d4d",
+    "negative_soft": "rgba(255, 77, 77, 0.14)",
+    "negative_muted": "rgba(255, 77, 77, 0.55)",
+    "warning": "#f59e0b",
+    "warning_soft": "rgba(245, 158, 11, 0.14)",
+    "border": "#242b32",
+    "border_soft": "#1a202b",
+    "button": "#0093fd",
+    "chart_line": "#0093fd",
+    "chart_fill": "rgba(0, 147, 253, 0.12)",
+}
+FONT_FAMILY = '"Inter", "Segoe UI", sans-serif'
+
+
+def _polymarket_chart_layout(fig):
+    """Apply Polymarket-style dark chart layout to a Plotly figure."""
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.08)", zeroline=False, tickprefix="$"),
+        hovermode="x unified",
+        font=dict(family=FONT_FAMILY, color=COLORS["text_secondary"]),
+    )
+READ_ONLY_UI = os.environ.get("READ_ONLY_UI") == "1"
+
+RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
+TABLE_COLUMNS = [
+    {"name": "Hide", "id": "hide"},
+    {"name": "Wallet", "id": "wallet"},
+    {"name": "Filter", "id": "filter"},
+    {"name": "Actual", "id": "actual"},
+    {"name": "Sim #", "id": "sim"},
+    {"name": "Invested", "id": "invested", "type": "numeric"},
+    {"name": "Realized P&L", "id": "realized_pnl", "type": "numeric"},
+    {"name": "Unrealized", "id": "unrealized_pnl", "type": "numeric"},
+    {"name": "Total P&L", "id": "total_pnl", "type": "numeric"},
+    {"name": "Markets In Range", "id": "markets", "type": "numeric"},
+    {"name": "Trades In Range", "id": "trades", "type": "numeric"},
+    {"name": "In CSV", "id": "in_csv"},
+]
 
 app = dash.Dash(
     __name__,
-    external_stylesheets=[dbc.themes.DARKLY],
+    external_stylesheets=[
+        dbc.themes.DARKLY,
+        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap",
+    ],
     suppress_callback_exceptions=True,
 )
-app.title = "Wallet Curator"
+server = app.server
+server.secret_key = os.environ.get("FLASK_SECRET_KEY", "wallet-curator-dashboard")
+app.title = "Wallet Curator Dashboard"
 
-# ─── Custom CSS ────────────────────────────────────────────────
-CUSTOM_CSS = {
-    'fontFamily': 'monospace',
-    'backgroundColor': '#0f0f0f',
-    'minHeight': '100vh',
-    'padding': '20px',
-    'color': '#e5e5e5',
-}
+if dash_auth and os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):
+    dash_auth.BasicAuth(
+        app,
+        {os.environ["DASH_USERNAME"]: os.environ["DASH_PASSWORD"]},
+        public_routes=["/healthz"],
+    )
+elif os.environ.get("DASH_USERNAME") and os.environ.get("DASH_PASSWORD"):
+    logger.warning("dash-auth is not installed; dashboard auth disabled")
+else:
+    logger.warning("DASH_USERNAME/DASH_PASSWORD not set; dashboard auth disabled")
 
-TABLE_STYLE = {
-    'backgroundColor': '#1a1a1a',
-    'color': '#e5e5e5',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-HEADER_STYLE = {
-    'backgroundColor': '#1a1a1a',
-    'color': '#e5e5e5',
-    'fontWeight': 'bold',
-    'border': '1px solid #2a2a2a',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-CELL_STYLE = {
-    'backgroundColor': '#0f0f0f',
-    'color': '#e5e5e5',
-    'border': '1px solid #2a2a2a',
-    'fontFamily': 'monospace',
-    'fontSize': '13px',
-}
-
-SINGLE_COLUMNS = [
-    {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
-    {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
-    {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
-    {'name': 'Filter', 'id': 'filter', 'type': 'text'},
-    {'name': 'Actual', 'id': 'actual', 'type': 'text'},
-    {'name': 'Sim', 'id': 'sim', 'type': 'text'},
-    {'name': 'Invested', 'id': 'invested', 'type': 'numeric'},
-    {'name': 'Realized', 'id': 'realized', 'type': 'numeric'},
-    {'name': 'Open Val', 'id': 'open_val', 'type': 'numeric'},
-    {'name': 'Open P&L', 'id': 'open_pnl', 'type': 'numeric'},
-    {'name': 'Total P&L', 'id': 'total_pnl', 'type': 'numeric'},
-    {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
-    {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
-    {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
-    {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
-]
-PNL_COL_IDS = ['realized', 'open_pnl', 'total_pnl', 'combined']
-GREEN = '#22c55e'
-RED = '#ef4444'
-DEFAULT_PNL_SORT = [{'column_id': 'total_pnl', 'direction': 'desc'}]
+_scheduler_started = False
 
 
-# ─── Layout ────────────────────────────────────────────────────
-def get_snapshot_options():
-    init_db()
-    conn = get_connection()
-    from lib.snapshots import get_all_snapshots
-    snaps = get_all_snapshots(conn)
-    conn.close()
-    options = []
-    for s in snaps:
-        label = f"Snap #{s['snapshot_id']} — {s['description'] or 'no description'}"
-        options.append({'label': label, 'value': s['snapshot_id']})
-    return options
+@server.route("/healthz")
+def healthz():
+    return "ok", 200
 
 
-def get_default_snapshot():
-    opts = get_snapshot_options()
-    return [opts[0]['value']] if opts else []
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started or os.environ.get("DISABLE_SCHEDULER") == "1":
+        return
+    if BackgroundScheduler is None:
+        logger.warning("apscheduler is not installed; hourly scheduler disabled")
+        return
+    scheduler = BackgroundScheduler(daemon=True, timezone="UTC")
+    scheduler.add_job(
+        run_hourly_pipeline,
+        "interval",
+        hours=1,
+        kwargs={"trigger": "scheduled"},
+        id="wallet-curator-hourly-pipeline",
+        replace_existing=True,
+    )
+    scheduler.start()
+    _scheduler_started = True
+    logger.info("Started hourly scheduler")
 
 
-def get_default_pnl_sort():
-    return [dict(item) for item in DEFAULT_PNL_SORT]
+def _card(children, class_name=""):
+    classes = "pm-surface"
+    if class_name:
+        classes = f"{classes} {class_name}"
+    return html.Div(children, className=classes)
 
 
-def get_hidden_button_state(hidden_count, show_hidden):
-    label = f"Show Hidden: {'ON' if show_hidden else 'OFF'} ({hidden_count})"
-    if show_hidden:
-        return label, 'warning', False
-    return label, 'dark', True
+def _range_buttons(prefix):
+    return html.Div(
+        [html.Button(label, id=f"{prefix}-{label}", className="pm-range-pill", n_clicks=0) for label in RANGES],
+        className="pm-range-pill-group",
+    )
 
 
-def build_pnl_columns(snapshot_ids):
-    if len(snapshot_ids) == 1:
-        return list(SINGLE_COLUMNS)
+def _money(value):
+    if value is None:
+        return "-"
+    return f"${value:,.2f}" if value >= 0 else f"-${abs(value):,.2f}"
 
-    columns = [
-        {'name': 'Hidden', 'id': 'hide', 'type': 'text'},
-        {'name': 'Wallet', 'id': 'wallet', 'type': 'text'},
-        {'name': 'Snaps', 'id': 'snaps', 'type': 'text'},
-        {'name': 'Filter', 'id': 'filter', 'type': 'text'},
-        {'name': 'Actual', 'id': 'actual', 'type': 'text'},
-        {'name': 'Sim', 'id': 'sim', 'type': 'text'},
-    ]
-    for sid in sorted(snapshot_ids):
-        columns.append({'name': f'#{sid} Inv', 'id': f's{sid}_inv', 'type': 'numeric'})
-        columns.append({'name': f'#{sid} Real', 'id': f's{sid}_real', 'type': 'numeric'})
-        columns.append({'name': f'#{sid} Total', 'id': f's{sid}_total', 'type': 'numeric'})
-    columns.extend([
-        {'name': 'Combined', 'id': 'combined', 'type': 'numeric'},
-        {'name': 'Markets', 'id': 'markets', 'type': 'numeric'},
-        {'name': 'Trades', 'id': 'trades', 'type': 'numeric'},
-        {'name': 'In CSV', 'id': 'in_csv', 'type': 'text'},
-        {'name': 'Excluded', 'id': 'excluded', 'type': 'numeric'},
+
+def _pnl_cell(value, col_class=""):
+    """Render a P&L value with color."""
+    if value is None:
+        value = 0
+    color = COLORS["positive"] if value > 0 else COLORS["negative"] if value < 0 else COLORS["text"]
+    return html.Td(_money(value), className=f"pm-tier-table__cell pm-num {col_class}".strip(), style={"color": color})
+
+
+def _daily_breakdown_table(rows):
+    """Build an HTML table matching the tier-table design for the daily breakdown."""
+    if not rows:
+        return html.Div("No wallet data for this range.", className="pm-empty-state__copy")
+
+    header = html.Tr([
+        _sortable_th("Hide"),
+        _sortable_th("Wallet"),
+        _sortable_th("Filter"),
+        _sortable_th("Actual"),
+        _sortable_th("Sim #"),
+        _sortable_th("Invested", "number"),
+        _sortable_th("Realized P&L", "number"),
+        _sortable_th("Unrealized", "number"),
+        _sortable_th("Total P&L", "number"),
+        _sortable_th("Markets", "number"),
+        _sortable_th("Trades", "number"),
+        _sortable_th("In CSV"),
     ])
-    return columns
-
-
-def sanitize_sort_by(sort_by, available_columns):
-    col_ids = {c['id'] for c in available_columns}
-    active_sort = sort_by or get_default_pnl_sort()
-    col = active_sort[0].get('column_id')
-
-    if col in col_ids:
-        return active_sort
-    if 'total_pnl' in col_ids:
-        return get_default_pnl_sort()
-    if 'combined' in col_ids:
-        return [{'column_id': 'combined', 'direction': 'desc'}]
-    return []
-
-
-def sort_dataframe(df, sort_by):
-    if df.empty:
-        return df
-
-    active_sort = sort_by or get_default_pnl_sort()
-    if not active_sort:
-        return df
-
-    col = active_sort[0].get('column_id')
-    direction = active_sort[0].get('direction', 'asc')
-    if col not in df.columns:
-        fallback_sort = sanitize_sort_by(active_sort, [{'id': c} for c in df.columns])
-        if not fallback_sort:
-            return df
-        col = fallback_sort[0]['column_id']
-        direction = fallback_sort[0].get('direction', 'asc')
-
-    sorted_df = df.copy()
-    sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce').fillna(sorted_df[col])
-    return sorted_df.sort_values(col, ascending=(direction == 'asc'), na_position='last')
-
-
-app.layout = dbc.Container([
-    dcc.Store(id='refresh-trigger', data=0),
-    dcc.Store(id='hidden-visible', data=False),
-    dcc.Store(id='pnl-sort-state', data=get_default_pnl_sort(), storage_type='session'),
-
-    # Header
-    dbc.Row([
-        dbc.Col(html.H2("Wallet Curator", style={'color': '#e5e5e5', 'margin': '0'}), width=6),
-        dbc.Col(html.Div(id='status-bar', style={'textAlign': 'right', 'color': '#888'}), width=6),
-    ], className='mb-3', align='center'),
-
-    # Navigation
-    dbc.Tabs([
-        dbc.Tab(label="PnL Dashboard", tab_id="tab-pnl"),
-        dbc.Tab(label="Wallet Changes", tab_id="tab-changes"),
-    ], id='tabs', active_tab='tab-pnl', className='mb-3'),
-
-    html.Div(id='tab-content'),
-
-], fluid=True, style=CUSTOM_CSS)
-
-
-def pnl_tab_layout(sort_by=None):
-    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, False)
-    return html.Div([
-        # Action bar
-        dbc.Row([
-            dbc.Col([
-                dbc.Button("Ingest ▶", id='btn-ingest', color='primary', className='me-2', size='sm'),
-                dbc.Button("Refresh 🔄", id='btn-refresh', color='secondary', className='me-2', size='sm'),
-                dbc.Button(hidden_label, id='btn-hidden', color=hidden_color, outline=hidden_outline, size='sm'),
-            ], width=5),
-            dbc.Col([
-                dcc.Dropdown(
-                    id='snapshot-select',
-                    options=get_snapshot_options(),
-                    value=get_default_snapshot(),
-                    multi=True,
-                    placeholder="Select snapshot(s)...",
-                    style={'backgroundColor': '#1a1a1a', 'color': '#000'},
+    colgroup = html.Colgroup([
+        html.Col(className="col-hide"),
+        html.Col(className="col-wallet"),
+        html.Col(className="col-filter"),
+        html.Col(className="col-actual"),
+        html.Col(className="col-sim"),
+        html.Col(className="col-invested"),
+        html.Col(className="col-realized"),
+        html.Col(className="col-unrealized"),
+        html.Col(className="col-total-pnl"),
+        html.Col(className="col-markets-daily"),
+        html.Col(className="col-trades-daily"),
+        html.Col(className="col-in-csv"),
+    ])
+    body_rows = []
+    for row in rows:
+        is_hidden = row.get("hidden", False)
+        hide_label = "Unhide" if is_hidden else "Hide"
+        row_style = {"opacity": "0.5"} if is_hidden else {}
+        wallet_addr = row["wallet_address"]
+        body_rows.append(html.Tr([
+            html.Td(
+                html.Button(
+                    hide_label,
+                    id=_button_id("toggle-hide", wallet=wallet_addr),
+                    className="pm-button pm-button--secondary pm-button--inline",
+                    n_clicks=0,
+                    disabled=READ_ONLY_UI,
                 ),
-            ], width=7),
-        ], className='mb-3'),
+                className="pm-tier-table__cell",
+            ),
+            html.Td(
+                html.Span(wallet_addr, className="pm-wallet-copyable", title="Click to copy",
+                           **{"data-clipboard": wallet_addr}),
+                className="pm-tier-table__cell",
+            ),
+            html.Td(row["filter"], className="pm-tier-table__cell"),
+            html.Td(row["actual"], className="pm-tier-table__cell"),
+            html.Td(row["sim"], className="pm-tier-table__cell pm-num"),
+            _pnl_cell(row["invested"]),
+            _pnl_cell(row["realized_pnl"]),
+            _pnl_cell(row["unrealized_pnl"]),
+            _pnl_cell(row["total_pnl"]),
+            html.Td(str(row["markets"]), className="pm-tier-table__cell pm-num"),
+            html.Td(str(row["trades"]), className="pm-tier-table__cell pm-num"),
+            html.Td(row["in_csv"], className="pm-tier-table__cell pm-num"),
+        ], className="pm-tier-table__row", style=row_style))
 
-        # Summary bar
-        html.Div(id='summary-bar', style={'color': '#888', 'marginBottom': '10px', 'fontSize': '13px'}),
+    return html.Table(
+        [colgroup, html.Thead(header), html.Tbody(body_rows)],
+        className="pm-tier-table",
+    )
 
-        # Notification
-        html.Div(id='notification', style={'marginBottom': '10px'}),
 
-        # Loading wrapper
-        dcc.Loading(
-            id='loading-table',
-            type='default',
-            children=[
-                dash_table.DataTable(
-                    id='pnl-table',
-                    sort_action='custom',
-                    sort_mode='single',
-                    sort_by=sort_by or get_default_pnl_sort(),
-                    style_table={'overflowX': 'auto'},
-                    style_header=HEADER_STYLE,
-                    style_cell=CELL_STYLE,
-                    style_data_conditional=[],
-                    page_size=100,
+def _line_color(value):
+    return COLORS["positive"] if value >= 0 else COLORS["negative"]
+
+
+def _status_chip(text, tone="default"):
+    class_name = "pm-status-chip"
+    if tone != "default":
+        class_name = f"{class_name} pm-status-chip--{tone}"
+    return html.Span(text, className=class_name)
+
+
+def _stat_tile(label, value, tone="default"):
+    class_name = "pm-stat-tile"
+    if tone != "default":
+        class_name = f"{class_name} {class_name}--{tone}"
+    return html.Div(
+        [
+            html.Div(label, className="pm-stat-tile__label"),
+            html.Div(value, className="pm-stat-tile__value"),
+        ],
+        className=class_name,
+    )
+
+
+def _brand():
+    return html.Div(
+        [
+            html.Div([html.Span(), html.Span()], className="pm-brand-mark"),
+            html.Div(
+                [
+                    html.Div("Wallet Curator", className="pm-brand-title"),
+                    html.Div("Cloud Portfolio", className="pm-brand-subtitle"),
+                ],
+                className="pm-brand-copy",
+            ),
+        ],
+        className="pm-brand",
+    )
+
+
+def _chart_mount(container_id):
+    return html.Div(id=container_id, className="lightweight-chart")
+
+
+def _format_chart_range_label(payload, range_key):
+    if not payload or not payload.get("series"):
+        return "Waiting for chart history"
+
+    start_at = parse_db_timestamp(payload.get("start_at"))
+    end_at = parse_db_timestamp(payload.get("end_at"))
+    if not start_at or not end_at:
+        return "Waiting for chart history"
+
+    if range_key == "ALL":
+        return f"All-time performance rebased to zero from {start_at.strftime('%b %d, %Y %H:%M')} UTC"
+
+    return (
+        f"{range_key} performance rebased to zero | {start_at.strftime('%b %d, %H:%M')} UTC "
+        f"to {end_at.strftime('%b %d, %H:%M')} UTC"
+    )
+
+
+def _build_recent_changes(changes):
+    if not changes:
+        return html.Div(
+            [
+                html.Div("No wallet changes yet.", className="pm-empty-state__title"),
+                html.Div(
+                    "The change feed will populate as synced wallets move in or out of the roster.",
+                    className="pm-empty-state__copy",
                 ),
             ],
-        ),
+            className="pm-empty-state",
+        )
+    items = []
+    for row in changes:
+        label = "ADDED" if row["action"] == "ADDED" else "REMOVED"
+        tone = "positive" if row["action"] == "ADDED" else "negative"
+        items.append(
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span(label, className=f"pm-change-badge pm-change-badge--{tone}"),
+                            html.Span(row["game_filter"] or "No filter", className="pm-change-meta"),
+                        ],
+                        className="pm-change-top",
+                    ),
+                    html.Div(row["wallet_address"], className="pm-change-wallet"),
+                ],
+                className="pm-change-row",
+            )
+        )
+    return html.Div(items, className="pm-changes-list")
 
-        # Footnotes
-        html.Div(id='footnotes', style={'color': '#888', 'marginTop': '10px', 'fontSize': '12px'}),
-    ])
+
+def _database_error_layout(message):
+    return dbc.Alert(message, color="danger", className="mb-0")
 
 
-def changes_tab_layout():
-    return html.Div([
-        dbc.Row([
-            dbc.Col([
-                html.H5("CSV Version History", style={'color': '#e5e5e5'}),
-                dcc.Dropdown(
-                    id='csv-version-select',
-                    placeholder="Select a past CSV version...",
-                    style={'backgroundColor': '#1a1a1a', 'color': '#000'},
+def _button_id(button_type, **kwargs):
+    payload = {"type": button_type}
+    payload.update(kwargs)
+    return payload
+
+
+def _wallet_action_button(label, action, wallet, render_token, disabled=False):
+    return html.Button(
+        label,
+        id=_button_id("wallet-action", action=action, wallet=wallet, render_token=render_token),
+        className=f"pm-button pm-button--secondary pm-button--inline pm-button--{action}",
+        n_clicks=0,
+        disabled=disabled,
+    )
+
+
+def _metric_chip(label, value, tone="default"):
+    class_name = "pm-metric-chip"
+    if tone != "default":
+        class_name = f"{class_name} {class_name}--{tone}"
+    return html.Div(
+        [
+            html.Div(label, className="pm-metric-chip__label"),
+            html.Div(value, className="pm-metric-chip__value"),
+        ],
+        className=class_name,
+    )
+
+
+def _pending_change_card(change, removable=False, render_token=None):
+    details = change["details"]
+    wallet = change["wallet_address"]
+    game = details.get("game_filter") or details.get("snapshot", {}).get("game") or "UNKNOWN"
+    snapshot = details.get("snapshot") or {}
+
+    if change["change_type"] == "add":
+        title = f"ADD {wallet}"
+        subtitle = f"Added at {details['to_tier'].replace('_', ' ').title()} ({details['new_copy_pct']}%)"
+    elif change["change_type"] == "remove":
+        title = f"REMOVE {wallet}"
+        subtitle = f"Was in {details['from_tier'].replace('_', ' ').title()} ({details['old_copy_pct']}%)"
+    elif change["change_type"] == "update_tier_config":
+        title = f"TIER CONFIG {wallet}"
+        subtitle = f"{details['tier_name'].replace('_', ' ').title()} {details['old_copy_pct']}% → {details['new_copy_pct']}%"
+    else:
+        direction = "PROMOTE" if change["change_type"] == "promote" else "DEMOTE"
+        subtitle = (
+            f"{details['from_tier'].replace('_', ' ').title()} ({details['old_copy_pct']}%) → "
+            f"{details['to_tier'].replace('_', ' ').title()} ({details['new_copy_pct']}%)"
+        )
+        title = f"{direction} {wallet}"
+
+    metrics = []
+    if snapshot:
+        metrics.append(f"P&L {_money(snapshot.get('total_pnl_at_action', 0.0))}")
+        metrics.append(f"{snapshot.get('unique_markets_at_action', 0)} markets")
+        metrics.append(f"{snapshot.get('days_active_at_action', 0)} days")
+
+    header_children = [
+        html.Div(
+            [
+                html.Span(title, className="pm-history-row__title"),
+                html.Span(game, className="pm-history-row__meta"),
+            ],
+            className="pm-history-row__top",
+        )
+    ]
+    if removable:
+        header_children.append(
+            html.Div(
+                html.Button(
+                    "Remove from push",
+                    id=_button_id("remove-pending-change", change_id=change["id"], render_token=render_token),
+                    className="pm-button pm-button--secondary pm-button--inline pm-button--danger",
+                    n_clicks=0,
+                    disabled=READ_ONLY_UI,
                 ),
-            ], width=6),
-        ], className='mb-3'),
+                className="pm-history-row__actions",
+            )
+        )
 
-        html.Div(id='csv-viewer', className='mb-4'),
+    return html.Div(
+        [
+            html.Div(
+                header_children,
+                className="pm-history-row__header",
+            ),
+            html.Div(subtitle, className="pm-history-row__subtitle"),
+            html.Div(" | ".join(metrics), className="pm-history-row__metrics") if metrics else None,
+        ],
+        className="pm-history-row",
+    )
 
-        html.H5("Full Changelog", style={'color': '#e5e5e5'}),
-        html.Div(id='changelog-content', style={
-            'backgroundColor': '#1a1a1a', 'padding': '15px', 'borderRadius': '8px',
-            'maxHeight': '500px', 'overflowY': 'auto', 'fontSize': '13px',
-        }),
+
+GAME_BADGES = {
+    "CS2": {"icon": "🎯", "label": "CS2", "color": COLORS["warning"], "bg": COLORS["warning_soft"]},
+    "LOL": {"icon": "⚔️", "label": "LOL", "color": "#eab308", "bg": "rgba(234,179,8,0.12)"},
+    "DOTA": {"icon": "🛡️", "label": "DOTA", "color": COLORS["sell"], "bg": COLORS["negative_soft"]},
+    "VALO": {"icon": "💥", "label": "VALO", "color": "#ec4899", "bg": "rgba(236,72,153,0.12)"},
+    "ESPORTS": {"icon": "🎮", "label": "ESPORTS", "color": "#8b5cf6", "bg": "rgba(139,92,246,0.12)"},
+    "UNKNOWN": {"icon": "❓", "label": "?", "color": "#6b7280", "bg": "rgba(107,114,128,0.12)"},
+}
+
+
+def _game_badge(game_code):
+    info = GAME_BADGES.get(game_code, GAME_BADGES["UNKNOWN"])
+    return html.Span(
+        f"{info['icon']}",
+        className="pm-game-badge",
+        title=game_code,
+        style={"color": info["color"], "backgroundColor": info["bg"],
+               "padding": "4px 10px", "borderRadius": "6px", "fontSize": "18px",
+               "border": f"1px solid {info['color']}30"},
+    )
+
+
+def _sparkline_svg(pnl_points, width=120, height=28):
+    """Generate inline SVG sparkline with smooth curves and gradient fill."""
+    if not pnl_points or len(pnl_points) < 2:
+        return html.Div("—", style={"width": f"{width}px", "color": COLORS["text_secondary"], "textAlign": "center"})
+
+    if len(pnl_points) > 40:
+        step = len(pnl_points) // 40
+        pnl_points = pnl_points[::step]
+
+    min_val = min(pnl_points)
+    max_val = max(pnl_points)
+    val_range = max_val - min_val if max_val != min_val else 1
+
+    pts = []
+    for i, val in enumerate(pnl_points):
+        x = (i / (len(pnl_points) - 1)) * width
+        y = 1 + (1 - (val - min_val) / val_range) * (height - 2)
+        pts.append((x, y))
+
+    # Build smooth cubic bezier path
+    path_d = f"M {pts[0][0]:.1f},{pts[0][1]:.1f}"
+    for i in range(1, len(pts)):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        cx = (x0 + x1) / 2
+        path_d += f" C {cx:.1f},{y0:.1f} {cx:.1f},{y1:.1f} {x1:.1f},{y1:.1f}"
+
+    # Fill path: same curve but close at bottom
+    fill_d = path_d + f" L {width:.1f},{height} L 0,{height} Z"
+
+    trending_up = pnl_points[-1] >= pnl_points[0]
+    color = COLORS["positive"] if trending_up else COLORS["negative"]
+    grad_id = f"g{abs(hash(tuple(pnl_points[:5]))) % 99999}"
+
+    svg_str = (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg" style="display:block">'
+        f'<defs><linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
+        f'<stop offset="100%" stop-color="{color}" stop-opacity="0.03"/>'
+        f'</linearGradient></defs>'
+        f'<path d="{fill_d}" fill="url(#{grad_id})"/>'
+        f'<path d="{path_d}" fill="none" stroke="{color}" stroke-width="1.5" '
+        f'stroke-linecap="round" stroke-linejoin="round"/>'
+        f'</svg>'
+    )
+    return html.Div(
+        dash.dcc.Markdown(svg_str, dangerously_allow_html=True),
+        style={"width": f"{width}px", "height": f"{height}px", "lineHeight": "0", "overflow": "hidden"},
+    )
+
+
+def _pnl_combined_cell(total_pnl, since_promo):
+    """Rich P&L cell with all-time + since promo subtitle."""
+    if total_pnl is None:
+        total_pnl = 0
+    if total_pnl == 0:
+        text = "$0.00"
+        color = COLORS["text"]
+    elif total_pnl > 0:
+        text = f"${total_pnl:,.2f}"
+        color = COLORS["positive"]
+    else:
+        text = f"-${abs(total_pnl):,.2f}"
+        color = COLORS["negative"]
+    main = html.Div(text, className="pm-pnl-main", style={"color": color})
+    if since_promo is not None and since_promo != 0:
+        if since_promo > 0:
+            sp_text = f"${since_promo:,.2f}"
+            sp_color = COLORS["positive_muted"]
+        else:
+            sp_text = f"-${abs(since_promo):,.2f}"
+            sp_color = COLORS["negative_muted"]
+        sub = html.Div(f"{sp_text} Since Promo", className="pm-pnl-sub", style={"color": sp_color})
+    elif since_promo == 0:
+        sub = html.Div("$0.00 Since Promo", className="pm-pnl-sub", style={"color": COLORS["text_secondary"]})
+    else:
+        sub = html.Div("")
+    return html.Td([main, sub], className="pm-tier-table__cell pm-pnl-combined")
+
+
+def _sortable_th(label, sort_type="text", sort_dir="none"):
+    props = {"data-sortable": "true", "data-sort-dir": sort_dir}
+    if sort_type == "number":
+        props["data-sort-type"] = "number"
+    class_name = "pm-tier-table__th"
+    if sort_dir == "asc":
+        class_name += " pm-sort-asc"
+    elif sort_dir == "desc":
+        class_name += " pm-sort-desc"
+    return html.Th(label, className=class_name, **props)
+
+
+def _render_wallet_row(wallet, tier_name, render_token):
+    """Render a premium wallet row."""
+    addr = wallet["wallet_address"]
+
+    # Action buttons
+    actions = []
+    if tier_name != "high_conviction":
+        actions.append(_wallet_action_button("▲ Promote", "promote", addr, render_token, disabled=READ_ONLY_UI))
+    if tier_name != "test":
+        actions.append(_wallet_action_button("▼ Demote", "demote", addr, render_token, disabled=READ_ONLY_UI))
+    actions.append(html.Span(style={"width": "4px"}))
+    actions.append(_wallet_action_button("✕ Remove", "remove", addr, render_token, disabled=READ_ONLY_UI))
+
+    return html.Tr([
+        html.Td(
+            html.Span(addr, className="pm-wallet-copyable", title="Click to copy",
+                       **{"data-clipboard": addr}),
+            className="pm-tier-table__cell",
+        ),
+        html.Td(wallet["game_filter"], className="pm-tier-table__cell"),
+        _pnl_combined_cell(wallet["total_pnl"], wallet.get("since_promo_pnl")),
+        html.Td(str(wallet["unique_markets"]), className="pm-tier-table__cell pm-num"),
+        html.Td(str(wallet["days_in_tier"]), className="pm-tier-table__cell pm-num"),
+        html.Td(str(wallet["total_trades"]), className="pm-tier-table__cell pm-num"),
+        html.Td(
+            html.Div(actions, className="pm-action-row-compact"),
+            className="pm-tier-table__cell",
+        ),
+    ], className="pm-tier-table__row")
+
+
+def _tier_table(wallets, tier_name, render_token):
+    header = html.Tr([
+        _sortable_th("Wallet"),
+        _sortable_th("Primary Game"),
+        _sortable_th("All-Time P&L", "number"),
+        _sortable_th("Markets", "number"),
+        _sortable_th("Days In Tier", "number"),
+        _sortable_th("Trades", "number"),
+        html.Th("Actions", className="pm-tier-table__th"),
     ])
+    rows = [
+        _render_wallet_row(w, tier_name, render_token)
+        for w in wallets
+    ]
+    colgroup = html.Colgroup([
+        html.Col(className="col-wallet"),
+        html.Col(className="col-game"),
+        html.Col(className="col-pnl"),
+        html.Col(className="col-markets"),
+        html.Col(className="col-days"),
+        html.Col(className="col-trades"),
+        html.Col(className="col-actions"),
+    ])
+    return html.Table(
+        [colgroup, html.Thead(header), html.Tbody(rows)],
+        className="pm-tier-table",
+    )
 
 
-# ─── Tab switching ─────────────────────────────────────────────
-@callback(Output('tab-content', 'children'), Input('tabs', 'active_tab'), State('pnl-sort-state', 'data'))
-def render_tab(tab, sort_by):
-    if tab == 'tab-pnl':
-        return pnl_tab_layout(sort_by=sort_by)
-    elif tab == 'tab-changes':
-        return changes_tab_layout()
-    return html.Div()
+def _render_removed_section(removed_wallets):
+    header = html.Tr([
+        _sortable_th("Wallet"),
+        _sortable_th("Game"),
+        _sortable_th("Was In Tier"),
+        _sortable_th("P&L At Removal", "number"),
+        _sortable_th("Trades", "number"),
+        _sortable_th("Removed At"),
+    ])
+    rows = []
+    for w in removed_wallets:
+        color = COLORS["positive"] if w["total_pnl"] > 0 else COLORS["negative"] if w["total_pnl"] < 0 else COLORS["text"]
+        rows.append(html.Tr([
+            html.Td(html.Span(f"0x...{w['wallet_address'][-4:]}", title=w["wallet_address"], className="pm-wallet-short"),
+                     className="pm-tier-table__cell"),
+            html.Td(w["game_filter"], className="pm-tier-table__cell"),
+            html.Td((w["from_tier"] or "").replace("_", " ").title(), className="pm-tier-table__cell"),
+            html.Td(f"${w['total_pnl']:,.2f}", style={"color": color}, className="pm-tier-table__cell"),
+            html.Td(str(w["total_trades"]), className="pm-tier-table__cell pm-num"),
+            html.Td(w["removed_at"], className="pm-tier-table__cell"),
+        ], className="pm-tier-table__row"))
+
+    table = html.Table([html.Thead(header), html.Tbody(rows)], className="pm-tier-table") if rows else html.Div("No removed wallets.", className="pm-empty-state__copy")
+
+    return _card([
+        html.Div([
+            html.Div([
+                html.Div("History", className="pm-kicker"),
+                html.H3("Removed", className="pm-section-title"),
+            ], className="pm-card-title-block"),
+            html.Div(f"{len(removed_wallets)} wallets", className="pm-section-side-note"),
+        ], className="pm-card-head pm-card-head--tight"),
+        table,
+    ], class_name="pm-admin-card")
 
 
-# ─── Status bar ────────────────────────────────────────────────
-@callback(Output('status-bar', 'children'), Input('refresh-trigger', 'data'))
-def update_status(_):
-    try:
-        conn = get_connection()
-        trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        res = conn.execute("SELECT resolved, COUNT(*) FROM resolutions GROUP BY resolved").fetchall()
-        res_map = {r[0]: r[1] for r in res}
-        resolved = res_map.get(1, 0) + res_map.get(-1, 0) + res_map.get(2, 0)
-        total = sum(res_map.values())
-        last = conn.execute("SELECT MAX(ingested_at) FROM ingest_registry").fetchone()[0]
-        conn.close()
-        return f"{trades:,} trades | {resolved}/{total} resolved | Last ingest: {last or 'never'}"
-    except Exception:
-        return "No data yet"
+def _render_management_sections(snapshot):
+    render_token = snapshot.get("render_token", "stable")
+    sections = []
+    for tier in snapshot["tiers"]:
+        wallets = tier["wallets"]
+        if wallets:
+            body = _tier_table(wallets, tier["tier_name"], render_token)
+        else:
+            body = html.Div(
+                html.Div("No wallets in this tier.", className="pm-empty-state__copy", style={"marginTop": 0}),
+                className="pm-empty-state pm-tier-empty-state",
+            )
+
+        # Tier header — collapsible
+        tier_id = tier["tier_name"]
+        tier_header = html.Details([
+            html.Summary(
+                html.Div([
+                    html.Span(f"{tier['display_name']} ({tier['copy_percentage']}% copy)", className="pm-tier-label-text"),
+                    html.Span(f"{len(wallets)} wallets", className="pm-tier-meta-inline"),
+                ], className="pm-tier-header-inner"),
+                className="pm-tier-summary",
+            ),
+            body,
+        ], open=True, className="pm-tier-collapsible")
+
+        sections.append(html.Div([tier_header], className="pm-tier-section"))
+
+    removed = snapshot.get("removed_wallets", [])
+    if removed:
+        sections.append(_render_removed_section(removed))
+
+    return sections
 
 
-# ─── PnL table: DATA callback (no sort_by input — breaks the circular loop) ───
-@callback(
-    [Output('pnl-table', 'data'),
-     Output('pnl-table', 'columns'),
-     Output('pnl-table', 'sort_by'),
-     Output('pnl-table', 'style_data_conditional'),
-     Output('summary-bar', 'children'),
-     Output('footnotes', 'children'),
-     Output('btn-hidden', 'children'),
-     Output('btn-hidden', 'color'),
-     Output('btn-hidden', 'outline')],
-    [Input('snapshot-select', 'value'),
-     Input('hidden-visible', 'data'),
-     Input('refresh-trigger', 'data')],
-    State('pnl-sort-state', 'data'),
+def _render_push_list(pushes):
+    if not pushes:
+        return html.Div("No CSV push history yet.", className="pm-empty-state__copy")
+    rows = []
+    for push in pushes:
+        status_label = {
+            "pending": "Pending VPS apply",
+            "applied": "Applied",
+            "reverted": "Reverted by later push",
+        }.get(push["status"], push["status"])
+        change_count = push.get("change_count", "")
+        summary_pills = []
+        if change_count:
+            summary_pills.append(html.Span(f"{change_count} changes"))
+        summary_pills.append(html.Span(status_label))
+        rows.append(
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(f"Push #{push['id']}", className="pm-history-list__title"),
+                            html.Div(push["summary"], className="pm-history-list__summary"),
+                            html.Div(summary_pills, className="pm-summary-strip"),
+                        ],
+                        className="pm-history-list__meta",
+                    ),
+                    html.Button(
+                        "View Details",
+                        id=_button_id("view-push", push_id=push["id"]),
+                        className="pm-button pm-button--secondary pm-button--inline",
+                        n_clicks=0,
+                    ),
+                ],
+                className="pm-history-list__row",
+            )
+        )
+    return html.Div(rows, className="pm-history-list")
+
+
+def _render_push_detail(detail):
+    if not detail:
+        return html.Div("Select a push to inspect its changes and revert options.", className="pm-empty-state__copy")
+
+    change_rows = [_pending_change_card(change) for change in detail["changes"]]
+    pushed_at = parse_db_timestamp(detail["pushed_at"]) if detail["pushed_at"] else None
+    applied_at = parse_db_timestamp(detail["applied_at"]) if detail["applied_at"] else None
+    pushed_label = pushed_at.strftime("%Y-%m-%d %H:%M UTC") if pushed_at else "Unknown"
+    applied_label = applied_at.strftime("%Y-%m-%d %H:%M UTC") if applied_at else "Waiting for VPS"
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(f"Push #{detail['id']}", className="pm-section-title pm-section-title--blue"),
+                            html.Div(f"Pushed {pushed_label}", className="pm-range-copy"),
+                            html.Div(f"Applied {applied_label}", className="pm-range-copy"),
+                        ],
+                        className="pm-card-title-block",
+                    ),
+                    html.Button(
+                        "Revert",
+                        id="btn-open-revert",
+                        className="pm-button pm-button--danger",
+                        n_clicks=0,
+                        disabled=READ_ONLY_UI or detail["status"] == "pending",
+                    ),
+                ],
+                className="pm-card-head pm-card-head--tight",
+            ),
+            html.Div(detail["summary"], className="pm-inline-message"),
+            html.Details(
+                [
+                    html.Summary(
+                        html.Div([
+                            html.Span(f"Changes ({len(detail['changes'])})", className="pm-collapsible-label"),
+                        ], className="pm-collapsible-header-inner"),
+                        className="pm-tier-summary",
+                    ),
+                    html.Div(change_rows, className="pm-history-detail-list", style={"padding": "12px"}),
+                ],
+                open=True,
+                className="pm-collapsible-section",
+            ),
+        ],
+        className="pm-history-detail",
+    )
+
+
+def overview_layout():
+    today = now_utc().date()
+    week_ago = today - timedelta(days=6)
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            html.Div(
+                className="pm-overview-grid",
+                children=[
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Portfolio", className="pm-kicker"),
+                                            html.H2("Overview", className="pm-section-title pm-section-title--blue"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    _range_buttons("overview-range"),
+                                ],
+                                className="pm-card-head",
+                            ),
+                            html.Div("Selected Range P&L", className="pm-metric-label"),
+                            html.Div(id="overview-current-pnl", className="pm-metric-value"),
+                            html.Div(id="overview-range-label", className="pm-range-copy"),
+                            html.Div(_chart_mount("overview-chart-container"), className="pm-chart-shell"),
+                        ],
+                        class_name="pm-overview-hero",
+                    ),
+                    html.Div(
+                        className="pm-side-rail",
+                        children=[
+                            _card(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Workspace", className="pm-kicker"),
+                                            html.H3("Controls & Feed", className="pm-side-title"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Button(
+                                                "Refresh P&L",
+                                                id="btn-refresh",
+                                                className="pm-button pm-button--primary",
+                                                n_clicks=0,
+                                            ),
+                                            html.Button(
+                                                "Show Hidden Wallets",
+                                                id="btn-hidden",
+                                                className="pm-button pm-button--secondary",
+                                                n_clicks=0,
+                                            ),
+                                        ],
+                                        className="pm-action-row",
+                                    ),
+                                    dbc.Alert(
+                                        "Read-only local UI mode is enabled. Refresh P&L and hide/unhide writes are disabled.",
+                                        color="secondary",
+                                        className="pm-readonly-alert",
+                                        style={"display": "block" if READ_ONLY_UI else "none"},
+                                    ),
+                                    html.Div(id="refresh-message", className="pm-inline-message"),
+                                    html.Div("Recent changes", className="pm-side-section-title"),
+                                    html.Div(id="recent-changes"),
+                                ],
+                                class_name="pm-side-card",
+                            )
+                        ],
+                    ),
+                ],
+            ),
+            _card(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Holdings", className="pm-kicker"),
+                                    html.H3("Daily Breakdown", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "Include Wallets Outside Date Range",
+                                        id="btn-outside-range",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Div(
+                                        [
+                                            dcc.Input(
+                                                id="daily-range-start",
+                                                type="date",
+                                                value=week_ago.isoformat(),
+                                                className="pm-date-input",
+                                            ),
+                                            html.Span("\u2192", className="pm-date-range-arrow"),
+                                            dcc.Input(
+                                                id="daily-range-end",
+                                                type="date",
+                                                value=today.isoformat(),
+                                                className="pm-date-input",
+                                            ),
+                                        ],
+                                        className="pm-date-range",
+                                    ),
+                                ],
+                                className="pm-breakdown-controls",
+                            ),
+                        ],
+                        className="pm-card-head pm-card-head--tight",
+                    ),
+                    html.Div(id="daily-totals", className="pm-breakdown-summary"),
+                    html.Details(
+                        [
+                            html.Summary(
+                                html.Div([
+                                    html.Span("Wallet Breakdown Table", className="pm-collapsible-label"),
+                                    html.Span(id="daily-table-count", className="pm-collapsible-meta"),
+                                ], className="pm-collapsible-header-inner"),
+                                className="pm-tier-summary",
+                            ),
+                            html.Div(
+                                id="daily-table",
+                                className="pm-daily-table-shell",
+                            ),
+                        ],
+                        open=True,
+                        className="pm-collapsible-section",
+                    ),
+                ],
+                class_name="pm-breakdown-card",
+            ),
+        ],
+    )
+
+
+def wallet_layout():
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            html.Div(
+                className="pm-wallet-grid",
+                children=[
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Wallets", className="pm-kicker"),
+                                            html.H2("Per-Wallet Performance", className="pm-section-title pm-section-title--blue"),
+                                        ],
+                                        className="pm-card-title-block",
+                                    ),
+                                    _range_buttons("wallet-range"),
+                                ],
+                                className="pm-card-head",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Wallet", className="pm-field-label"),
+                                    html.Div(
+                                        dcc.Dropdown(id="wallet-dropdown", placeholder="Select wallet..."),
+                                        className="pm-wallet-dropdown",
+                                    ),
+                                ],
+                                className="pm-wallet-picker-block",
+                            ),
+                            html.Div("Selected Range P&L", className="pm-metric-label"),
+                            html.Div(id="wallet-current-pnl", className="pm-metric-value pm-metric-value--wallet"),
+                            html.Div(id="wallet-range-label", className="pm-range-copy"),
+                            html.Div(_chart_mount("wallet-chart-container"), className="pm-chart-shell"),
+                        ],
+                        class_name="pm-wallet-hero",
+                    ),
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Wallet Summary", className="pm-kicker"),
+                                    html.H3("Position Context", className="pm-side-title"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(id="wallet-stats"),
+                        ],
+                        class_name="pm-wallet-side",
+                    ),
+                ],
+            )
+        ],
+    )
+
+
+def wallet_management_layout():
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            _card(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Control Plane", className="pm-kicker"),
+                                    html.H2("Wallet Management", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "Add Wallet ➕",
+                                        id="btn-open-add-wallet",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                        disabled=READ_ONLY_UI,
+                                    ),
+                                    html.Button(
+                                        "Export XLSX 📊",
+                                        id="btn-export-xlsx",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Button(
+                                        "Export Wallets 📋",
+                                        id="btn-export-txt",
+                                        className="pm-button pm-button--secondary",
+                                        n_clicks=0,
+                                    ),
+                                    html.Button(
+                                        "Push to VPS 🚀",
+                                        id="btn-open-push",
+                                        className="pm-button pm-button--primary",
+                                        n_clicks=0,
+                                        disabled=READ_ONLY_UI,
+                                    ),
+                                ],
+                                className="pm-action-row",
+                            ),
+                        ],
+                        className="pm-card-head",
+                    ),
+                    dbc.Alert(
+                        "Local read-only UI mode is enabled. Wallet management writes are disabled.",
+                        color="secondary",
+                        className="pm-readonly-alert",
+                        style={"display": "block" if READ_ONLY_UI else "none"},
+                    ),
+                    html.Div(id="wallet-management-flash", className="pm-inline-message"),
+                    html.Div(id="wallet-management-banner"),
+                    html.Div(id="wallet-management-pending"),
+                ],
+                class_name="pm-admin-card",
+            ),
+            html.Div(id="wallet-management-sections", className="pm-page-stack"),
+            dbc.Modal(
+                [
+                    dbc.ModalHeader(dbc.ModalTitle("Add Wallets")),
+                    dbc.ModalBody(
+                        [
+                            html.Div("Paste Sharp CSV lines (one wallet per line)", className="pm-field-label"),
+                            dcc.Textarea(
+                                id="add-wallet-line",
+                                className="pm-textarea pm-textarea--mono",
+                                placeholder="0xabc123...,true,true,true,200,...\n0xdef456...,true,true,true,200,...",
+                                style={"width": "100%", "minHeight": "160px"},
+                            ),
+                            html.Div("Assign tier", className="pm-field-label"),
+                            dcc.Dropdown(
+                                id="add-wallet-tier",
+                                options=[
+                                    {"label": "Test", "value": "test"},
+                                    {"label": "Promoted", "value": "promoted"},
+                                    {"label": "High Conviction", "value": "high_conviction"},
+                                ],
+                                value="test",
+                                clearable=False,
+                                className="pm-wallet-dropdown",
+                            ),
+                            html.Div(id="add-wallet-message", className="pm-inline-message"),
+                        ]
+                    ),
+                    dbc.ModalFooter(
+                        [
+                            html.Button("Cancel", id="btn-cancel-add-wallet", className="pm-button pm-button--secondary", n_clicks=0),
+                            html.Button("Queue Wallets", id="btn-submit-add-wallet", className="pm-button pm-button--primary", n_clicks=0),
+                        ]
+                    ),
+                ],
+                id="add-wallet-modal",
+                is_open=False,
+                size="lg",
+            ),
+            dbc.Modal(
+                [
+                    dbc.ModalHeader(dbc.ModalTitle("Push Changes to VPS")),
+                    dbc.ModalBody(html.Div(id="push-preview-body")),
+                    dbc.ModalFooter(
+                        [
+                            html.Button("Cancel", id="btn-cancel-push", className="pm-button pm-button--secondary", n_clicks=0),
+                            html.Button("Confirm & Push", id="btn-confirm-push", className="pm-button pm-button--primary", n_clicks=0),
+                        ]
+                    ),
+                ],
+                id="push-preview-modal",
+                is_open=False,
+                size="lg",
+            ),
+        ],
+    )
+
+
+def subcategory_charts_layout():
+    RANGE_OPTIONS = [
+        {"label": "1D", "value": 1},
+        {"label": "7D", "value": 7},
+        {"label": "2W", "value": 14},
+        {"label": "30D", "value": 30},
+        {"label": "ALL", "value": 365},
+    ]
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            _card(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Subcategory Charts", className="pm-kicker"),
+                                    html.H2("Wallet Performance by Category", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                        ],
+                        className="pm-card-head",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Wallet Address", className="pm-field-label"),
+                                    dcc.Input(
+                                        id="sc-wallet-input",
+                                        type="text",
+                                        placeholder="0x...",
+                                        className="pm-text-input pm-text-input--mono",
+                                    ),
+                                ],
+                                style={"flex": "2"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Category", className="pm-field-label"),
+                                    dcc.Dropdown(
+                                        id="sc-game-dropdown",
+                                        placeholder="Select category...",
+                                        searchable=True,
+                                        className="pm-wallet-dropdown",
+                                    ),
+                                ],
+                                style={"flex": "1"},
+                            ),
+                        ],
+                        style={"display": "flex", "gap": "16px", "marginBottom": "12px"},
+                    ),
+                    dcc.Store(id="sc-active-range", data=365),
+                    html.Div(
+                        [
+                            html.Button(
+                                opt["label"],
+                                id=f"sc-range-{opt['value']}",
+                                className="pm-range-pill" + (" pm-range-pill--active" if opt["value"] == 365 else ""),
+                                n_clicks=0,
+                            )
+                            for opt in RANGE_OPTIONS
+                        ],
+                        id="sc-range-pills",
+                        style={"display": "flex", "gap": "6px", "marginBottom": "16px"},
+                    ),
+                    html.Button("Generate Chart", id="sc-generate", className="pm-button pm-button--primary", n_clicks=0),
+                    html.Div(id="sc-message", className="pm-inline-message", style={"marginTop": "12px"}),
+                ],
+                class_name="pm-admin-card",
+            ),
+            html.Div(id="sc-summary", style={"marginTop": "16px"}),
+            html.Div(
+                dcc.Graph(id="sc-chart", style={"height": "500px"}, config={"displayModeBar": False}),
+                id="sc-chart-container",
+                style={"display": "none", "marginTop": "16px"},
+            ),
+            html.Div(id="sc-concentration", style={"marginTop": "12px"}),
+            html.Div(id="sc-top-markets", style={"marginTop": "12px"}),
+        ],
+    )
+
+
+_CUR_RANGE_OPTIONS = [
+    {"token": "1D", "label": "1D"},
+    {"token": "7D", "label": "7D"},
+    {"token": "14D", "label": "2W"},
+    {"token": "30D", "label": "30D"},
+    {"token": CURATION_ALL_RANGE, "label": "ALL"},
+]
+_CUR_RANGE_TOKENS = [opt["token"] for opt in _CUR_RANGE_OPTIONS]
+_CUR_RANGE_LABELS = {opt["token"]: opt["label"] for opt in _CUR_RANGE_OPTIONS}
+
+
+def wallet_curation_layout():
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            # Stores
+            dcc.Store(id="cur-wallets", data=[]),
+            dcc.Store(id="cur-index", data=0),
+            dcc.Store(id="cur-approved", data=[]),
+            dcc.Store(id="cur-decisions", data={}),
+            dcc.Store(id="cur-filter", data=""),
+            dcc.Store(id="cur-range", data=CURATION_ALL_RANGE),
+            dcc.Store(id="cur-session-id", data=""),
+            dcc.Store(id="cur-view", data={"status": "idle"}),
+            dcc.Store(id="cur-sim-session-id", data=""),
+            dcc.Store(id="cur-sim-active", data=False),
+            dcc.Store(id="cur-sim-overlay-visible", data=False),
+            dcc.Download(id="cur-trade-audit-download"),
+            dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0, disabled=True),
+
+            # Setup screen
+            html.Div(
+                id="cur-setup",
+                children=[
+                    _card([
+                        html.Div([
+                            html.Div("Wallet Curation", className="pm-kicker"),
+                            html.H2("Swipe Review", className="pm-section-title pm-section-title--blue"),
+                        ], className="pm-card-title-block"),
+                        html.Div(
+                            [
+                                dcc.Upload(
+                                    id="cur-sim-upload",
+                                    children=html.Button("Upload Sharpsim", className="pm-button pm-button--secondary"),
+                                    accept=".xlsx",
+                                ),
+                                html.Button(
+                                    "Switch to manual",
+                                    id="cur-sim-clear",
+                                    className="pm-button pm-button--secondary",
+                                    n_clicks=0,
+                                    style={"display": "none"},
+                                ),
+                            ],
+                            style={"display": "flex", "gap": "12px", "marginBottom": "12px"},
+                        ),
+                        html.Div(id="cur-sim-summary", className="pm-inline-message"),
+                        html.Div(
+                            id="cur-manual-fields",
+                            children=[
+                                html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
+                                dcc.Textarea(
+                                    id="cur-wallet-input",
+                                    className="pm-textarea pm-textarea--mono",
+                                    placeholder="0xabc123...\n0xdef456...\n0x789...",
+                                    style={"minHeight": "120px"},
+                                ),
+                                html.Div([
+                                    html.Div([
+                                        html.Div("Category", className="pm-field-label"),
+                                        dcc.Dropdown(id="cur-category", placeholder="Select category...",
+                                                     searchable=True, className="pm-wallet-dropdown"),
+                                    ], style={"flex": "1"}),
+                                ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                            ],
+                        ),
+                        html.Div(
+                            [
+                                html.Button(
+                                    opt["label"],
+                                    id=f"cur-setup-range-{opt['token']}",
+                                    className="pm-range-pill" + (" pm-range-pill--active" if opt["token"] == CURATION_ALL_RANGE else ""),
+                                    n_clicks=0,
+                                )
+                                for opt in _CUR_RANGE_OPTIONS
+                            ],
+                            className="pm-range-pill-group",
+                            style={"marginBottom": "16px"},
+                        ),
+                        html.Button("Start Review", id="cur-start", className="pm-button pm-button--primary", n_clicks=0),
+                        html.Div(id="cur-setup-msg", style={"marginTop": "8px"}),
+                    ], class_name="pm-admin-card"),
+                ],
+            ),
+
+            # Swipe screen
+            html.Div(
+                id="cur-swipe",
+                style={"display": "none"},
+                children=[
+                    html.Div(id="cur-progress", style={"marginBottom": "12px", "color": "var(--pm-text-secondary)", "fontSize": "13px"}),
+                    html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
+                    html.Div(id="cur-sim-summary-panel", style={"marginBottom": "12px"}),
+                    html.Div(
+                        [
+                            html.Button(
+                                opt["label"],
+                                id=f"cur-swipe-range-{opt['token']}",
+                                className="pm-range-pill" + (" pm-range-pill--active" if opt["token"] == CURATION_ALL_RANGE else ""),
+                                n_clicks=0,
+                            )
+                            for opt in _CUR_RANGE_OPTIONS
+                        ],
+                        className="pm-range-pill-group",
+                        style={"marginBottom": "16px"},
+                    ),
+                    html.Div(
+                        [
+                            html.Div(id="cur-warnings", style={"marginBottom": "12px"}),
+                            html.Div(id="cur-read", style={"marginBottom": "12px"}),
+                            dcc.Graph(id="cur-chart", style={"height": "400px"}, config={"displayModeBar": False}),
+                            html.Div(id="cur-stats"),
+                            html.Div(id="cur-concentration", style={"marginTop": "12px"}),
+                            html.Div(id="cur-top-markets", style={"marginTop": "12px"}),
+                        ]
+                    ),
+                    html.Div([
+                        html.Button("← Back", id="cur-back", className="pm-button pm-button--secondary", n_clicks=0),
+                        html.Button("✗ Skip", id="cur-skip", className="pm-button pm-button--sell", n_clicks=0),
+                        html.Button("✓ Approve", id="cur-approve", className="pm-button pm-button--buy", n_clicks=0),
+                    ], style={"display": "flex", "gap": "12px", "justifyContent": "center", "marginTop": "20px"}),
+                ],
+            ),
+
+            # Results screen
+            html.Div(
+                id="cur-results",
+                style={"display": "none"},
+                children=[
+                    _card([
+                        html.Div([
+                            html.Div("Review Complete", className="pm-kicker"),
+                            html.H2(id="cur-results-title", className="pm-section-title pm-section-title--blue"),
+                        ], className="pm-card-title-block"),
+                        html.Div(id="cur-results-list", style={"marginTop": "12px", "fontFamily": "monospace", "fontSize": "13px"}),
+                        html.Div([
+                            dcc.Download(id="cur-download"),
+                            html.Button("Download Results", id="cur-download-btn",
+                                        className="pm-button pm-button--primary", n_clicks=0),
+                            html.Button("Start New Batch", id="cur-new-batch",
+                                        className="pm-button pm-button--secondary", n_clicks=0),
+                        ], style={"display": "flex", "gap": "12px", "marginTop": "16px"}),
+                    ], class_name="pm-admin-card"),
+                ],
+            ),
+        ],
+    )
+
+
+def settings_layout():
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            _card(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Config", className="pm-kicker"),
+                                    html.H2("Tier Settings", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Button(
+                                "Save Changes",
+                                id="btn-save-tier-settings",
+                                className="pm-button pm-button--primary",
+                                n_clicks=0,
+                                disabled=READ_ONLY_UI,
+                            ),
+                        ],
+                        className="pm-card-head",
+                    ),
+                    dbc.Alert(
+                        "Local read-only UI mode is enabled. Tier config writes are disabled.",
+                        color="secondary",
+                        className="pm-readonly-alert",
+                        style={"display": "block" if READ_ONLY_UI else "none"},
+                    ),
+                    html.Div(id="settings-message", className="pm-inline-message"),
+                    html.Details(
+                        [
+                            html.Summary(
+                                html.Div([
+                                    html.Span("Tier Copy Percentages", className="pm-collapsible-label"),
+                                    html.Span("3 tiers configured", className="pm-collapsible-meta"),
+                                ], className="pm-collapsible-header-inner"),
+                                className="pm-tier-summary",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Test", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-test", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-test", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div("Promoted", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-promoted", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-promoted", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Div("High Conviction", className="pm-settings-row__name"),
+                                            dcc.Input(id="settings-copy-high", type="number", min=0, step=0.1, className="pm-settings-input"),
+                                            html.Div(id="settings-count-high", className="pm-settings-row__count"),
+                                        ],
+                                        className="pm-settings-row",
+                                    ),
+                                ],
+                                className="pm-settings-grid",
+                                style={"padding": "12px"},
+                            ),
+                        ],
+                        open=True,
+                        className="pm-collapsible-section",
+                    ),
+                    html.Div(
+                        "Changing a tier's copy percentage queues per-wallet CSV updates. Use Push to VPS to apply them live.",
+                        className="pm-range-copy",
+                    ),
+                ],
+                class_name="pm-admin-card",
+            )
+        ],
+    )
+
+
+def changes_layout():
+    return html.Div(
+        className="pm-page-stack",
+        children=[
+            html.Div(
+                className="pm-changes-grid",
+                children=[
+                    _card(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("History", className="pm-kicker"),
+                                    html.H2("CSV Change History", className="pm-section-title pm-section-title--blue"),
+                                ],
+                                className="pm-card-title-block",
+                            ),
+                            html.Div(id="changes-list"),
+                        ],
+                        class_name="pm-admin-card",
+                    ),
+                    _card(
+                        [
+                            html.Div(id="changes-detail"),
+                            html.Div(id="changes-message", className="pm-inline-message"),
+                        ],
+                        class_name="pm-admin-card",
+                    ),
+                ],
+            ),
+            dbc.Modal(
+                [
+                    dbc.ModalHeader(dbc.ModalTitle("Revert CSV Push")),
+                    dbc.ModalBody(html.Div(id="revert-preview-body")),
+                    dbc.ModalFooter(
+                        [
+                            html.Button("Cancel", id="btn-cancel-revert", className="pm-button pm-button--secondary", n_clicks=0),
+                            html.Button("Confirm Revert", id="btn-confirm-revert", className="pm-button pm-button--primary", n_clicks=0),
+                        ]
+                    ),
+                ],
+                id="revert-modal",
+                is_open=False,
+                size="lg",
+            ),
+        ],
+    )
+
+
+def serve_layout():
+    return html.Div(
+        className="pm-app-shell",
+        children=[
+            dcc.Location(id="url", refresh=False),
+            dcc.Store(id="refresh-token", data=0),
+            dcc.Store(id="wallet-admin-token", data=0),
+            dcc.Store(id="overview-range", data="ALL"),
+            dcc.Store(id="wallet-range", data="ALL"),
+            dcc.Store(id="show-hidden", data=False),
+            dcc.Store(id="include-outside-range", data=False),
+            dcc.Store(id="selected-push-id"),
+            dcc.Download(id="download-xlsx"),
+            dcc.Download(id="download-txt"),
+            dcc.Store(id="overview-chart-data"),
+            dcc.Store(id="wallet-chart-data"),
+            dcc.Interval(id="status-poll", interval=60_000, n_intervals=0),
+            html.Div(id="overview-chart-signal", style={"display": "none"}),
+            html.Div(id="wallet-chart-signal", style={"display": "none"}),
+            html.Header(
+                className="pm-topbar",
+                children=[
+                    html.Div(
+                        [
+                            _brand(),
+                            html.Div(
+                                [
+                                    html.Div("Live Cloud Portfolio", className="pm-header-title"),
+                                    html.Div(
+                                        "Railway-hosted dashboard with VPS trade sync and live wallet performance.",
+                                        className="pm-header-copy",
+                                    ),
+                                ],
+                                className="pm-header-center",
+                            ),
+                            html.Div(id="status-bar", className="pm-status-bar"),
+                        ],
+                        className="pm-topbar-inner",
+                    )
+                ],
+            ),
+            html.Div(
+                className="pm-tab-rail",
+                children=[
+                    dcc.Tabs(
+                        id="tabs",
+                        value="overview",
+                        parent_className="pm-tabs-parent",
+                        className="pm-tabs-shell",
+                        children=[
+                            dcc.Tab(
+                                label="Wallet Management",
+                                value="wallet-management",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Portfolio Overview",
+                                value="overview",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Per-Wallet Charts",
+                                value="wallets",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Changes",
+                                value="changes",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Wallet Curation",
+                                value="wallet-curation",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Subcategory Charts",
+                                value="subcategory-charts",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                            dcc.Tab(
+                                label="Settings",
+                                value="settings",
+                                className="pm-tab",
+                                selected_className="pm-tab pm-tab--selected",
+                            ),
+                        ],
+                    )
+                ],
+            ),
+            html.Main(
+                className="pm-main-shell",
+                children=[
+                    html.Div(
+                        className="pm-main-column",
+                        children=[
+                            html.Div(id="overview-container", children=overview_layout()),
+                            html.Div(id="wallet-container", children=wallet_layout(), style={"display": "none"}),
+                            html.Div(id="wallet-management-container", children=wallet_management_layout(), style={"display": "none"}),
+                            html.Div(id="wallet-curation-container", children=wallet_curation_layout(), style={"display": "none"}),
+                            html.Div(id="subcategory-charts-container", children=subcategory_charts_layout(), style={"display": "none"}),
+                            html.Div(id="settings-container", children=settings_layout(), style={"display": "none"}),
+                            html.Div(id="changes-container", children=changes_layout(), style={"display": "none"}),
+                        ],
+                    )
+                ],
+            ),
+        ],
+        style={
+            "minHeight": "100vh",
+            "backgroundColor": COLORS["background"],
+            "color": COLORS["text"],
+            "fontFamily": FONT_FAMILY,
+        },
+    )
+
+
+app.layout = serve_layout
+
+
+clientside_callback(
+    """
+    function(payload, activeTab) {
+        if (activeTab !== "overview" || !window.walletCuratorCharts) {
+            return window.dash_clientside.no_update;
+        }
+        window.walletCuratorCharts.renderChart("overview-chart-container", payload);
+        return String(Date.now());
+    }
+    """,
+    Output("overview-chart-signal", "children"),
+    Input("overview-chart-data", "data"),
+    Input("tabs", "value"),
 )
-def update_table(snapshot_ids, show_hidden, _, stored_sort_by):
-    hidden_label, hidden_color, hidden_outline = get_hidden_button_state(0, show_hidden)
-    if not snapshot_ids:
-        return [], [], get_default_pnl_sort(), [], "No snapshots selected", "", hidden_label, hidden_color, hidden_outline
 
-    try:
-        conn = get_connection()
-        from lib.snapshots import get_combined_dataframe, get_all_snapshots
 
-        df = get_combined_dataframe(conn, snapshot_ids, include_hidden=show_hidden)
+clientside_callback(
+    """
+    function(payload, activeTab) {
+        if (activeTab !== "wallets" || !window.walletCuratorCharts) {
+            return window.dash_clientside.no_update;
+        }
+        window.walletCuratorCharts.renderChart("wallet-chart-container", payload);
+        return String(Date.now());
+    }
+    """,
+    Output("wallet-chart-signal", "children"),
+    Input("wallet-chart-data", "data"),
+    Input("tabs", "value"),
+)
 
-        # Force numeric columns to proper numeric types
-        numeric_cols = [c for c in df.columns if c in
-                        ['invested', 'realized', 'open_val', 'open_pnl', 'total_pnl',
-                         'markets', 'trades', 'excluded', 'combined']
-                        or c.endswith('_inv') or c.endswith('_real') or c.endswith('_total')]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Hidden count
-        hidden_count = conn.execute("SELECT COUNT(*) FROM hidden_wallets").fetchone()[0]
-        hidden_label, hidden_color, hidden_outline = get_hidden_button_state(hidden_count, show_hidden)
+TAB_PATHS = {
+    "overview": "/",
+    "wallets": "/wallets",
+    "wallet-management": "/wallet-management",
+    "wallet-curation": "/wallet-curation",
+    "subcategory-charts": "/subcategory-charts",
+    "settings": "/settings",
+    "changes": "/changes",
+}
+PATH_TO_TAB = {v: k for k, v in TAB_PATHS.items()}
 
-        # Summary bar
-        snaps = get_all_snapshots(conn)
-        snap_map = {s['snapshot_id']: s for s in snaps}
-        parts = []
-        for sid in sorted(snapshot_ids):
-            if sid in snap_map:
-                s = snap_map[sid]
-                parts.append(f"Snap #{sid} ({s['new_trades_since_last']:,} trades, {s['description'] or ''})")
-        summary = " + ".join(parts)
-
-        conn.close()
-
-        if df.empty:
-            columns = build_pnl_columns(snapshot_ids)
-            sort_by = sanitize_sort_by(stored_sort_by, columns)
-            return [], columns, sort_by, [], summary, "", hidden_label, hidden_color, hidden_outline
-
-        columns = build_pnl_columns(snapshot_ids)
-        sort_by = sanitize_sort_by(stored_sort_by, columns)
-
-        # Conditional formatting + cell selection fix
-        col_ids = [c['id'] for c in columns]
-        pnl_col_ids = [c for c in col_ids if any(c.endswith(k) for k in ['realized', 'open_pnl', 'total_pnl', 'combined', '_real', '_total'])]
-        style_cond = [
-            {'if': {'state': 'active'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
-            {'if': {'state': 'selected'}, 'backgroundColor': '#2a2a2a', 'color': '#e5e5e5', 'border': '1px solid #444'},
-            {'if': {'filter_query': '{hide} = "Yes"'}, 'backgroundColor': '#141414', 'color': '#999'},
-            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'hide'}, 'color': '#f59e0b', 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{hide} = "Yes"', 'column_id': 'wallet'}, 'textDecoration': 'line-through'},
-            {'if': {'filter_query': '{hide} = "No"', 'column_id': 'hide'}, 'color': '#888'},
-        ]
-        for col_id in pnl_col_ids:
-            style_cond.append({
-                'if': {'filter_query': f'{{{col_id}}} > 0', 'column_id': col_id},
-                'color': GREEN,
-            })
-            style_cond.append({
-                'if': {'filter_query': f'{{{col_id}}} < 0', 'column_id': col_id},
-                'color': RED,
-            })
-
-        # Footnotes
-        footnotes = []
-        if 'excluded' in df.columns:
-            excluded_df = df[df['excluded'] > 0]
-            for _, row in excluded_df.iterrows():
-                footnotes.append(f"* {row['wallet']}: {row['excluded']} positions excluded (missing buy data)")
-
-        df = sort_dataframe(df, sort_by)
-
-        records = df.to_dict('records')
-        fn_text = html.Div([html.Div(f, style={'color': '#888'}) for f in footnotes]) if footnotes else ""
-
-        return records, columns, sort_by, style_cond, summary, fn_text, hidden_label, hidden_color, hidden_outline
-
-    except Exception as e:
-        return [], [], get_default_pnl_sort(), [], f"Error: {e}", "", hidden_label, hidden_color, hidden_outline
+_HIDE = {"display": "none"}
+_SHOW = {"display": "block"}
+_TAB_ORDER = ["overview", "wallets", "wallet-management", "wallet-curation", "subcategory-charts", "settings", "changes"]
+_CONTAINER_IDS = [f"{t.replace('subcategory-charts', 'subcategory-charts')}-container" for t in _TAB_ORDER]
 
 
 @callback(
-    Output('pnl-sort-state', 'data'),
-    Input('pnl-table', 'sort_by'),
+    [
+        Output("overview-container", "style"),
+        Output("wallet-container", "style"),
+        Output("wallet-management-container", "style"),
+        Output("wallet-curation-container", "style"),
+        Output("subcategory-charts-container", "style"),
+        Output("settings-container", "style"),
+        Output("changes-container", "style"),
+    ],
+    Input("tabs", "value"),
+)
+def render_tab(active_tab):
+    return [_SHOW if tab == active_tab else _HIDE for tab in _TAB_ORDER]
+
+
+# Sync URL → tab on page load
+@callback(
+    Output("tabs", "value"),
+    Input("url", "pathname"),
+    prevent_initial_call=False,
+)
+def url_to_tab(pathname):
+    normalized = pathname or "/"
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    return PATH_TO_TAB.get(normalized, "overview")
+
+
+@callback(
+    Output("overview-range", "data"),
+    [Input(f"overview-range-{label}", "n_clicks") for label in RANGES],
+    State("overview-range", "data"),
     prevent_initial_call=True,
 )
-def persist_table_sort(sort_by):
-    return sort_by or get_default_pnl_sort()
+def set_overview_range(*args):
+    current = args[-1]
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return current
+    return triggered.split("-")[-1]
 
 
-# ─── PnL table: SORT callback (separate — no circular loop) ───────────────────
 @callback(
-    Output('pnl-table', 'data', allow_duplicate=True),
-    Input('pnl-table', 'sort_by'),
-    State('pnl-table', 'data'),
+    Output("wallet-range", "data"),
+    [Input(f"wallet-range-{label}", "n_clicks") for label in RANGES],
+    State("wallet-range", "data"),
     prevent_initial_call=True,
 )
-def sort_table(sort_by, current_data):
-    if not sort_by or not current_data:
-        return no_update
-    df = pd.DataFrame(current_data)
-    return sort_dataframe(df, sort_by).to_dict('records')
+def set_wallet_range(*args):
+    current = args[-1]
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return current
+    return triggered.split("-")[-1]
 
 
-# ─── Ingest button ─────────────────────────────────────────────
 @callback(
-    [Output('notification', 'children'),
-     Output('refresh-trigger', 'data', allow_duplicate=True),
-     Output('snapshot-select', 'options', allow_duplicate=True),
-     Output('snapshot-select', 'value', allow_duplicate=True)],
-    Input('btn-ingest', 'n_clicks'),
+    [Output(f"overview-range-{label}", "className") for label in RANGES],
+    Input("overview-range", "data"),
+)
+def style_overview_range_buttons(active_range):
+    return [
+        "pm-range-pill pm-range-pill--active" if label == active_range else "pm-range-pill"
+        for label in RANGES
+    ]
+
+
+@callback(
+    [Output(f"wallet-range-{label}", "className") for label in RANGES],
+    Input("wallet-range", "data"),
+)
+def style_wallet_range_buttons(active_range):
+    return [
+        "pm-range-pill pm-range-pill--active" if label == active_range else "pm-range-pill"
+        for label in RANGES
+    ]
+
+
+@callback(
+    Output("show-hidden", "data"),
+    Input("btn-hidden", "n_clicks"),
+    State("show-hidden", "data"),
     prevent_initial_call=True,
 )
-def run_ingest(n_clicks):
-    if not n_clicks:
-        return no_update, no_update, no_update, no_update
-
-    try:
-        conn = get_connection()
-
-        # Run ingest pipeline
-        from lib.ingest_sharp import run as ingest_run
-        from lib.db import rebuild_positions, ensure_resolution_entries
-        from lib.resolver import check_resolutions
-        from lib.pricing import fetch_prices
-        from lib.pnl import compute_wallet_pnl
-        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
-        from lib.changelog import detect_changes
-
-        excluded = ingest_run()
-        if excluded is None:
-            excluded = {}
-
-        conn = get_connection()
-        ensure_resolution_entries(conn)
-        resolved = check_resolutions(conn)
-        prices = fetch_prices(conn)
-        compute_wallet_pnl(conn, excluded, current_prices=prices)
-
-        new_trades = conn.execute("SELECT SUM(new_trades) FROM ingest_registry").fetchone()[0] or 0
-        snap_id = maybe_create_snapshot(conn, new_trade_count=new_trades)
-        save_csv_if_changed(conn)
-        detect_changes(conn)
-        conn.close()
-
-        msg = dbc.Alert(f"Ingest complete. {resolved} tokens resolved. Snapshot #{snap_id} updated.",
-                        color='success', duration=5000)
-        opts = get_snapshot_options()
-        default = [opts[0]['value']] if opts else []
-        return msg, dash.callback_context.triggered[0]['prop_id'], opts, default
-
-    except Exception as e:
-        return dbc.Alert(f"Ingest failed: {e}", color='danger', duration=8000), no_update, no_update, no_update
-
-
-# ─── Refresh button ────────────────────────────────────────────
-@callback(
-    [Output('notification', 'children', allow_duplicate=True),
-     Output('refresh-trigger', 'data', allow_duplicate=True)],
-    Input('btn-refresh', 'n_clicks'),
-    prevent_initial_call=True,
-)
-def run_refresh(n_clicks):
-    if not n_clicks:
-        return no_update, no_update
-
-    try:
-        conn = get_connection()
-        from lib.db import ensure_resolution_entries
-        from lib.resolver import check_resolutions
-        from lib.pricing import fetch_prices
-        from lib.pnl import compute_wallet_pnl
-        from lib.snapshots import maybe_create_snapshot
-
-        ensure_resolution_entries(conn)
-        resolved = check_resolutions(conn)
-        prices = fetch_prices(conn)
-        compute_wallet_pnl(conn, current_prices=prices)
-        maybe_create_snapshot(conn)
-        conn.close()
-
-        msg = dbc.Alert(f"Refresh complete. {resolved} tokens resolved. Prices updated.",
-                        color='info', duration=5000)
-        return msg, dash.callback_context.triggered[0]['prop_id']
-
-    except Exception as e:
-        return dbc.Alert(f"Refresh failed: {e}", color='danger', duration=8000), no_update
-
-
-# ─── Hide/Show toggle ──────────────────────────────────────────
-@callback(
-    Output('hidden-visible', 'data'),
-    Input('btn-hidden', 'n_clicks'),
-    State('hidden-visible', 'data'),
-    prevent_initial_call=True,
-)
-def toggle_hidden(n_clicks, current):
-    if not n_clicks:
-        return no_update
+def toggle_hidden(_, current):
     return not current
 
 
-# ─── Hide wallet (via 👁 column click) ─────────────────────────
 @callback(
-    Output('refresh-trigger', 'data', allow_duplicate=True),
-    Input('pnl-table', 'active_cell'),
-    State('pnl-table', 'data'),
+    Output("include-outside-range", "data"),
+    Input("btn-outside-range", "n_clicks"),
+    State("include-outside-range", "data"),
     prevent_initial_call=True,
 )
-def handle_cell_click(active_cell, data):
-    if not active_cell or not data:
-        return no_update
+def toggle_outside_range(_, current):
+    return not current
 
-    col = active_cell['column_id']
-    if col != 'hide':
-        return no_update
 
-    row = data[active_cell['row']]
-    wallet = row.get('wallet', '')
-    if not wallet.startswith('0x'):
+@callback(
+    [
+        Output("status-bar", "children"),
+        Output("overview-chart-data", "data"),
+        Output("overview-current-pnl", "children"),
+        Output("overview-current-pnl", "style"),
+        Output("overview-range-label", "children"),
+        Output("recent-changes", "children"),
+    ],
+    [Input("refresh-token", "data"), Input("overview-range", "data"), Input("status-poll", "n_intervals")],
+)
+def update_overview(_, range_key, __):
+    try:
+        conn = get_connection()
+        summary = get_sync_status_summary(conn)
+        payload = get_chart_payload(conn, wallet=None, range_key=range_key)
+        sync = summary["sync"]
+        latest = payload["current_delta_pnl"]
+        status_chips = []
+        if sync:
+            last_sync_at = parse_db_timestamp(sync["last_sync_at"])
+            last_sync = last_sync_at.strftime("%Y-%m-%d %H:%M UTC") if last_sync_at else "Unknown"
+            status_chips.extend(
+                [
+                    _status_chip(f"Sync source {sync['current_version_folder'] or 'unknown'}"),
+                    _status_chip(f"Last sync {last_sync}"),
+                    _status_chip(f"{summary['total_trades']:,} trades"),
+                ]
+            )
+        else:
+            status_chips.extend(
+                [
+                    _status_chip("Waiting for first VPS sync", tone="warning"),
+                    _status_chip(f"{summary['total_trades']:,} trades"),
+                ]
+            )
+        if READ_ONLY_UI:
+            status_chips.append(_status_chip("Local read-only", tone="info"))
+        latest_pipeline = summary["latest_pipeline"]
+        if latest_pipeline and latest_pipeline["error"]:
+            status_chips.append(_status_chip(f"Pipeline warning {latest_pipeline['error']}", tone="danger"))
+        elif latest_pipeline:
+            status_chips.append(_status_chip("Pipeline healthy", tone="success"))
+        changes = _build_recent_changes(get_recent_changes(conn, limit=8))
+        conn.close()
+        return (
+            html.Div(status_chips, className="pm-status-chip-row"),
+            payload,
+            _money(latest),
+            {"color": _line_color(latest)},
+            _format_chart_range_label(payload, range_key),
+            changes,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load overview")
+        return (
+            html.Div(
+                [_status_chip("Database unavailable", tone="danger"), html.Span(str(exc), className="pm-status-error")],
+                className="pm-status-chip-row",
+            ),
+            None,
+            "Database unavailable",
+            {"color": COLORS["negative"]},
+            "",
+            _database_error_layout(str(exc)),
+        )
+
+
+@callback(
+    [
+        Output("daily-table", "children"),
+        Output("daily-table-count", "children"),
+        Output("daily-totals", "children"),
+        Output("btn-hidden", "children"),
+        Output("btn-outside-range", "children"),
+    ],
+    [
+        Input("daily-range-start", "value"),
+        Input("daily-range-end", "value"),
+        Input("show-hidden", "data"),
+        Input("include-outside-range", "data"),
+        Input("refresh-token", "data"),
+    ],
+)
+def update_daily_table(start_date, end_date, show_hidden, include_outside_range, _):
+    try:
+        conn = get_connection()
+        breakdown = get_daily_breakdown(
+            conn,
+            start_date,
+            end_date,
+            include_hidden=show_hidden,
+            include_outside_range=include_outside_range,
+        )
+        conn.close()
+        table = _daily_breakdown_table(breakdown["rows"])
+        count_label = f"{len(breakdown['rows'])} wallets"
+        roster_label = "Outside-range wallets included" if include_outside_range else "In-range wallets only"
+        totals_text = html.Div(
+            [
+                html.Span(f"Date range {start_date} to {end_date} UTC"),
+                html.Span(f"Showing {len(breakdown['rows'])} wallets"),
+                html.Span(roster_label),
+                html.Span(f"Invested {_money(breakdown['totals']['invested'])}"),
+                html.Span(f"Realized {_money(breakdown['totals']['realized'])}"),
+                html.Span(f"Unrealized {_money(breakdown['totals']['unrealized'])}"),
+                html.Span(f"Table total {_money(breakdown['totals']['total'])}"),
+                html.Span(f"True total incl. hidden {_money(breakdown['true_totals']['total'])}"),
+                html.Span("Trades and markets columns are range-scoped"),
+            ],
+            className="pm-summary-strip",
+        )
+        button_label = "Hide Hidden Wallets" if show_hidden else "Show Hidden Wallets"
+        range_button_label = (
+            "Hide Wallets Outside Date Range"
+            if include_outside_range
+            else "Include Wallets Outside Date Range"
+        )
+        return table, count_label, totals_text, button_label, range_button_label
+    except Exception as exc:
+        logger.exception("Failed to load daily table")
+        return (
+            html.Div(f"Daily table unavailable: {exc}", className="pm-empty-state__copy"),
+            "",
+            html.Div(f"Daily table unavailable: {exc}"),
+            "Show Hidden Wallets",
+            "Include Wallets Outside Date Range",
+        )
+
+
+@callback(
+    [
+        Output("wallet-management-banner", "children"),
+        Output("wallet-management-pending", "children"),
+        Output("wallet-management-sections", "children"),
+        Output("btn-open-push", "children"),
+    ],
+    [Input("wallet-admin-token", "data"), Input("refresh-token", "data"), Input("status-poll", "n_intervals")],
+)
+def update_wallet_management_view(_, __, ___):
+    try:
+        conn = get_connection()
+        snapshot = get_wallet_management_snapshot(conn, bootstrap=not READ_ONLY_UI)
+        conn.close()
+        logger.info(
+            "Wallet management snapshot rendered: test=%d promoted=%d high_conviction=%d pending=%d",
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "test"), 0),
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "promoted"), 0),
+            next((len(tier["wallets"]) for tier in snapshot["tiers"] if tier["tier_name"] == "high_conviction"), 0),
+            snapshot["pending_count"],
+        )
+        banner = None
+        if snapshot["bootstrap_count"]:
+            banner = dbc.Alert(
+                "All existing wallets have been assigned to Test tier. Review and promote as needed.",
+                color="info",
+            )
+        pending_bits = [html.Span(f"{snapshot['pending_count']} queued local changes")]
+        if snapshot["pending_push"]:
+            pushed_at = parse_db_timestamp(snapshot["pending_push"]["pushed_at"])
+            pushed_label = pushed_at.strftime("%Y-%m-%d %H:%M UTC") if pushed_at else "Unknown"
+            pending_bits.append(html.Span(f"Pending push #{snapshot['pending_push']['id']} since {pushed_label}"))
+        pending = html.Div(pending_bits, className="pm-summary-strip")
+        push_label = f"Push to VPS 🚀 ({snapshot['pending_count']})" if snapshot["pending_count"] else "Push to VPS 🚀"
+        return banner, pending, _render_management_sections(snapshot), push_label
+    except Exception as exc:
+        logger.exception("Failed to load wallet management")
+        return (
+            _database_error_layout(str(exc)),
+            html.Div("Wallet management data unavailable.", className="pm-empty-state__copy"),
+            [],
+            "Push to VPS 🚀",
+        )
+
+
+@callback(
+    [Output("wallet-management-flash", "children"), Output("wallet-admin-token", "data")],
+    Input(_button_id("wallet-action", action=ALL, wallet=ALL, render_token=ALL), "n_clicks"),
+    State("wallet-admin-token", "data"),
+    prevent_initial_call=True,
+)
+def handle_wallet_management_actions(clicks, wallet_admin_token):
+    # clicks is a list of n_clicks for ALL matched buttons.
+    # On rerender, all values are 0 (no real click). any() catches this.
+    if not any(clicks):
+        return no_update, no_update
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Wallet management writes are disabled in local read-only mode.", color="secondary"), no_update
+
+    wallet = triggered["wallet"]
+    action = triggered["action"]
+    try:
+        conn = get_connection()
+        if action == "promote":
+            result = promote_or_demote_wallet(conn, wallet, "up")
+            message = dbc.Alert(
+                f"Queued promotion for {wallet} to {result['to_tier'].replace('_', ' ').title()} ({result['new_copy_pct']}%).",
+                color="success",
+            )
+        elif action == "demote":
+            result = promote_or_demote_wallet(conn, wallet, "down")
+            message = dbc.Alert(
+                f"Queued demotion for {wallet} to {result['to_tier'].replace('_', ' ').title()} ({result['new_copy_pct']}%).",
+                color="warning",
+            )
+        elif action == "remove":
+            remove_wallet(conn, wallet)
+            message = dbc.Alert(f"Queued removal for {wallet}.", color="danger")
+        else:
+            message = dbc.Alert(f"Unsupported wallet action: {action}", color="danger")
+        conn.close()
+        return message, wallet_admin_token + 1
+    except Exception as exc:
+        logger.exception("Wallet management action failed")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    [Output("wallet-management-flash", "children", allow_duplicate=True), Output("wallet-admin-token", "data", allow_duplicate=True)],
+    Input(_button_id("remove-pending-change", change_id=ALL, render_token=ALL), "n_clicks"),
+    State("wallet-admin-token", "data"),
+    prevent_initial_call=True,
+)
+def handle_remove_pending_change(clicks, wallet_admin_token):
+    if not any(clicks):
+        return no_update, no_update
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Queued change removal is disabled in local read-only mode.", color="secondary"), no_update
+
+    try:
+        conn = get_connection()
+        result = remove_pending_change(conn, triggered["change_id"])
+        conn.close()
+        removed = result["removed_change"]
+        action_labels = {
+            "add": "add",
+            "remove": "removal",
+            "promote": "promotion",
+            "demote": "demotion",
+            "update_tier_config": "tier config update",
+        }
+        label = action_labels.get(removed["change_type"], removed["change_type"])
+        wallet = removed["wallet_address"]
+        return (
+            dbc.Alert(
+                f"Removed queued {label} for {wallet}. {result['remaining_count']} changes remain in the next push.",
+                color="info",
+            ),
+            wallet_admin_token + 1,
+        )
+    except Exception as exc:
+        logger.exception("Failed to remove queued change")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    [
+        Output("add-wallet-modal", "is_open"),
+        Output("add-wallet-message", "children"),
+        Output("add-wallet-line", "value"),
+        Output("wallet-admin-token", "data", allow_duplicate=True),
+    ],
+    [
+        Input("btn-open-add-wallet", "n_clicks"),
+        Input("btn-cancel-add-wallet", "n_clicks"),
+        Input("btn-submit-add-wallet", "n_clicks"),
+    ],
+    [
+        State("add-wallet-modal", "is_open"),
+        State("add-wallet-line", "value"),
+        State("add-wallet-tier", "value"),
+        State("wallet-admin-token", "data"),
+    ],
+    prevent_initial_call=True,
+)
+def handle_add_wallet_modal(_, __, submit_clicks, is_open, raw_lines, tier_name, wallet_admin_token):
+    triggered = dash.callback_context.triggered_id
+    if triggered == "btn-open-add-wallet":
+        return True, "", no_update, no_update
+    if triggered == "btn-cancel-add-wallet":
+        return False, "", "", no_update
+    if triggered == "btn-submit-add-wallet":
+        if READ_ONLY_UI:
+            return True, dbc.Alert("Wallet writes are disabled in local read-only mode.", color="secondary"), no_update, no_update
+        if not submit_clicks:
+            return is_open, no_update, no_update, no_update
+
+        lines = [l.strip() for l in (raw_lines or "").split("\n") if l.strip()]
+        if not lines:
+            return True, dbc.Alert("Paste at least one CSV line.", color="warning"), no_update, no_update
+
+        added = []
+        errors = []
+        conn = get_connection()
+        for line in lines:
+            try:
+                result = add_wallet_from_csv_line(conn, line, tier_name)
+                added.append(result["wallet_address"][:12] + "...")
+            except Exception as exc:
+                errors.append(f"{line[:20]}...: {exc}")
+        conn.close()
+
+        messages = []
+        if added:
+            messages.append(dbc.Alert(
+                f"Queued {len(added)} wallet(s) at {tier_name.replace('_', ' ').title()}: {', '.join(added)}",
+                color="success",
+            ))
+        if errors:
+            messages.append(dbc.Alert(
+                html.Div([html.Div(e) for e in errors]),
+                color="danger",
+            ))
+
+        return (
+            False if not errors else True,
+            html.Div(messages),
+            "" if not errors else no_update,
+            wallet_admin_token + 1 if added else no_update,
+        )
+    return is_open, no_update, no_update, no_update
+
+
+@callback(
+    Output("push-preview-modal", "is_open"),
+    [Input("btn-open-push", "n_clicks"), Input("btn-cancel-push", "n_clicks"), Input("btn-confirm-push", "n_clicks")],
+    State("push-preview-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_push_preview_modal(open_clicks, cancel_clicks, confirm_clicks, is_open):
+    triggered = dash.callback_context.triggered_id
+    if triggered == "btn-open-push" and open_clicks:
+        return True
+    if triggered == "btn-cancel-push" and cancel_clicks:
+        return False
+    if triggered == "btn-confirm-push" and confirm_clicks:
+        return False
+    return is_open
+
+
+@callback(
+    [Output("push-preview-body", "children"), Output("btn-confirm-push", "disabled")],
+    [Input("push-preview-modal", "is_open"), Input("wallet-admin-token", "data")],
+)
+def render_push_preview(is_open, _):
+    if not is_open:
+        return no_update, no_update
+    try:
+        conn = get_connection()
+        snapshot = get_wallet_management_snapshot(conn, bootstrap=False)
+        conn.close()
+        if READ_ONLY_UI:
+            return dbc.Alert("Pushes are disabled in local read-only mode.", color="secondary"), True
+        if snapshot["pending_push"]:
+            return dbc.Alert("A push is already pending on the VPS. Wait for it to apply before pushing again.", color="warning"), True
+        if not snapshot["pending_changes"]:
+            return dbc.Alert("There are no queued changes to push.", color="secondary"), True
+        return html.Div(
+            [_pending_change_card(change, removable=True, render_token=snapshot.get("render_token")) for change in snapshot["pending_changes"]],
+        ), False
+    except Exception as exc:
+        logger.exception("Failed to render push preview")
+        return dbc.Alert(str(exc), color="danger"), True
+
+
+@callback(
+    [Output("wallet-management-flash", "children", allow_duplicate=True), Output("wallet-admin-token", "data", allow_duplicate=True)],
+    Input("btn-confirm-push", "n_clicks"),
+    State("wallet-admin-token", "data"),
+    prevent_initial_call=True,
+)
+def confirm_push_to_vps(n_clicks, wallet_admin_token):
+    if not n_clicks:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Pushes are disabled in local read-only mode.", color="secondary"), no_update
+    try:
+        conn = get_connection()
+        result = create_push_from_pending_changes(conn)
+        conn.close()
+        return dbc.Alert(f"Push #{result['push_id']} queued for the VPS: {result['summary']}.", color="success"), wallet_admin_token + 1
+    except Exception as exc:
+        logger.exception("Failed to create push")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    [
+        Output("settings-copy-test", "value"),
+        Output("settings-copy-promoted", "value"),
+        Output("settings-copy-high", "value"),
+        Output("settings-count-test", "children"),
+        Output("settings-count-promoted", "children"),
+        Output("settings-count-high", "children"),
+    ],
+    [Input("wallet-admin-token", "data"), Input("status-poll", "n_intervals")],
+)
+def load_tier_settings(_, __):
+    try:
+        conn = get_connection()
+        configs = {row["tier_name"]: row for row in get_tier_configs(conn)}
+        rows = conn.execute(
+            "SELECT tier_name, COUNT(*) AS wallet_count FROM wallet_tiers GROUP BY tier_name"
+        ).fetchall()
+        conn.close()
+        counts = {row["tier_name"]: int(row["wallet_count"] or 0) for row in rows}
+        return (
+            configs["test"]["copy_percentage"],
+            configs["promoted"]["copy_percentage"],
+            configs["high_conviction"]["copy_percentage"],
+            html.Span(f"{counts.get('test', 0)} wallets", className="pm-settings-row__count-pill"),
+            html.Span(f"{counts.get('promoted', 0)} wallets", className="pm-settings-row__count-pill"),
+            html.Span(f"{counts.get('high_conviction', 0)} wallets", className="pm-settings-row__count-pill"),
+        )
+    except Exception:
+        return no_update, no_update, no_update, "—", "—", "—"
+
+
+@callback(
+    [Output("settings-message", "children"), Output("wallet-admin-token", "data", allow_duplicate=True)],
+    Input("btn-save-tier-settings", "n_clicks"),
+    [
+        State("settings-copy-test", "value"),
+        State("settings-copy-promoted", "value"),
+        State("settings-copy-high", "value"),
+        State("wallet-admin-token", "data"),
+    ],
+    prevent_initial_call=True,
+)
+def save_tier_settings(n_clicks, test_copy, promoted_copy, high_copy, wallet_admin_token):
+    if not n_clicks:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Tier config writes are disabled in local read-only mode.", color="secondary"), no_update
+    try:
+        conn = get_connection()
+        result = save_tier_config_changes(
+            conn,
+            {
+                "test": test_copy,
+                "promoted": promoted_copy,
+                "high_conviction": high_copy,
+            },
+        )
+        conn.close()
+        if not result["changed_tiers"]:
+            return dbc.Alert("No tier percentages changed.", color="secondary"), no_update
+        return (
+            dbc.Alert(f"Saved tier settings. Next push will update {result['total_affected']} wallet rows.", color="success"),
+            wallet_admin_token + 1,
+        )
+    except Exception as exc:
+        logger.exception("Failed to save tier settings")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    Output("selected-push-id", "data"),
+    [Input("wallet-admin-token", "data"), Input("status-poll", "n_intervals"), Input(_button_id("view-push", push_id=ALL), "n_clicks")],
+    State("selected-push-id", "data"),
+)
+def sync_selected_push(_, __, ___, current_selected):
+    triggered = dash.callback_context.triggered_id
+    if isinstance(triggered, dict) and triggered.get("type") == "view-push":
+        return triggered["push_id"]
+    try:
+        conn = get_connection()
+        pushes = list_push_history(conn)
+        conn.close()
+    except Exception:
+        return current_selected
+    valid_ids = {push["id"] for push in pushes}
+    if current_selected in valid_ids:
+        return current_selected
+    return pushes[0]["id"] if pushes else None
+
+
+@callback(
+    [Output("changes-list", "children"), Output("changes-detail", "children")],
+    [Input("selected-push-id", "data"), Input("wallet-admin-token", "data"), Input("status-poll", "n_intervals")],
+)
+def render_changes_view(selected_push_id, _, __):
+    try:
+        conn = get_connection()
+        pushes = list_push_history(conn)
+        detail = get_push_detail(conn, selected_push_id) if selected_push_id else None
+        conn.close()
+        return _render_push_list(pushes), _render_push_detail(detail)
+    except Exception as exc:
+        logger.exception("Failed to load change history")
+        error = _database_error_layout(str(exc))
+        return error, error
+
+
+@callback(
+    Output("revert-modal", "is_open"),
+    [Input("btn-open-revert", "n_clicks"), Input("btn-cancel-revert", "n_clicks"), Input("btn-confirm-revert", "n_clicks")],
+    State("revert-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_revert_modal(open_clicks, cancel_clicks, confirm_clicks, is_open):
+    triggered = dash.callback_context.triggered_id
+    if triggered == "btn-open-revert" and open_clicks:
+        return True
+    if triggered == "btn-cancel-revert" and cancel_clicks:
+        return False
+    if triggered == "btn-confirm-revert" and confirm_clicks:
+        return False
+    return is_open
+
+
+@callback(
+    Output("revert-preview-body", "children"),
+    [Input("revert-modal", "is_open"), Input("selected-push-id", "data")],
+)
+def render_revert_preview(is_open, selected_push_id):
+    if not is_open or not selected_push_id:
         return no_update
+    try:
+        conn = get_connection()
+        detail = get_push_detail(conn, selected_push_id)
+        conn.close()
+        if not detail:
+            return dbc.Alert("Push not found.", color="danger")
+        pushed_at = parse_db_timestamp(detail["pushed_at"]) if detail["pushed_at"] else None
+        pushed_label = pushed_at.strftime("%Y-%m-%d %H:%M UTC") if pushed_at else "Unknown time"
+        return html.Div(
+            [
+                html.Div(
+                    f"Revert to the CSV state from {pushed_label} (before Push #{detail['id']} was applied).",
+                    className="pm-range-copy",
+                ),
+                html.Div([_pending_change_card(change) for change in detail["changes"]], className="pm-history-detail-list"),
+            ]
+        )
+    except Exception as exc:
+        return dbc.Alert(str(exc), color="danger")
+
+
+@callback(
+    [Output("changes-message", "children"), Output("wallet-admin-token", "data", allow_duplicate=True)],
+    Input("btn-confirm-revert", "n_clicks"),
+    [State("selected-push-id", "data"), State("wallet-admin-token", "data")],
+    prevent_initial_call=True,
+)
+def confirm_revert_push(n_clicks, selected_push_id, wallet_admin_token):
+    if not n_clicks or not selected_push_id:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        return dbc.Alert("Reverts are disabled in local read-only mode.", color="secondary"), no_update
+    try:
+        conn = get_connection()
+        result = create_revert_push(conn, selected_push_id)
+        conn.close()
+        return dbc.Alert(f"Queued revert push #{result['push_id']}.", color="warning"), wallet_admin_token + 1
+    except Exception as exc:
+        logger.exception("Failed to create revert push")
+        return dbc.Alert(str(exc), color="danger"), no_update
+
+
+@callback(
+    Output("refresh-token", "data", allow_duplicate=True),
+    Input(_button_id("toggle-hide", wallet=ALL), "n_clicks"),
+    State("refresh-token", "data"),
+    prevent_initial_call=True,
+)
+def toggle_hidden_wallet(clicks, refresh_token):
+    if READ_ONLY_UI:
+        return no_update
+    if not any(clicks):
+        return no_update
+    triggered = dash.callback_context.triggered_id
+    if not triggered:
+        return no_update
+    wallet = triggered["wallet"]
 
     conn = get_connection()
     existing = conn.execute(
-        "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?", (wallet,)
+        "SELECT 1 FROM hidden_wallets WHERE wallet_address = ?",
+        (wallet,),
     ).fetchone()
     if existing:
         conn.execute("DELETE FROM hidden_wallets WHERE wallet_address = ?", (wallet,))
     else:
-        conn.execute("INSERT OR IGNORE INTO hidden_wallets (wallet_address) VALUES (?)", (wallet,))
+        conn.execute("INSERT INTO hidden_wallets (wallet_address) VALUES (?)", (wallet,))
     conn.commit()
     conn.close()
-    return 'hide-toggle'
-
-
-# ─── Wallet Changes tab ───────────────────────────────────────
-@callback(
-    Output('csv-version-select', 'options'),
-    Input('tabs', 'active_tab'),
-)
-def load_csv_versions(tab):
-    if tab != 'tab-changes':
-        return no_update
-    try:
-        conn = get_connection()
-        versions = conn.execute(
-            "SELECT id, saved_at, wallet_count, changes_summary FROM csv_history ORDER BY id DESC"
-        ).fetchall()
-        conn.close()
-        return [
-            {'label': f"{v['saved_at']} — {v['wallet_count']} wallets ({v['changes_summary'] or ''})",
-             'value': v['id']}
-            for v in versions
-        ]
-    except Exception:
-        return []
+    return refresh_token + 1
 
 
 @callback(
-    Output('csv-viewer', 'children'),
-    Input('csv-version-select', 'value'),
+    [Output("refresh-message", "children"), Output("refresh-token", "data", allow_duplicate=True)],
+    Input("btn-refresh", "n_clicks"),
+    State("refresh-token", "data"),
+    prevent_initial_call=True,
 )
-def show_csv_version(version_id):
-    if not version_id:
-        return html.Div("Select a CSV version to view", style={'color': '#888'})
-    try:
-        conn = get_connection()
-        row = conn.execute("SELECT * FROM csv_history WHERE id = ?", (version_id,)).fetchone()
-        conn.close()
-        if not row:
-            return html.Div("Version not found", style={'color': '#888'})
-
-        import csv as csv_mod
-        import io
-        reader = csv_mod.DictReader(io.StringIO(row['csv_content']))
-        rows_data = list(reader)
-        if not rows_data:
-            return html.Div("Empty CSV", style={'color': '#888'})
-
-        df = pd.DataFrame(rows_data)
-        # Only show address and market_whitelist
-        show_cols = ['address', 'market_whitelist']
-        show_cols = [c for c in show_cols if c in df.columns]
-        if show_cols:
-            df = df[show_cols]
-        df = df[df['address'] != '__global__'] if 'address' in df.columns else df
-
-        return dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': c, 'id': c} for c in df.columns],
-            style_header=HEADER_STYLE,
-            style_cell=CELL_STYLE,
-            page_size=50,
+def refresh_pipeline(n_clicks, refresh_token):
+    if not n_clicks:
+        return no_update, no_update
+    if READ_ONLY_UI:
+        message = dbc.Alert("Refresh is disabled in local read-only mode.", color="secondary")
+        return message, no_update
+    result = run_hourly_pipeline(trigger="manual-refresh")
+    if result["status"] == "ok":
+        message = dbc.Alert(
+            f"Pipeline complete. {result['positions_rebuilt']} positions, "
+            f"{result['tokens_resolved']} newly resolved tokens.",
+            color="success",
         )
-    except Exception as e:
-        return html.Div(f"Error: {e}", style={'color': RED})
+    elif result["status"] == "busy":
+        message = dbc.Alert(result["message"], color="warning")
+    else:
+        message = dbc.Alert(result.get("error", "Pipeline failed"), color="danger")
+    return message, refresh_token + 1
 
 
 @callback(
-    Output('changelog-content', 'children'),
-    Input('tabs', 'active_tab'),
+    [Output("wallet-dropdown", "options"), Output("wallet-dropdown", "value")],
+    Input("refresh-token", "data"),
+    State("wallet-dropdown", "value"),
 )
-def load_changelog(tab):
-    if tab != 'tab-changes':
-        return no_update
+def load_wallet_options(_, current_wallet):
     try:
         conn = get_connection()
-        changes = conn.execute(
-            "SELECT * FROM wallet_changes ORDER BY change_date DESC LIMIT 50"
-        ).fetchall()
+        options = get_wallet_options(conn)
         conn.close()
-
-        if not changes:
-            return html.Div("No wallet changes recorded yet.", style={'color': '#888'})
-
-        items = []
-        for c in changes:
-            icon = "✅" if c['action'] == 'ADDED' else "🔴"
-            addr = c['wallet_address']
-            short = addr[:10] + '...' + addr[-4:]
-            game = c['game_filter'] or '?'
-            date = c['change_date']
-            items.append(html.Div(
-                f"{icon} {c['action']} {short} ({game}) — {date}",
-                style={'marginBottom': '4px'}
-            ))
-        return html.Div(items)
+        values = {option["value"] for option in options}
+        value = current_wallet if current_wallet in values else (options[0]["value"] if options else None)
+        return options, value
     except Exception:
-        return html.Div("Error loading changelog", style={'color': RED})
+        return [], None
 
 
-# ─── Run ───────────────────────────────────────────────────────
-if __name__ == '__main__':
+@callback(
+    [
+        Output("wallet-chart-data", "data"),
+        Output("wallet-current-pnl", "children"),
+        Output("wallet-current-pnl", "style"),
+        Output("wallet-range-label", "children"),
+        Output("wallet-stats", "children"),
+    ],
+    [Input("wallet-dropdown", "value"), Input("wallet-range", "data"), Input("refresh-token", "data")],
+)
+def update_wallet_view(wallet, range_key, _):
+    if not wallet:
+        return None, "Select a wallet", {"color": COLORS["text_secondary"]}, "", ""
+    try:
+        conn = get_connection()
+        payload = get_chart_payload(conn, wallet=wallet, range_key=range_key)
+        stats = get_wallet_stats(conn, wallet)
+        conn.close()
+        if not stats:
+            return None, "No data", {"color": COLORS["text_secondary"]}, "", ""
+
+        current = payload["current_delta_pnl"]
+        realized_tone = "positive" if stats["realized"] > 0 else "negative" if stats["realized"] < 0 else "default"
+        unrealized_tone = "positive" if stats["unrealized"] > 0 else "negative" if stats["unrealized"] < 0 else "default"
+        stat_block = html.Div(
+            [
+                html.Div(
+                    [
+                        _stat_tile("Wallet", html.Span(
+                            stats["wallet"], className="pm-wallet-copyable",
+                            title="Click to copy", **{"data-clipboard": stats["wallet"]})),
+                        _stat_tile("Filter", stats["filter"]),
+                        _stat_tile("Actual", stats["game"]),
+                        _stat_tile("Invested", _money(stats["invested"])),
+                        _stat_tile("Realized", _money(stats["realized"]), tone=realized_tone),
+                        _stat_tile("Unrealized", _money(stats["unrealized"]), tone=unrealized_tone),
+                        _stat_tile("Markets", f"{stats['markets']}"),
+                        _stat_tile("Trades", f"{stats['trades']}"),
+                        _stat_tile("Excluded", f"{stats['excluded_positions']}"),
+                    ],
+                    className="pm-wallet-stat-grid",
+                ),
+                html.Div(
+                    [
+                        html.Span(f"First trade {stats['first_trade'] or '-'}"),
+                        html.Span(f"Last trade {stats['last_trade'] or '-'}"),
+                    ],
+                    className="pm-summary-strip",
+                ),
+            ],
+            className="pm-wallet-summary",
+        )
+        return (
+            payload,
+            _money(current),
+            {"color": _line_color(current)},
+            _format_chart_range_label(payload, range_key),
+            stat_block,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load wallet view")
+        return None, str(exc), {"color": COLORS["negative"]}, "", ""
+
+
+# ─── Export callbacks ──────────────────────────────────────────
+@callback(
+    Output("download-xlsx", "data"),
+    Input("btn-export-xlsx", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_export_xlsx(n_clicks):
+    if not n_clicks:
+        return no_update
+    try:
+        from lib.exporter import export_xlsx
+        conn = get_connection()
+        xlsx_bytes = export_xlsx(conn)
+        conn.close()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return dcc.send_bytes(xlsx_bytes, f"wallet_export_{ts}.xlsx")
+    except Exception as exc:
+        logger.exception("XLSX export failed")
+        return no_update
+
+
+@callback(
+    Output("download-txt", "data"),
+    Input("btn-export-txt", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_export_txt(n_clicks):
+    if not n_clicks:
+        return no_update
+    try:
+        from lib.exporter import export_wallet_list_txt
+        conn = get_connection()
+        txt = export_wallet_list_txt(conn)
+        conn.close()
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        return dict(content=txt, filename=f"wallet_list_{ts}.txt")
+    except Exception as exc:
+        logger.exception("TXT export failed")
+        return no_update
+
+
+# ─── Subcategory Charts callbacks ──────────────────────────────
+@callback(
+    Output("sc-game-dropdown", "options"),
+    Input("tabs", "value"),
+)
+def load_game_options(tab):
+    if tab != "subcategory-charts":
+        return no_update
+    try:
+        from lib.clickhouse_charts import ClickHouseClient, get_available_filters
+        client = ClickHouseClient()
+        filters = get_available_filters(client)
+
+        # Build grouped options: categories first, then subcategories, then details
+        # Value encodes the level: "category::Sports", "subcategory::Tennis", "detail::Counter-Strike"
+        options = []
+        seen = set()
+        for level_label, level_key in [("Category", "category"), ("Subcategory", "subcategory"), ("Detail", "detail")]:
+            level_items = [f for f in filters if f["level"] == level_key]
+            for item in level_items:
+                val = f"{level_key}::{item['label']}"
+                if val not in seen:
+                    seen.add(val)
+                    options.append({
+                        "label": f"[{level_label}] {item['label']} ({item['count']:,})",
+                        "value": val,
+                    })
+        return options
+    except Exception as exc:
+        logger.warning("Failed to load filters from ClickHouse: %s", exc)
+        return [
+            {"label": "[Subcategory] Esports", "value": "subcategory::Esports"},
+            {"label": "[Detail] Counter-Strike", "value": "detail::Counter-Strike"},
+            {"label": "[Subcategory] NBA", "value": "subcategory::NBA"},
+            {"label": "[Subcategory] US Politics", "value": "subcategory::US Politics"},
+        ]
+
+
+_SC_RANGES = [1, 7, 14, 30, 365]
+
+
+# Range pill click → update active range store + highlight
+@callback(
+    [Output("sc-active-range", "data")] + [Output(f"sc-range-{d}", "className") for d in _SC_RANGES],
+    [Input(f"sc-range-{d}", "n_clicks") for d in _SC_RANGES],
+    State("sc-active-range", "data"),
+    prevent_initial_call=True,
+)
+def update_active_range(c1, c7, c14, c30, c365, current):
+    triggered = dash.ctx.triggered_id
+    selected = current or 365
+    click_map = {"sc-range-1": 1, "sc-range-7": 7, "sc-range-14": 14, "sc-range-30": 30, "sc-range-365": 365}
+    clicks_map = {"sc-range-1": c1, "sc-range-7": c7, "sc-range-14": c14, "sc-range-30": c30, "sc-range-365": c365}
+    if triggered in click_map and clicks_map.get(triggered):
+        selected = click_map[triggered]
+    return [selected] + [
+        "pm-range-pill pm-range-pill--active" if d == selected else "pm-range-pill"
+        for d in _SC_RANGES
+    ]
+
+
+# Generate chart — triggered by Generate button OR range pill change
+def _build_concentration_badges(conc):
+    """Build concentration badge HTML from concentration dict."""
+    def badge(label, pct):
+        if pct > 50:
+            color, bg = COLORS["negative"], COLORS["negative_soft"]
+        elif pct > 30:
+            color, bg = COLORS["warning"], COLORS["warning_soft"]
+        else:
+            color, bg = COLORS["buy"], COLORS["positive_soft"]
+        return html.Span(f"{label}: {pct}%",
+                          style={"color": color, "background": bg, "padding": "4px 10px",
+                                 "borderRadius": "6px", "fontSize": "12px", "border": f"1px solid {color}30"})
+
+    return html.Div([
+        html.Div("P&L Concentration", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                              "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Div([
+            badge("Top 1 Market", conc.get("top1_pct", 0)),
+            badge("Top 3 Markets", conc.get("top3_pct", 0)),
+            badge("Top 5 Markets", conc.get("top5_pct", 0)),
+        ], style={"display": "flex", "gap": "8px"}),
+    ])
+
+
+def _severity_to_badge_style(severity):
+    if severity == "red":
+        return COLORS["negative"], COLORS["negative_soft"]
+    if severity == "amber":
+        return COLORS["warning"], COLORS["warning_soft"]
+    return COLORS["buy"], COLORS["positive_soft"]
+
+
+def _severity_to_chip_tone(severity):
+    if severity == "red":
+        return "danger"
+    if severity == "amber":
+        return "warning"
+    return "success"
+
+
+def _build_curation_warning_strip(signals):
+    chips = signals.get("warning_chips", []) if signals else []
+    if not chips:
+        return html.Div(
+            [_status_chip("No major copyability flags in this window", tone="success")],
+            className="pm-status-chip-row",
+            style={"justifyContent": "flex-start"},
+        )
+    return html.Div(
+        [
+            _status_chip(f"{chip['label']}: {chip['detail']}", tone=_severity_to_chip_tone(chip["severity"]))
+            for chip in chips
+        ],
+        className="pm-status-chip-row",
+        style={"justifyContent": "flex-start"},
+    )
+
+
+def _build_curation_signal_badges(signals):
+    if not signals:
+        return ""
+
+    metric_severities = signals.get("metric_severities", {})
+
+    def badge(label, value, severity_key):
+        color, bg = _severity_to_badge_style(metric_severities.get(severity_key, "green"))
+        return html.Span(
+            f"{label}: {value}",
+            style={
+                "color": color,
+                "background": bg,
+                "padding": "4px 10px",
+                "borderRadius": "6px",
+                "fontSize": "12px",
+                "border": f"1px solid {color}30",
+            },
+        )
+
+    gap = signals.get("copy_price_gap")
+    gap_label = "n/a" if gap is None else f"{gap:+.4f}"
+
+    return html.Div([
+        html.Div("Curation Signals", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                            "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Div([
+            badge("Top 1 Market", f"{signals.get('top1_pct', 0):.1f}%", "top1_pct"),
+            badge("Top 3 Markets", f"{signals.get('top3_pct', 0):.1f}%", "top3_pct"),
+            badge("Both-Sides", f"{signals.get('both_sides_market_pct', 0):.1f}%", "both_sides_market_pct"),
+            badge("Buy Gap", gap_label, "copy_price_gap"),
+            badge("Near-Certain Buys", f"{signals.get('near_certain_buy_volume_pct', 0):.1f}%", "near_certain_buy_volume_pct"),
+        ], style={"display": "flex", "gap": "8px", "flexWrap": "wrap"}),
+    ])
+
+
+def _build_curation_read(summary, signals):
+    if not signals:
+        return ""
+
+    active_days = int(summary.get("active_days") or 0)
+    unique_markets = int(summary.get("unique_markets") or 0)
+    top1_pct = float(signals.get("top1_pct") or 0.0)
+    top3_pct = float(signals.get("top3_pct") or 0.0)
+    both_sides_pct = float(signals.get("both_sides_market_pct") or 0.0)
+    near_certain_pct = float(signals.get("near_certain_buy_volume_pct") or 0.0)
+    copy_price_gap = signals.get("copy_price_gap")
+    metric_severities = signals.get("metric_severities", {})
+    warning_chips = signals.get("warning_chips", [])
+    red_count = sum(1 for chip in warning_chips if chip.get("severity") == "red")
+    amber_count = sum(1 for chip in warning_chips if chip.get("severity") == "amber")
+
+    strengths = []
+    risks = []
+
+    if unique_markets >= 20 and active_days >= 7:
+        strengths.append(f"broad sample with {unique_markets} markets across {active_days} days")
+    elif unique_markets >= 10 and active_days >= 5:
+        strengths.append(f"usable sample with {unique_markets} markets across {active_days} days")
+    else:
+        risks.append(f"thin sample with only {unique_markets} markets across {active_days} days")
+
+    if metric_severities.get("concentration") == "green":
+        strengths.append(f"PnL is reasonably spread out (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+    elif metric_severities.get("concentration") == "amber":
+        risks.append(f"some concentration risk (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+    else:
+        risks.append(f"heavy concentration risk (top1 {top1_pct:.1f}%, top3 {top3_pct:.1f}%)")
+
+    if both_sides_pct < 55:
+        strengths.append(f"mostly directional trading ({both_sides_pct:.1f}% both-sides)")
+    elif both_sides_pct < 85:
+        risks.append(f"mixed execution style ({both_sides_pct:.1f}% both-sides)")
+    else:
+        risks.append(f"very high both-sides trading ({both_sides_pct:.1f}%)")
+
+    if copy_price_gap is not None:
+        if copy_price_gap <= 0.02:
+            strengths.append(f"taker pricing is not obviously worse ({copy_price_gap:+.4f} buy gap)")
+        elif copy_price_gap <= 0.04:
+            risks.append(f"mild taker price disadvantage ({copy_price_gap:+.4f} buy gap)")
+        else:
+            risks.append(f"material taker price disadvantage ({copy_price_gap:+.4f} buy gap)")
+
+    if near_certain_pct >= 25:
+        risks.append(f"too much near-certain buying ({near_certain_pct:.1f}%)")
+    elif near_certain_pct >= 10:
+        risks.append(f"some near-certain buying ({near_certain_pct:.1f}%)")
+    else:
+        strengths.append(f"near-certain buying is low ({near_certain_pct:.1f}%)")
+
+    if red_count >= 2 or metric_severities.get("sample") == "red":
+        title = "Avoid For Now"
+        tone = "danger"
+        summary_text = "The structure is too risky to trust yet. This wallet may still be profitable, but the copyability flags are strong enough that it should not be an easy approve."
+    elif red_count == 0 and amber_count <= 1 and metric_severities.get("sample") == "green":
+        title = "Looks Promising"
+        tone = "success"
+        summary_text = "The wallet has enough breadth to take seriously and does not show a major copyability problem in this window."
+    else:
+        title = "Mixed Profile"
+        tone = "warning"
+        summary_text = "There is enough here to inspect, but the wallet has real structural risks. Treat it as a manual review candidate, not an automatic approve."
+
+    return _card([
+        html.Div([
+            html.Div("Curation Read", className="pm-kicker"),
+            _status_chip(title, tone=tone),
+        ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "12px", "marginBottom": "10px", "flexWrap": "wrap"}),
+        html.Div(summary_text, className="pm-empty-state__copy", style={"marginTop": 0}),
+        html.Div(f"What looks good: {('; '.join(strengths[:2]) + '.') if strengths else 'No obvious strengths in this window.'}",
+                 className="pm-empty-state__copy"),
+        html.Div(f"What to watch: {('; '.join(risks[:2]) + '.') if risks else 'No major risks triggered in this window.'}",
+                 className="pm-empty-state__copy"),
+    ], class_name="pm-admin-card")
+
+
+def _build_curation_loading_read(progress=None):
+    children = [
+        html.Div([
+            html.Div("Curation Read", className="pm-kicker"),
+            _status_chip("Loading", tone="warning"),
+        ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "12px", "marginBottom": "10px", "flexWrap": "wrap"}),
+        html.Div("This wallet is being fetched in the background. You should only pay the wait once for the current wallet; the next wallets are warming behind it.", className="pm-empty-state__copy", style={"marginTop": 0}),
+    ]
+    if progress is not None:
+        ready = progress.get("ready", 0)
+        running = progress.get("running", 0)
+        queued = progress.get("queued", 0)
+        children.append(
+            html.Div(f"Cache progress: {ready} ready, {running} running, {queued} queued.", className="pm-empty-state__copy")
+        )
+    return _card(children, class_name="pm-admin-card")
+
+
+def _build_curation_loading_figure(title):
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        annotations=[
+            dict(
+                text=title,
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(size=16, color=COLORS["text_secondary"]),
+            )
+        ],
+    )
+    return fig
+
+
+def _build_top_markets_table(markets):
+    """Build top markets HTML table."""
+    if not markets:
+        return ""
+    total_abs = sum(abs(m["net_cash"]) for m in markets) or 1
+    rows = []
+    for m in markets:
+        pct = round(abs(m["net_cash"]) / total_abs * 100, 1)
+        mc = COLORS["positive"] if m["net_cash"] >= 0 else COLORS["negative"]
+        rows.append(html.Tr([
+            html.Td(m["market_name"][:60], style={"maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"}),
+            html.Td(f"${m['net_cash']:,.2f}", style={"color": mc}),
+            html.Td(str(m["total_trades"])),
+            html.Td(f"{pct}%"),
+        ], className="pm-tier-table__row"))
+
+    return html.Div([
+        html.Div("Top Markets by P&L", style={"fontSize": "11px", "color": "var(--pm-text-secondary)",
+                                                "textTransform": "uppercase", "letterSpacing": "0.5px", "marginBottom": "6px"}),
+        html.Table([
+            html.Thead(html.Tr([html.Th("Market"), html.Th("P&L"), html.Th("Trades"), html.Th("% of Total")])),
+            html.Tbody(rows),
+        ], className="pm-tier-table", style={"fontSize": "12px"}),
+    ])
+
+
+def _format_compact_price(value, digits=3):
+    if value is None:
+        return "-"
+    return f"{float(value):.{digits}f}"
+
+
+def _format_share_count(value):
+    if value is None:
+        return "-"
+    return f"{float(value):,.2f}"
+
+
+def _format_curation_timestamp(value):
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _plain_money_cell(value):
+    return html.Td(_money(value), className="pm-tier-table__cell pm-num")
+
+
+def _value_cell(value):
+    return html.Td(value, className="pm-tier-table__cell")
+
+
+def _label_with_derived_note(label, is_derived):
+    parts = [html.Div(label or "Unknown", style={"fontWeight": 500})]
+    if is_derived:
+        parts.append(html.Div("(derived)", style={"fontSize": "11px", "color": COLORS["text_secondary"]}))
+    return parts
+
+
+def _count_label(count, singular):
+    suffix = singular if count == 1 else f"{singular}s"
+    return f"{count:,} {suffix}"
+
+
+def _build_curation_collapsible_table(title, meta_text, body, shell_style=None, section_id=None, meta_id=None, body_id=None):
+    meta_props = {"className": "pm-collapsible-meta"}
+    if meta_id:
+        meta_props["id"] = meta_id
+    body_props = {"className": "pm-daily-table-shell", "style": shell_style or {"maxHeight": "420px"}}
+    if body_id:
+        body_props["id"] = body_id
+    return html.Details(
+        [
+            html.Summary(
+                html.Div([
+                    html.Span(title, className="pm-collapsible-label"),
+                    html.Span(meta_text, **meta_props),
+                ], className="pm-collapsible-header-inner"),
+                className="pm-tier-summary",
+            ),
+            html.Div(body, **body_props),
+        ],
+        **({"id": section_id} if section_id else {}),
+        open=False,
+        className="pm-collapsible-section",
+    )
+
+
+def _build_curation_empty_table_state(message):
+    return html.Div(message, className="pm-empty-state__copy", style={"padding": "14px"})
+
+
+def _build_both_sides_table(rows):
+    rows = list(rows or [])
+    rows.sort(key=lambda row: (-float(row.get("combined_avg_buy") or 0.0), -float(row.get("total_pnl") or 0.0), str(row.get("market") or "")))
+    header = html.Tr([
+        _sortable_th("Market"),
+        _sortable_th("Outcome A"),
+        _sortable_th("Avg Buy A", "number"),
+        _sortable_th("Shares A", "number"),
+        _sortable_th("Dollars A", "number"),
+        _sortable_th("Sold A", "number"),
+        _sortable_th("P&L A", "number"),
+        _sortable_th("Outcome B"),
+        _sortable_th("Avg Buy B", "number"),
+        _sortable_th("Shares B", "number"),
+        _sortable_th("Dollars B", "number"),
+        _sortable_th("Sold B", "number"),
+        _sortable_th("P&L B", "number"),
+        _sortable_th("Combined Avg Buy", "number", "desc"),
+        _sortable_th("Total P&L", "number"),
+    ])
+    if not rows:
+        body = _build_curation_empty_table_state("No dual-outcome markets in this range.")
+    else:
+        table_rows = []
+        for row in rows:
+            outcome_summary = f"{row.get('outcome_a_label', 'Unknown')} vs {row.get('outcome_b_label', 'Unknown')}"
+            extra_count = int(row.get("extra_outcome_count") or 0)
+            notes = []
+            if row.get("has_paired_complements"):
+                notes.append("paired complement rotations present")
+            if extra_count > 0:
+                notes.append(f"+{extra_count} more outcome" if extra_count == 1 else f"+{extra_count} more outcomes")
+            market_cell = html.Td(
+                [
+                    html.Div(str(row.get("market") or "Unknown"), style={"fontWeight": 500, "whiteSpace": "normal"}),
+                    html.Div(outcome_summary, style={"fontSize": "11px", "color": COLORS["text_secondary"], "whiteSpace": "normal"}),
+                    html.Div(" · ".join(notes), style={"fontSize": "11px", "color": COLORS["text_secondary"], "whiteSpace": "normal"}) if notes else "",
+                ],
+                className="pm-tier-table__cell",
+                style={"minWidth": "320px", "whiteSpace": "normal", "verticalAlign": "top"},
+            )
+            table_rows.append(html.Tr([
+                market_cell,
+                html.Td(_label_with_derived_note(row.get("outcome_a_label"), row.get("outcome_a_is_derived")), className="pm-tier-table__cell", style={"minWidth": "160px", "whiteSpace": "normal", "verticalAlign": "top"}),
+                html.Td(_format_compact_price(row.get("avg_buy_a")), className="pm-tier-table__cell pm-num"),
+                html.Td(_format_share_count(row.get("bought_shares_a")), className="pm-tier-table__cell pm-num"),
+                _plain_money_cell(row.get("bought_dollars_a")),
+                html.Td(_format_share_count(row.get("sold_shares_a")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("side_pnl_a")),
+                html.Td(_label_with_derived_note(row.get("outcome_b_label"), row.get("outcome_b_is_derived")), className="pm-tier-table__cell", style={"minWidth": "160px", "whiteSpace": "normal", "verticalAlign": "top"}),
+                html.Td(_format_compact_price(row.get("avg_buy_b")), className="pm-tier-table__cell pm-num"),
+                html.Td(_format_share_count(row.get("bought_shares_b")), className="pm-tier-table__cell pm-num"),
+                _plain_money_cell(row.get("bought_dollars_b")),
+                html.Td(_format_share_count(row.get("sold_shares_b")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("side_pnl_b")),
+                html.Td(_format_compact_price(row.get("combined_avg_buy")), className="pm-tier-table__cell pm-num"),
+                _pnl_cell(row.get("total_pnl")),
+            ], className="pm-tier-table__row"))
+        body = html.Table(
+            [
+                html.Colgroup([
+                    html.Col(style={"width": "340px"}),
+                    html.Col(style={"width": "170px"}),
+                    html.Col(style={"width": "90px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "170px"}),
+                    html.Col(style={"width": "90px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "95px"}),
+                    html.Col(style={"width": "110px"}),
+                    html.Col(style={"width": "120px"}),
+                    html.Col(style={"width": "110px"}),
+                ]),
+                html.Thead(header),
+                html.Tbody(table_rows),
+            ],
+            className="pm-tier-table",
+            style={"minWidth": "1910px"},
+        )
+    return _build_curation_collapsible_table("Both-Sides Markets", _count_label(len(rows), "market"), body)
+
+
+def _build_all_trades_table(rows):
+    rows = list(rows or [])
+    rows.sort(key=lambda row: (-float(row.get("mtm_pnl") or 0.0), str(row.get("ts") or ""), str(row.get("market") or "")))
+    if not rows:
+        return _build_curation_empty_table_state("No trades in this range.")
+
+    header = html.Tr([
+        _sortable_th("Time"),
+        _sortable_th("Market"),
+        _sortable_th("Outcome"),
+        _sortable_th("Side"),
+        _sortable_th("Shares", "number"),
+        _sortable_th("Avg Price", "number"),
+        _sortable_th("Dollars", "number"),
+        _sortable_th("Fee", "number"),
+        _sortable_th("MTM P&L", "number", "desc"),
+    ])
+    table_rows = []
+    for row in rows:
+        table_rows.append(html.Tr([
+            html.Td(_format_curation_timestamp(row.get("ts")), className="pm-tier-table__cell"),
+            html.Td(str(row.get("market") or "Unknown"), className="pm-tier-table__cell", style={"minWidth": "320px", "whiteSpace": "normal"}),
+            html.Td(_label_with_derived_note(row.get("outcome_label"), row.get("outcome_is_derived")), className="pm-tier-table__cell", style={"minWidth": "180px", "whiteSpace": "normal", "verticalAlign": "top"}),
+            _value_cell(str(row.get("side") or "")),
+            html.Td(_format_share_count(row.get("shares")), className="pm-tier-table__cell pm-num"),
+            html.Td(_format_compact_price(row.get("price")), className="pm-tier-table__cell pm-num"),
+            _plain_money_cell(row.get("dollars")),
+            _plain_money_cell(row.get("fee")),
+            _pnl_cell(row.get("mtm_pnl")),
+        ], className="pm-tier-table__row"))
+    return html.Table(
+        [
+            html.Colgroup([
+                html.Col(style={"width": "150px"}),
+                html.Col(style={"width": "360px"}),
+                html.Col(style={"width": "200px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "95px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "110px"}),
+                html.Col(style={"width": "90px"}),
+                html.Col(style={"width": "110px"}),
+            ]),
+            html.Thead(header),
+            html.Tbody(table_rows),
+        ],
+        className="pm-tier-table",
+        style={"minWidth": "1295px"},
+    )
+
+
+def _build_lazy_all_trades_section():
+    return _build_curation_collapsible_table(
+        "All Trades",
+        "Open to load",
+        _build_curation_empty_table_state("Open to load the top winners and losers for this wallet."),
+        section_id="cur-all-trades-section",
+        meta_id="cur-all-trades-meta",
+        body_id="cur-all-trades-body",
+    )
+
+
+def _build_curation_trade_audit_body(audit_payload):
+    total_rows = int((audit_payload or {}).get("total_rows") or 0)
+    display_rows = list((audit_payload or {}).get("display_rows") or [])
+    if total_rows <= 0:
+        return _build_curation_empty_table_state("No trades in this range.")
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        "Top 50 winners and 50 losers by MTM P&L. Download CSV for the full in-range ledger.",
+                        className="pm-range-copy",
+                    ),
+                    html.Button(
+                        "Download Full CSV",
+                        id="cur-all-trades-download-btn",
+                        className="pm-button pm-button--secondary",
+                        n_clicks=0,
+                    ),
+                ],
+                style={"display": "flex", "gap": "12px", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "12px"},
+            ),
+            _build_all_trades_table(display_rows),
+        ]
+    )
+
+
+def _build_curation_bottom_sections(markets, both_sides_rows):
+    sections = []
+    top_markets = _build_top_markets_table(markets)
+    if top_markets:
+        sections.append(top_markets)
+    sections.append(_build_both_sides_table(both_sides_rows))
+    sections.append(_build_lazy_all_trades_section())
+    return html.Div(sections, style={"display": "grid", "gap": "12px"})
+
+
+def _build_sim_summary_strip(wallet_meta):
+    values = []
+    if wallet_meta.get("capital"):
+        values.append(html.Span(f"${wallet_meta['capital']:,.0f} capital"))
+    if wallet_meta.get("copy_ratio") is not None:
+        values.append(html.Span(f"{wallet_meta['copy_ratio']:.0%} copy ratio"))
+    if wallet_meta.get("execution_mode"):
+        values.append(html.Span(wallet_meta["execution_mode"]))
+    values.append(html.Span(f"{wallet_meta.get('copied', 0):,} copied / {wallet_meta.get('skipped', 0):,} skipped"))
+    return html.Div(values, className="pm-sim-summary-strip")
+
+
+def _build_sim_validation(validation):
+    if not validation:
+        return ""
+    if validation.get("workbook_value") is None:
+        note = str(validation.get("range_note") or "").strip()
+        if not note:
+            return ""
+        return html.Div(note, className="pm-sim-validation pm-sim-validation--note")
+    delta = float(validation.get("delta") or 0.0)
+    if abs(delta) <= 10:
+        tone = "pm-sim-validation--ok"
+    elif abs(delta) <= 100:
+        tone = "pm-sim-validation--warn"
+    else:
+        tone = "pm-sim-validation--bad"
+    return html.Div(
+        f"Workbook: ${validation['workbook_value']:,.2f} · Recomputed: ${validation['recomputed_value']:,.2f} · Δ ${delta:,.2f}",
+        className=f"pm-sim-validation {tone}",
+    )
+
+
+def _build_curation_stats(actual_summary, sim_payload, wallet_meta):
+    sim_summary = (sim_payload or {}).get("summary", {})
+    sim_pnl = sim_summary.get("final_pnl")
+    sim_roi = sim_summary.get("roi_pct")
+    actual_pnl = float(actual_summary.get("final_pnl", 0.0) or 0.0)
+    actual_roi = float(actual_summary.get("roi_pct", 0.0) or 0.0)
+    return html.Div([
+        _stat_tile("Final P&L", f"${actual_pnl:,.2f}", tone="positive" if actual_pnl >= 0 else "negative"),
+        html.Div([
+            _stat_tile("Sim P&L", "N/A" if sim_pnl is None else f"${float(sim_pnl):,.2f}",
+                       tone="positive" if float(sim_pnl or 0.0) >= 0 else "negative"),
+        ], className="pm-sim-stat"),
+        _stat_tile("ROI", f"{actual_roi:.1f}%"),
+        html.Div([
+            _stat_tile("Sim ROI", "N/A" if sim_roi is None else f"{float(sim_roi):.1f}%"),
+        ], className="pm-sim-stat"),
+        _stat_tile("Trades", f"{int(actual_summary.get('total_trades', 0) or 0):,}"),
+        html.Div([
+            _stat_tile("Copied", f"{int(wallet_meta.get('copied', 0) or 0):,}"),
+        ], className="pm-sim-stat"),
+    ], className="pm-wallet-stat-grid pm-wallet-stat-grid--sim")
+
+
+def _add_curation_pnl_trace(fig, series, color, fillcolor, name, hovertemplate, row=1, col=1):
+    import plotly.graph_objects as go
+
+    customdata = [[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series]
+    trace = go.Scatter(
+        x=[s["date"] for s in series],
+        y=[s["pnl"] for s in series],
+        mode="lines",
+        line=dict(color=color, width=2),
+        fill="tozeroy",
+        fillcolor=fillcolor,
+        customdata=customdata,
+        hovertemplate=hovertemplate,
+        name=name,
+        showlegend=False,
+    )
+    if row is None or col is None:
+        fig.add_trace(trace)
+        return
+    fig.add_trace(trace, row=row, col=col)
+
+
+def _build_curation_chart_figure(actual_series, sim_series=None):
+    import plotly.graph_objects as go
+
+    if sim_series:
+        from plotly.subplots import make_subplots
+
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            horizontal_spacing=0.08,
+            subplot_titles=("Actual P&L", "Sim P&L"),
+        )
+        _add_curation_pnl_trace(
+            fig,
+            actual_series,
+            COLORS["chart_line"],
+            COLORS["chart_fill"],
+            "Actual P&L",
+            "<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+            row=1,
+            col=1,
+        )
+        _add_curation_pnl_trace(
+            fig,
+            sim_series,
+            "#9B51E0",
+            "rgba(155, 81, 224, 0.12)",
+            "Sim P&L",
+            "<b>%{x}</b><br>Sim P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+            row=1,
+            col=2,
+        )
+        _polymarket_chart_layout(fig)
+        date_values = [s["date"] for s in actual_series] + [s["date"] for s in sim_series]
+        if date_values:
+            date_range = [min(date_values), max(date_values)]
+            fig.update_xaxes(range=date_range, row=1, col=1)
+            fig.update_xaxes(range=date_range, row=1, col=2)
+        fig.update_xaxes(showgrid=False, zeroline=False)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(122,145,173,0.08)", zeroline=False, tickprefix="$")
+        fig.update_layout(margin=dict(l=50, r=20, t=44, b=40), hovermode="x")
+        return fig
+
+    fig = go.Figure()
+    _add_curation_pnl_trace(
+        fig,
+        actual_series,
+        COLORS["chart_line"],
+        COLORS["chart_fill"],
+        "Actual P&L",
+        "<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+        row=None,
+        col=None,
+    )
+    _polymarket_chart_layout(fig)
+    return fig
+
+
+def _load_sim_payload(sim_session_id, wallet, range_key, base_payload):
+    if not sim_session_id or not base_payload:
+        return None, None
+
+    from lib.sharpsim_parser import build_sim_payload
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    session = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_meta = (session.get("wallets") or {}).get(wallet)
+    if not wallet_meta:
+        return None, None
+
+    wallet_meta = {
+        **wallet_meta,
+        "capital": (session.get("session_meta") or {}).get("capital"),
+        "copy_ratio": (session.get("session_meta") or {}).get("copy_ratio"),
+        "execution_mode": (session.get("session_meta") or {}).get("execution_mode"),
+    }
+    sim_payload = None
+    if wallet_meta.get("sim_status") == "ready":
+        sim_payload = build_sim_payload(
+            wallet_meta,
+            (session.get("drl") or {}).get(wallet, []),
+            base_payload.get("closes", []),
+            base_payload.get("resolutions", {}),
+            range_key,
+        )
+    return wallet_meta, sim_payload
+
+
+def _build_curation_decision_row(view, decision, sim_session_id):
+    from lib.curation_prefetch import get_curation_prefetch_manager
+
+    manager = get_curation_prefetch_manager()
+    wallet = view["wallet"]
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    range_key = _normalize_curation_range(view.get("range"))
+    key = manager.make_base_key(wallet, filter_level, filter_value)
+    actual_payload = manager.get_payload(key, range_key) or {}
+    base_payload = manager.get_base_payload(key) or {}
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, range_key, base_payload)
+    actual_summary = actual_payload.get("summary", {})
+    sim_summary = (sim_payload or {}).get("summary", {})
+    return {
+        "wallet": wallet,
+        "filter_level": filter_level,
+        "filter_value": filter_value,
+        "decision": decision,
+        "actual_final_pnl": actual_summary.get("final_pnl", 0.0),
+        "actual_roi_pct": actual_summary.get("roi_pct", 0.0),
+        "sim_final_pnl": sim_summary.get("final_pnl"),
+        "sim_roi_pct": sim_summary.get("roi_pct"),
+        "sim_copied": (wallet_meta or {}).get("copied", 0),
+        "sim_skipped": (wallet_meta or {}).get("skipped", 0),
+        "sim_status": sim_summary.get("sim_status") or (wallet_meta or {}).get("sim_status", "missing_drl"),
+    }
+
+
+@callback(
+    [
+        Output("sc-chart", "figure"),
+        Output("sc-chart-container", "style"),
+        Output("sc-summary", "children"),
+        Output("sc-message", "children"),
+        Output("sc-concentration", "children"),
+        Output("sc-top-markets", "children"),
+    ],
+    [Input("sc-generate", "n_clicks"), Input("sc-active-range", "data")],
+    [State("sc-wallet-input", "value"), State("sc-game-dropdown", "value")],
+    prevent_initial_call=True,
+)
+def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
+    import plotly.graph_objects as go
+
+    empty = no_update, no_update, no_update, no_update, "", ""
+
+    if not n_clicks:
+        return empty
+
+    if not wallet or not wallet.startswith("0x"):
+        return no_update, {"display": "none"}, "", dbc.Alert("Enter a valid wallet address (0x...)", color="warning"), "", ""
+
+    if not filter_raw:
+        return no_update, {"display": "none"}, "", dbc.Alert("Select a category from the dropdown.", color="warning"), "", ""
+
+    if "::" in filter_raw:
+        filter_level, filter_value = filter_raw.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", filter_raw
+
+    lookback = active_range or 365
+
+    try:
+        from lib.clickhouse_charts import get_wallet_curation_data
+        payload = get_wallet_curation_data(wallet.strip().lower(), filter_value, lookback, filter_level=filter_level)
+    except Exception as exc:
+        logger.exception("ClickHouse chart query failed")
+        return no_update, {"display": "none"}, "", dbc.Alert(f"ClickHouse error: {exc}", color="danger"), "", ""
+
+    if not payload:
+        return no_update, {"display": "none"}, "", dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value}.", color="info"), "", ""
+
+    series = payload["series"]
+    summary = payload["summary"]
+    final_pnl = summary["final_pnl"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[s["date"] for s in series], y=[s["pnl"] for s in series],
+        mode="lines", line=dict(color=COLORS["chart_line"], width=2),
+        fill="tozeroy", fillcolor=COLORS["chart_fill"],
+        customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
+        hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
+    ))
+    _polymarket_chart_layout(fig)
+
+    pnl_tone = "positive" if final_pnl >= 0 else "negative"
+    sign = "" if final_pnl == 0 else ("-" if final_pnl < 0 else "")
+    stats = html.Div([
+        _card([
+            html.Div([
+                _stat_tile("Final P&L", f"{sign}${abs(final_pnl):,.2f}", tone=pnl_tone),
+                _stat_tile("ROI", f"{summary.get('roi_pct', 0):.1f}%"),
+                _stat_tile("Trades", f"{summary['total_trades']:,}"),
+                _stat_tile("Volume", f"${summary['total_volume_usd']:,.0f}"),
+                _stat_tile("Drawdown", f"{summary['max_drawdown_pct']:.1f}%"),
+                _stat_tile("Win Rate", f"{summary.get('win_rate', 0):.0f}%"),
+                _stat_tile("Tokens", f"{summary['scoped_tokens']}"),
+                _stat_tile("Period", f"{summary['first_trade_date']} — {summary['chart_end_date']}"),
+            ], className="pm-wallet-stat-grid"),
+        ], class_name="pm-admin-card"),
+    ])
+
+    breakdown = payload.get("breakdown", {})
+    concentration = _build_concentration_badges(breakdown.get("concentration", {}))
+    top_markets = _build_top_markets_table(breakdown.get("markets", []))
+
+    return fig, {"display": "block", "marginTop": "16px"}, stats, "", concentration, top_markets
+
+
+# ─── Wallet Curation callbacks ─────────────────────────────────
+@callback(
+    Output("cur-category", "options"),
+    [Input("tabs", "value"), Input("url", "pathname")],
+)
+def load_curation_categories(tab, pathname):
+    if tab != "wallet-curation" and pathname != "/wallet-curation":
+        return no_update
+    try:
+        from lib.clickhouse_charts import ClickHouseClient, get_available_filters
+        client = ClickHouseClient()
+        filters = get_available_filters(client)
+        options = []
+        seen = set()
+        for level_label, level_key in [("Category", "category"), ("Subcategory", "subcategory"), ("Detail", "detail")]:
+            for item in [f for f in filters if f["level"] == level_key]:
+                val = f"{level_key}::{item['label']}"
+                if val not in seen:
+                    seen.add(val)
+                    options.append({"label": f"[{level_label}] {item['label']} ({item['count']:,})", "value": val})
+        return options
+    except Exception:
+        return [{"label": "[Subcategory] Esports", "value": "subcategory::Esports"}]
+
+
+def _normalize_curation_range(selected_range):
+    return normalize_curation_range_key(selected_range)
+
+
+def _cur_range_label(selected_range):
+    return _CUR_RANGE_LABELS.get(_normalize_curation_range(selected_range), "ALL")
+
+
+def _is_curation_wallet_list(value):
+    return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
+
+
+def _is_curation_range_candidate(value):
+    if isinstance(value, int):
+        return value in {1, 7, 14, 30, 365}
+    if not isinstance(value, str):
+        return False
+    return value.strip().upper() in {"1", "1D", "7", "7D", "14", "14D", "2W", "30", "30D", "365", CURATION_ALL_RANGE}
+
+
+def _coerce_curation_render_state(selected_range, poll_value, wallets, filter_raw):
+    candidates = [selected_range, poll_value, wallets, filter_raw]
+
+    wallet_list = []
+    for candidate in candidates:
+        if _is_curation_wallet_list(candidate):
+            wallet_list = list(candidate)
+            break
+
+    filter_value = ""
+    for candidate in candidates:
+        if isinstance(candidate, str) and "::" in candidate:
+            filter_value = candidate
+            break
+
+    range_value = CURATION_ALL_RANGE
+    for candidate in candidates:
+        if _is_curation_range_candidate(candidate):
+            range_value = candidate
+            break
+
+    return wallet_list, filter_value, _normalize_curation_range(range_value)
+
+
+def _cur_view_key(session_id, index, wallet, filter_raw, selected_range):
+    return "|".join(
+        [
+            str(session_id or ""),
+            str(index if index is not None else ""),
+            str(wallet or ""),
+            str(filter_raw or ""),
+            _normalize_curation_range(selected_range),
+        ]
+    )
+
+
+def _build_curation_wallet_header(wallet, filter_value):
+    return html.Div([
+        html.Span(wallet, className="pm-wallet-copyable", **{"data-clipboard": wallet}),
+        html.Span(f" — {filter_value}", style={"color": "var(--pm-text-secondary)", "marginLeft": "8px"}),
+    ])
+
+
+def _default_curation_status_counts(total_wallets):
+    return {"ready": 0, "running": 0, "queued": 0, "error": 0, "total": total_wallets}
+
+
+def _build_curation_progress_copy(index, wallets, selected_range, status_counts):
+    progress = f"Wallet {index + 1} of {len(wallets)} • {_cur_range_label(selected_range)}"
+    if status_counts.get("total"):
+        progress = (
+            f"Wallet {index + 1} of {len(wallets)}"
+            f" • {_cur_range_label(selected_range)}"
+            f" • ready {status_counts['ready']}/{status_counts['total']}"
+            f" • running {status_counts['running']}"
+        )
+    return progress
+
+
+def _resolve_curation_view(index, session_id, selected_range, wallets, filter_raw):
+    wallets, filter_raw, selected_range = _coerce_curation_render_state(
+        selected_range,
+        None,
+        wallets,
+        filter_raw,
+    )
+    idle_view = {"status": "idle"}
+    if not wallets or index is None or index >= len(wallets):
+        return "", "", idle_view, True
+
+    wallet = wallets[index]
+    if "::" in (filter_raw or ""):
+        filter_level, filter_value = filter_raw.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", filter_raw or ""
+
+    header = _build_curation_wallet_header(wallet, filter_value)
+    status_counts = _default_curation_status_counts(len(wallets))
+    view = {
+        "status": "loading",
+        "key": _cur_view_key(session_id, index, wallet, filter_raw, selected_range),
+        "wallet": wallet,
+        "filter_raw": filter_raw or "",
+        "filter_level": filter_level,
+        "filter_value": filter_value,
+        "range": selected_range,
+        "session_id": session_id or "",
+        "error": None,
+    }
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        if session_id:
+            manager.warm_session_index(session_id, index, warm_count=6)
+            status_counts = manager.get_session_progress(session_id)
+        data = manager.get_payload(key, selected_range)
+        status = manager.get_status(key)
+        error_text = manager.get_error(key)
+
+        if status == "error":
+            view["status"] = "error"
+            view["error"] = error_text or f"Failed to fetch {wallet[:12]}..."
+        elif status == "ready" and not data:
+            view["status"] = "empty"
+        elif data:
+            view["status"] = "ready"
+        else:
+            view["status"] = "loading"
+    except Exception as exc:
+        logger.exception("Curation cache lookup failed")
+        view["status"] = "error"
+        view["error"] = f"Error: {exc}"
+
+    progress = _build_curation_progress_copy(index, wallets, selected_range, status_counts)
+    poll_disabled = view["status"] in {"idle", "ready", "empty", "error"}
+    return progress, header, view, poll_disabled
+
+
+@callback(
+    Output("cur-range", "data"),
+    [Input(f"cur-setup-range-{token}", "n_clicks") for token in _CUR_RANGE_TOKENS]
+    + [Input(f"cur-swipe-range-{token}", "n_clicks") for token in _CUR_RANGE_TOKENS],
+    State("cur-range", "data"),
+    prevent_initial_call=True,
+)
+def set_cur_range(*args):
+    *clicks, current = args
+    triggered = dash.ctx.triggered_id
+    click_map = {
+        **{f"cur-setup-range-{token}": token for token in _CUR_RANGE_TOKENS},
+        **{f"cur-swipe-range-{token}": token for token in _CUR_RANGE_TOKENS},
+    }
+    clicks_map = dict(zip(click_map.keys(), clicks))
+    selected = _normalize_curation_range(current)
+    if triggered in click_map and clicks_map.get(triggered):
+        return click_map[triggered]
+    return selected
+
+
+@callback(
+    [Output(f"cur-setup-range-{token}", "className") for token in _CUR_RANGE_TOKENS]
+    + [Output(f"cur-swipe-range-{token}", "className") for token in _CUR_RANGE_TOKENS],
+    Input("cur-range", "data"),
+)
+def highlight_cur_range(selected):
+    selected = _normalize_curation_range(selected)
+    classes = [
+        "pm-range-pill pm-range-pill--active" if token == selected else "pm-range-pill"
+        for token in _CUR_RANGE_TOKENS
+    ]
+    return classes + classes.copy()
+
+
+@callback(
+    [
+        Output("cur-sim-session-id", "data"),
+        Output("cur-sim-active", "data"),
+        Output("cur-sim-overlay-visible", "data"),
+        Output("cur-sim-summary", "children"),
+        Output("cur-manual-fields", "style"),
+        Output("cur-sim-clear", "style"),
+        Output("cur-setup-msg", "children", allow_duplicate=True),
+    ],
+    Input("cur-sim-upload", "contents"),
+    State("cur-sim-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_sim_upload(contents, filename):
+    if not contents:
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+    try:
+        from base64 import b64decode
+        from lib.sharpsim_parser import parse_sharpsim
+        from lib.sharpsim_session import get_sharpsim_session_manager
+
+        _, encoded = contents.split(",", 1)
+        payload = parse_sharpsim(b64decode(encoded), filename or "")
+        session_id = get_sharpsim_session_manager().create_session(payload)
+        summary = " | ".join(
+            [f"{len(payload['wallet_order'])} wallets loaded from Sharpsim"]
+            + [f"{label} ({count})" for label, count in payload.get("filter_summary", {}).items()]
+        )
+        return (
+            session_id,
+            True,
+            True,
+            dbc.Alert(summary, color="secondary"),
+            {"display": "none"},
+            {"display": "inline-flex"},
+            "",
+        )
+    except Exception as exc:
+        logger.exception("Sharpsim upload failed")
+        return (
+            "",
+            False,
+            False,
+            "",
+            {"display": "block"},
+            {"display": "none"},
+            dbc.Alert(f"Invalid Sharpsim workbook: {exc}", color="danger"),
+        )
+
+
+@callback(
+    [
+        Output("cur-sim-session-id", "data", allow_duplicate=True),
+        Output("cur-sim-active", "data", allow_duplicate=True),
+        Output("cur-sim-overlay-visible", "data", allow_duplicate=True),
+        Output("cur-sim-summary", "children", allow_duplicate=True),
+        Output("cur-manual-fields", "style", allow_duplicate=True),
+        Output("cur-sim-clear", "style", allow_duplicate=True),
+    ],
+    Input("cur-sim-clear", "n_clicks"),
+    State("cur-sim-session-id", "data"),
+    prevent_initial_call=True,
+)
+def clear_sim_session(n_clicks, sim_session_id):
+    if not n_clicks:
+        return [no_update] * 6
+
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    if sim_session_id:
+        get_sharpsim_session_manager().clear_session(sim_session_id)
+    return "", False, False, "", {"display": "block"}, {"display": "none"}
+
+
+def _wallet_configs_from_manual_inputs(wallet_text, category):
+    wallets = [wallet.strip().lower() for wallet in (wallet_text or "").splitlines() if wallet.strip().startswith("0x")]
+    if "::" in (category or ""):
+        filter_level, filter_value = category.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", category or ""
+    wallet_configs = [
+        {"address": wallet, "filter_level": filter_level, "filter_value": filter_value}
+        for wallet in wallets
+    ]
+    return wallets, wallet_configs, f"{filter_level}::{filter_value}"
+
+
+def _wallet_configs_from_sim_session(sim_session_id):
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    payload = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_configs = [
+        {
+            "address": wallet,
+            "filter_level": payload["wallets"][wallet]["filter_level"],
+            "filter_value": payload["wallets"][wallet]["filter_value"],
+        }
+        for wallet in payload.get("wallet_order", [])
+    ]
+    filter_raw = ""
+    if wallet_configs:
+        filter_raw = f"{wallet_configs[0]['filter_level']}::{wallet_configs[0]['filter_value']}"
+    return payload.get("wallet_order", []), wallet_configs, filter_raw
+
+
+@callback(
+    [Output("cur-wallets", "data"), Output("cur-filter", "data"),
+     Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
+     Output("cur-session-id", "data"),
+     Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
+     Output("cur-setup-msg", "children")],
+    Input("cur-start", "n_clicks"),
+    [
+        State("cur-wallet-input", "value"),
+        State("cur-category", "value"),
+        State("cur-range", "data"),
+        State("cur-sim-active", "data"),
+        State("cur-sim-session-id", "data"),
+    ],
+    prevent_initial_call=True,
+)
+def start_curation(n_clicks, wallet_text, category, selected_range, sim_active, sim_session_id):
+    if not n_clicks:
+        return [no_update] * 10
+
+    if sim_active and sim_session_id:
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_sim_session(sim_session_id)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("Uploaded Sharpsim session has no wallets.", color="warning")]
+    else:
+        if not wallet_text or not wallet_text.strip():
+            return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+        if not category:
+            return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_manual_inputs(wallet_text, category)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+
+    selected_range = _normalize_curation_range(selected_range)
+
+    session_id = uuid.uuid4().hex
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        get_curation_prefetch_manager().prime_session(
+            session_id=session_id,
+            wallet_configs=wallet_configs,
+            warm_count=6,
+        )
+    except Exception:
+        logger.exception("Failed to seed curation prefetch session")
+
+    return (
+        wallets, filter_raw, 0, [], {}, session_id,
+        {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
+    )
+
+
+@callback(
+    [
+        Output("cur-progress", "children"),
+        Output("cur-wallet-header", "children"),
+        Output("cur-view", "data"),
+        Output("cur-prefetch-poll", "disabled"),
+    ],
+    [Input("cur-index", "data"), Input("cur-session-id", "data"), Input("cur-range", "data"), Input("cur-prefetch-poll", "n_intervals")],
+    [State("cur-wallets", "data"), State("cur-filter", "data"), State("cur-view", "data")],
+)
+def update_curation_status(index, session_id, selected_range, _poll, wallets, filter_raw, current_view):
+    progress, header, next_view, poll_disabled = _resolve_curation_view(
+        index,
+        session_id,
+        selected_range,
+        wallets,
+        filter_raw,
+    )
+    if current_view == next_view:
+        next_view = no_update
+    return progress, header, next_view, poll_disabled
+
+
+@callback(
+    [
+        Output("cur-warnings", "children"),
+        Output("cur-read", "children"),
+        Output("cur-sim-summary-panel", "children"),
+        Output("cur-chart", "figure"),
+        Output("cur-stats", "children"),
+        Output("cur-concentration", "children"),
+        Output("cur-top-markets", "children"),
+    ],
+    Input("cur-view", "data"),
+    Input("cur-sim-overlay-visible", "data"),
+    State("cur-sim-session-id", "data"),
+)
+def render_curation_wallet(view, sim_overlay_visible, sim_session_id):
+    if not view or view.get("status") == "idle":
+        return "", "", "", _build_curation_loading_figure("No wallet selected"), "", "", ""
+
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
+
+    if view["status"] == "error":
+        return [
+            html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(),
+            "",
+            _build_curation_loading_figure("Wallet fetch failed"),
+            dbc.Alert(view.get("error") or f"Failed to fetch {wallet[:12]}...", color="danger"),
+            "",
+            "",
+        ]
+
+    if view["status"] == "empty":
+        return [
+            "",
+            "",
+            "",
+            _build_curation_loading_figure("No trades found"),
+            dbc.Alert(f"No trades found for {wallet[:12]}... in {filter_value} for {_cur_range_label(selected_range)}.", color="info"),
+            "",
+            "",
+        ]
+
+    if view["status"] == "loading":
+        loading_warning = html.Div(
+            [_status_chip("Loading wallet data", tone="warning")],
+            className="pm-status-chip-row",
+            style={"justifyContent": "flex-start"},
+        )
+        return [
+            loading_warning,
+            _build_curation_loading_read(),
+            "",
+            _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
+            dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
+            "",
+            "",
+        ]
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        data = manager.get_payload(key, selected_range)
+    except Exception as exc:
+        logger.exception("Failed to render curation wallet")
+        return [
+            html.Div([_status_chip("Background fetch failed", tone="danger")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(),
+            "",
+            _build_curation_loading_figure("Wallet fetch failed"),
+            dbc.Alert(f"Error: {exc}", color="danger"),
+            "",
+            "",
+        ]
+
+    if not data:
+        return [
+            html.Div([_status_chip("Loading wallet data", tone="warning")], className="pm-status-chip-row", style={"justifyContent": "flex-start"}),
+            _build_curation_loading_read(),
+            "",
+            _build_curation_loading_figure(f"Loading {wallet[:10]}..."),
+            dbc.Alert("Fetching chart data in the background. You can stay here; the next wallets are warming too.", color="secondary"),
+            "",
+            "",
+        ]
+
+    series = data["series"]
+    summary = data["summary"]
+
+    base_payload = manager.get_base_payload(key)
+    wallet_meta, sim_payload = _load_sim_payload(sim_session_id, wallet, selected_range, base_payload)
+    sim_series = (sim_payload or {}).get("series") or None
+    fig = _build_curation_chart_figure(series, sim_series=sim_series)
+
+    sim_panel = ""
+    if wallet_meta:
+        sim_panel = html.Div(
+            [
+                _build_sim_summary_strip(wallet_meta),
+                _build_sim_validation((sim_payload or {}).get("validation")),
+                dbc.Alert("Sim data unavailable for this wallet.", color="secondary", className="pm-inline-message")
+                if wallet_meta.get("sim_status") != "ready" or not sim_payload
+                else "",
+            ],
+            className="pm-sim-panel",
+        )
+
+    stats = _build_curation_stats(summary, sim_payload, wallet_meta or {})
+
+    signals = data.get("signals", {})
+    warnings = _build_curation_warning_strip(signals)
+    curation_read = _build_curation_read(summary, signals)
+    concentration = _build_curation_signal_badges(signals)
+    breakdown = data.get("breakdown", {})
+    top_markets = _build_curation_bottom_sections(
+        breakdown.get("markets", []),
+        data.get("both_sides_rows", []),
+    )
+
+    return [warnings, curation_read, sim_panel, fig, stats, concentration, top_markets]
+
+
+def render_curation_trade_audit(is_open, view):
+    if not is_open:
+        return no_update, no_update
+    if not view or view.get("status") != "ready":
+        return "Loading...", _build_curation_empty_table_state("Trade audit will load when wallet data is ready.")
+
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        base_payload = manager.get_base_payload(key)
+    except Exception as exc:
+        logger.exception("Failed to load curation trade audit")
+        return "Unavailable", dbc.Alert(f"Trade audit unavailable: {exc}", color="danger", className="pm-inline-message")
+
+    if not base_payload:
+        return "Loading...", _build_curation_empty_table_state("Trade audit will load when wallet data is ready.")
+
+    audit_payload = build_wallet_trade_audit_payload_from_base(base_payload, selected_range)
+    total_rows = int(audit_payload.get("total_rows") or 0)
+    display_rows = list(audit_payload.get("display_rows") or [])
+    if total_rows <= 0:
+        return "0 rows", _build_curation_empty_table_state("No trades in this range.")
+    return f"{len(display_rows):,} shown of {total_rows:,} rows", _build_curation_trade_audit_body(audit_payload)
+
+
+@callback(
+    Output("cur-all-trades-meta", "children"),
+    Output("cur-all-trades-body", "children"),
+    Input("cur-all-trades-section", "open"),
+    State("cur-view", "data"),
+    prevent_initial_call=True,
+)
+def update_curation_trade_audit(is_open, view):
+    return render_curation_trade_audit(is_open, view)
+
+
+@callback(
+    Output("cur-trade-audit-download", "data"),
+    Input("cur-all-trades-download-btn", "n_clicks"),
+    State("cur-view", "data"),
+    prevent_initial_call=True,
+)
+def download_curation_trade_audit(n_clicks, view):
+    import csv
+    import io
+
+    if not n_clicks or not view or view.get("status") != "ready":
+        return no_update
+
+    wallet = view.get("wallet", "")
+    filter_level = view.get("filter_level", "detail")
+    filter_value = view.get("filter_value", "")
+    selected_range = _normalize_curation_range(view.get("range"))
+
+    try:
+        from lib.curation_prefetch import get_curation_prefetch_manager
+
+        manager = get_curation_prefetch_manager()
+        key = manager.make_base_key(wallet, filter_level, filter_value)
+        base_payload = manager.get_base_payload(key)
+    except Exception:
+        logger.exception("Failed to prepare curation trade audit export")
+        return no_update
+
+    if not base_payload:
+        return no_update
+
+    audit_payload = build_wallet_trade_audit_payload_from_base(base_payload, selected_range, limit_per_side=None)
+    rows = list(audit_payload.get("rows") or [])
+    if not rows:
+        return no_update
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["ts", "market", "outcome_label", "side", "shares", "price", "dollars", "fee", "mtm_pnl"],
+    )
+    writer.writeheader()
+    for row in sorted(rows, key=lambda item: (str(item.get("ts") or ""), str(item.get("market") or ""), str(item.get("outcome_label") or "")), reverse=True):
+        writer.writerow({field: row.get(field) for field in writer.fieldnames})
+
+    wallet_slug = (wallet or "wallet")[:10]
+    range_slug = selected_range.lower()
+    filename = f"curation_trades_{wallet_slug}_{range_slug}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    return dict(content=buffer.getvalue(), filename=filename)
+
+
+@callback(
+    [Output("cur-index", "data", allow_duplicate=True),
+     Output("cur-approved", "data", allow_duplicate=True),
+     Output("cur-decisions", "data", allow_duplicate=True),
+     Output("cur-setup", "style", allow_duplicate=True),
+     Output("cur-swipe", "style", allow_duplicate=True),
+     Output("cur-results", "style", allow_duplicate=True),
+     Output("cur-results-title", "children"),
+     Output("cur-results-list", "children")],
+    [Input("cur-approve", "n_clicks"), Input("cur-skip", "n_clicks"), Input("cur-back", "n_clicks")],
+    [State("cur-index", "data"), State("cur-wallets", "data"),
+     State("cur-approved", "data"), State("cur-decisions", "data"),
+     State("cur-view", "data"), State("cur-sim-session-id", "data")],
+    prevent_initial_call=True,
+)
+def handle_curation_action(approve_clicks, skip_clicks, back_clicks, index, wallets, approved, decisions, current_view, sim_session_id):
+    try:
+        triggered = dash.ctx.triggered_id
+    except Exception:
+        triggered = None
+    if not triggered:
+        if approve_clicks:
+            triggered = "cur-approve"
+        elif skip_clicks:
+            triggered = "cur-skip"
+        elif back_clicks:
+            triggered = "cur-back"
+    if not triggered or not wallets:
+        return [no_update] * 8
+
+    if triggered == "cur-back":
+        if index > 0:
+            return [index - 1] + [no_update] * 7
+        return [no_update] * 8
+
+    wallet = wallets[index] if index < len(wallets) else None
+    if not wallet or not current_view:
+        return [no_update] * 8
+
+    if triggered == "cur-approve" and approve_clicks:
+        if wallet not in approved:
+            approved = approved + [wallet]
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "approved", sim_session_id)}
+    elif triggered == "cur-skip" and skip_clicks:
+        decisions = {**decisions, wallet: _build_curation_decision_row(current_view, "skipped", sim_session_id)}
+    else:
+        return [no_update] * 8
+
+    next_index = index + 1
+    if next_index >= len(wallets):
+        title = f"Approved {len(approved)} of {len(wallets)} wallets"
+        wallet_list = html.Div([html.Div(w, style={"fontFamily": "monospace", "padding": "2px 0"}) for w in approved]) if approved else html.Div("No wallets approved.", style={"color": "var(--pm-text-secondary)"})
+        return [next_index, approved, decisions,
+                {"display": "none"}, {"display": "none"}, {"display": "block"},
+                title, wallet_list]
+
+    return [next_index, approved, decisions, no_update, no_update, no_update, no_update, no_update]
+
+
+@callback(
+    Output("cur-download", "data"),
+    Input("cur-download-btn", "n_clicks"),
+    State("cur-decisions", "data"),
+    prevent_initial_call=True,
+)
+def download_curation_results(n_clicks, decisions):
+    import csv
+    import io
+
+    if not n_clicks or not decisions:
+        return no_update
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "wallet",
+            "filter_level",
+            "filter_value",
+            "decision",
+            "actual_final_pnl",
+            "actual_roi_pct",
+            "sim_final_pnl",
+            "sim_roi_pct",
+            "sim_copied",
+            "sim_skipped",
+            "sim_status",
+        ],
+    )
+    writer.writeheader()
+    for row in decisions.values():
+        writer.writerow(row)
+    return dict(content=buffer.getvalue(), filename=f"curation_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
+
+
+@callback(
+    [Output("cur-setup", "style", allow_duplicate=True),
+     Output("cur-swipe", "style", allow_duplicate=True),
+     Output("cur-results", "style", allow_duplicate=True)],
+    Input("cur-new-batch", "n_clicks"),
+    prevent_initial_call=True,
+)
+def new_batch(n_clicks):
+    if not n_clicks:
+        return [no_update] * 3
+    return [{"display": "block"}, {"display": "none"}, {"display": "none"}]
+
+
+def _ensure_clickhouse_tunnel():
+    """Auto-start SSH tunnel for local ClickHouse access if not already running."""
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("DISABLE_TUNNEL") == "1":
+        return  # skip on Railway or if explicitly disabled
+    ch_url = os.environ.get("CLICKHOUSE_URL", "")
+    if "127.0.0.1" not in ch_url and "localhost" not in ch_url:
+        return  # not using local tunnel
+    key_path = Path.home() / ".ssh" / "jake_hetzner_ed25519"
+    if not key_path.exists():
+        logger.info("SSH key not found at %s — skipping tunnel", key_path)
+        return
+    # Check if tunnel is already running
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "ssh.*8123.*142.132.139.47"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            logger.info("ClickHouse SSH tunnel already running")
+            return
+    except Exception:
+        pass
+    # Start tunnel in background
+    try:
+        subprocess.Popen(
+            [
+                "ssh", "-N", "-f",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ExitOnForwardFailure=yes",
+                "-L", "8123:127.0.0.1:8123",
+                "-L", "9000:127.0.0.1:9000",
+                "-i", str(key_path),
+                "jake@142.132.139.47",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("Started ClickHouse SSH tunnel")
+    except Exception as exc:
+        logger.warning("Failed to start SSH tunnel: %s", exc)
+
+
+start_scheduler()
+try:
     init_db()
+except Exception as exc:
+    logger.warning("Initial database bootstrap failed: %s", exc)
 
-    # Create initial snapshot if none exist
-    conn = get_connection()
-    snap_count = conn.execute("SELECT COUNT(*) FROM pnl_snapshots").fetchone()[0]
-    trade_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    if snap_count == 0 and trade_count > 0:
-        from lib.snapshots import maybe_create_snapshot, save_csv_if_changed
-        maybe_create_snapshot(conn)
-        save_csv_if_changed(conn)
-    conn.close()
-
-    print("\n  Wallet Curator Dashboard")
-    print("  http://localhost:5050\n")
-    app.run(debug=False, port=5050)
+if __name__ == "__main__":
+    _ensure_clickhouse_tunnel()
+    port = int(os.environ.get("PORT", "8050"))
+    app.run(host="0.0.0.0", port=port, debug=False)
