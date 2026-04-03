@@ -4,6 +4,8 @@ from typing import Iterable
 import psycopg2
 from psycopg2.extras import DictCursor
 
+from lib.tier_defaults import DEFAULT_TIER_CONFIG_ROWS, TIER_SORT_ORDER_UPDATES
+
 logger = logging.getLogger(__name__)
 
 
@@ -429,7 +431,7 @@ POSTGRES_MIGRATIONS = [
     "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS old_tier_config JSONB",
     "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS new_tier_config JSONB",
     "ALTER TABLE csv_push_history ADD COLUMN IF NOT EXISTS reverts_push_id INTEGER",
-]
+] + TIER_SORT_ORDER_UPDATES
 
 
 def init_postgres_schema(conn: CloudConnection):
@@ -444,11 +446,7 @@ def init_postgres_schema(conn: CloudConnection):
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (tier_name) DO NOTHING
         """,
-        [
-            ("test", "Test", 4.0, 1),
-            ("promoted", "Promoted", 10.0, 2),
-            ("high_conviction", "High Conviction", 20.0, 3),
-        ],
+        DEFAULT_TIER_CONFIG_ROWS,
     )
     cursor.execute(
         """

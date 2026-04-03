@@ -85,7 +85,7 @@ def parse_game_from_whitelist(whitelist):
     games = set()
     if any(pattern in whitelist for pattern in ["cs2", "csgo", "counter-strike"]):
         games.add("CS2")
-    if "lol" in whitelist:
+    if any(pattern in whitelist for pattern in ["lol", "league of legends", "league-of-legends"]):
         games.add("LOL")
     if any(pattern in whitelist for pattern in ["dota2", "dota-2", "dota"]):
         games.add("DOTA")
@@ -234,6 +234,69 @@ def read_valid_csv_text(filepath):
         csv_text += "\n"
     rows = list(csv.DictReader(io.StringIO(csv_text)))
     return csv_text, rows
+
+
+def build_wallet_sync_payload(wallets_path):
+    csv_text, rows = read_valid_csv_text(wallets_path)
+    raw_lines = csv_text.splitlines()
+    header_row = raw_lines[0] if raw_lines else ""
+    global_row = ""
+    wallets = []
+    row_order = 0
+
+    for index, row in enumerate(rows, start=1):
+        address = normalize_wallet(row.get("address", ""))
+        if not address:
+            continue
+
+        raw_line = raw_lines[index] if index < len(raw_lines) else ""
+        if address == "__global__":
+            global_row = raw_line
+            continue
+
+        whitelist = (row.get("market_whitelist") or "").strip()
+        copy_percentage = parse_float_or_none(row.get("copy_percentage"))
+        copy_percentage_enabled = 1 if str(row.get("copy_percentage_enabled", "")).strip().lower() == "true" else 0
+        wallets.append(
+            (
+                address,
+                whitelist,
+                parse_game_from_whitelist(whitelist),
+                raw_line,
+                row_order,
+                copy_percentage,
+                copy_percentage_enabled,
+            )
+        )
+        row_order += 1
+
+    return {
+        "csv_text": csv_text,
+        "header_row": header_row,
+        "global_row": global_row,
+        "wallets": wallets,
+    }
+
+
+def upsert_synced_csv_state(cursor, wallet_sync_payload, source_path):
+    cursor.execute(
+        """
+        INSERT INTO synced_csv_state (id, header_row, global_row, csv_content, synced_at, source_path)
+        VALUES (1, %s, %s, %s, NOW(), %s)
+        ON CONFLICT (id) DO UPDATE
+        SET header_row = EXCLUDED.header_row,
+            global_row = EXCLUDED.global_row,
+            csv_content = EXCLUDED.csv_content,
+            synced_at = EXCLUDED.synced_at,
+            source_path = EXCLUDED.source_path
+        """,
+        (
+            wallet_sync_payload["header_row"],
+            wallet_sync_payload["global_row"],
+            wallet_sync_payload["csv_text"],
+            str(source_path),
+        ),
+    )
 
 
 def load_last_synced_hash():
@@ -396,54 +459,11 @@ def push_trades(conn, trades):
 
 
 def sync_active_wallets(conn, wallets_path):
-    csv_text, rows = read_valid_csv_text(wallets_path)
-    if not rows:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO synced_csv_state (id, header_row, global_row, csv_content, synced_at, source_path)
-                VALUES (1, '', '', '', NOW(), %s)
-                ON CONFLICT (id) DO UPDATE
-                SET header_row = EXCLUDED.header_row,
-                    global_row = EXCLUDED.global_row,
-                    csv_content = EXCLUDED.csv_content,
-                    synced_at = EXCLUDED.synced_at,
-                    source_path = EXCLUDED.source_path
-                """,
-                (str(wallets_path),),
-            )
-        conn.commit()
-        return 0
-
-    raw_lines = csv_text.splitlines()
-    header_row = raw_lines[0] if raw_lines else ""
-    global_row = raw_lines[1] if len(raw_lines) > 1 else ""
-    wallets = []
-    row_order = 0
-    for index, row in enumerate(rows, start=1):
-        address = normalize_wallet(row.get("address", ""))
-        if not address or address == "__global__":
-            continue
-        whitelist = (row.get("market_whitelist") or "").strip()
-        raw_line = raw_lines[index] if index < len(raw_lines) else ""
-        copy_percentage = parse_float_or_none(row.get("copy_percentage"))
-        copy_percentage_enabled = 1 if str(row.get("copy_percentage_enabled", "")).strip().lower() == "true" else 0
-        wallets.append(
-            (
-                address,
-                whitelist,
-                parse_game_from_whitelist(whitelist),
-                raw_line,
-                row_order,
-                copy_percentage,
-                copy_percentage_enabled,
-            )
-        )
-        row_order += 1
+    wallet_sync_payload = build_wallet_sync_payload(wallets_path)
 
     with conn.cursor() as cursor:
         cursor.execute("TRUNCATE TABLE synced_active_wallets")
-        if wallets:
+        if wallet_sync_payload["wallets"]:
             execute_values(
                 cursor,
                 """
@@ -453,24 +473,12 @@ def sync_active_wallets(conn, wallets_path):
                 )
                 VALUES %s
                 """,
-                wallets,
+                wallet_sync_payload["wallets"],
                 page_size=250,
             )
-        cursor.execute(
-            """
-            INSERT INTO synced_csv_state (id, header_row, global_row, csv_content, synced_at, source_path)
-            VALUES (1, %s, %s, %s, NOW(), %s)
-            ON CONFLICT (id) DO UPDATE
-            SET header_row = EXCLUDED.header_row,
-                global_row = EXCLUDED.global_row,
-                csv_content = EXCLUDED.csv_content,
-                synced_at = EXCLUDED.synced_at,
-                source_path = EXCLUDED.source_path
-            """,
-            (header_row, global_row, csv_text, str(wallets_path)),
-        )
+        upsert_synced_csv_state(cursor, wallet_sync_payload, wallets_path)
     conn.commit()
-    return len(wallets)
+    return len(wallet_sync_payload["wallets"])
 
 
 def check_pending_push(conn):

@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Polymarket P&L Chart - Reproduction</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-page: #15191d;
+      --bg-card: #181d21;
+      --surface: #1e2428;
+      --border: #242b32;
+      --text-primary: #dee3e7;
+      --text-white: #ffffff;
+      --text-secondary: #7b8996;
+      --brand-500: #0093fd;
+      --gradient-end: #9B51E0;
+      --positive: #3db468;
+      --negative: #ff4d4d;
+    }
+
+    body {
+      background: var(--bg-page);
+      font-family: 'Inter', sans-serif;
+      color: var(--text-primary);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .profile-card {
+      display: flex;
+      width: 100%;
+      max-width: 780px;
+      gap: 0;
+    }
+
+    /* Left side: User info */
+    .user-info {
+      flex: 1;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .user-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .avatar {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+
+    .username {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-white);
+    }
+
+    .user-meta {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .stats-row {
+      display: flex;
+      gap: 24px;
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-white);
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    /* Right side: Chart card */
+    .chart-card {
+      flex: 1.1;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 15.2px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Chart header */
+    .chart-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0;
+    }
+
+    .chart-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .chart-title svg {
+      color: var(--text-secondary);
+    }
+
+    .chart-title h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .time-buttons {
+      display: flex;
+      gap: 4px;
+    }
+
+    .time-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-family: 'Inter', sans-serif;
+      font-size: 14px;
+      padding: 4px 8px;
+      border-radius: 9.2px;
+      cursor: pointer;
+      transition: color 0.15s;
+    }
+
+    .time-btn:hover {
+      color: var(--text-primary);
+    }
+
+    .time-btn.active {
+      color: var(--brand-500);
+    }
+
+    /* Value display */
+    .value-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 2px;
+    }
+
+    .profit-value {
+      font-size: 30px;
+      font-weight: 600;
+      color: var(--text-white);
+      letter-spacing: -0.5px;
+    }
+
+    .branding {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    .branding svg {
+      height: 18px;
+      width: auto;
+    }
+
+    /* Sub label */
+    .sub-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .all-time-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    /* Chart area */
+    .chart-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      margin-top: 8px;
+    }
+
+    .chart-svg-container {
+      width: 100%;
+      position: relative;
+    }
+
+    .chart-svg-container svg {
+      width: 100%;
+      display: block;
+    }
+
+    /* Tooltip (hover state) */
+    .chart-tooltip {
+      display: none;
+      position: absolute;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      color: var(--text-primary);
+      pointer-events: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div class="profile-card">
+    <!-- Left: User Info -->
+    <div class="user-info">
+      <div class="user-header">
+        <div class="avatar"></div>
+        <div>
+          <div class="username">whatyouknowboutlove</div>
+          <div class="user-meta">Joined Dec 2025 &middot; 629 views</div>
+        </div>
+      </div>
+      <div class="stats-row">
+        <div class="stat">
+          <span class="stat-value">$8,167.24</span>
+          <span class="stat-label">Positions Value</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value">$4,585.69</span>
+          <span class="stat-label">Biggest Win</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value">300</span>
+          <span class="stat-label">Predictions</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Chart Card -->
+    <div class="chart-card">
+      <!-- Header -->
+      <div class="chart-header">
+        <div class="chart-title">
+          <svg viewBox="0 0 12 12" width="12" height="12" fill="currentColor">
+            <path d="m7.248,2.52c-.559-.837-1.938-.837-2.496,0L1.653,7.168c-.308.461-.336,1.051-.074,1.54.262.489.769.792,1.322.792h6.197c.554,0,1.061-.303,1.322-.792.262-.488.233-1.079-.074-1.54l-3.099-4.648Z"/>
+          </svg>
+          <h2>Profit/Loss</h2>
+        </div>
+        <div class="time-buttons">
+          <button class="time-btn" data-period="1D">1D</button>
+          <button class="time-btn" data-period="1W">1W</button>
+          <button class="time-btn" data-period="1M">1M</button>
+          <button class="time-btn active" data-period="ALL">ALL</button>
+        </div>
+      </div>
+
+      <!-- Value -->
+      <div class="value-row">
+        <span class="profit-value">$38,753.37</span>
+        <div class="branding">
+          <svg viewBox="0 0 18 18" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="12.5 6.25 9 2.75 5.5 6.25"/>
+            <line x1="9" y1="2.75" x2="9" y2="10.25"/>
+            <path d="M15.25,11.75v1.5c0,1.105-.895,2-2,2H4.75c-1.105,0-2-.895-2-2v-1.5"/>
+          </svg>
+          <span>Polymarket</span>
+        </div>
+      </div>
+
+      <!-- Sub label -->
+      <div class="sub-row">
+        <span class="all-time-label">All-Time</span>
+      </div>
+
+      <!-- Chart -->
+      <div class="chart-area">
+        <div class="chart-svg-container">
+          <svg id="pnlChart" viewBox="0 0 442 54" preserveAspectRatio="none" fill="none">
+            <defs>
+              <linearGradient id="strokeGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#0093fd" stop-opacity="1"/>
+                <stop offset="100%" stop-color="#9B51E0" stop-opacity="1"/>
+              </linearGradient>
+              <linearGradient id="fillGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#0093fd" stop-opacity="0.25"/>
+                <stop offset="100%" stop-color="#9B51E0" stop-opacity="0.005"/>
+              </linearGradient>
+              <clipPath id="chartClip">
+                <rect width="442" height="54"/>
+              </clipPath>
+            </defs>
+            <g clip-path="url(#chartClip)">
+              <path id="fillPath" fill="url(#fillGrad)" stroke-width="0"/>
+              <path id="strokePath" fill="transparent" stroke="url(#strokeGrad)" stroke-width="2"/>
+              <rect width="442" height="54" fill="transparent"/>
+            </g>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Chart coordinate data (sampled from Polymarket SVG)
+    const rawPoints = [
+      [0,48.75],[2.68,48.75],[5.36,48.75],[8.04,48.75],[10.73,48.75],
+      [13.41,48.75],[16.09,48.75],[18.77,48.75],[21.45,47.94],[24.13,47.84],
+      [26.81,46.14],[29.5,46.23],[32.18,47.48],[34.86,47.12],[37.54,46.96],
+      [40.22,46.98],[42.9,47.03],[45.59,47.03],[48.27,48.23],[50.95,48.71],
+      [53.63,48.71],[56.31,48.91],[58.99,46.09],[61.67,46.09],[64.36,46.48],
+      [67.04,46.02],[69.72,46.23],[72.4,46.11],[75.08,48.56],[77.76,48.59],
+      [80.44,48.82],[83.13,48.82],[85.81,48.82],[88.49,48.82],[91.17,47.25],
+      [93.85,47.25],[96.53,47.64],[99.22,47.62],[101.9,48.65],[104.58,48.65],
+      [107.26,48.17],[109.94,48.54],[112.62,47.66],[115.3,47.65],[117.99,47.69],
+      [120.67,47.85],[123.35,47.82],[126.03,47.83],[128.71,48.29],[131.39,48.32],
+      [134.07,49.26],[136.76,49.34],[139.44,49.79],[142.12,49.79],[144.8,49.99],
+      [147.48,49.99],[150.16,50.01],[152.85,50.01],[155.53,49.7],[158.21,49.7],
+      [160.89,49.7],[163.57,49.54],[166.25,48.88],[168.93,48.9],[171.62,48.72],
+      [174.3,48.7],[176.98,48.28],[179.66,48.28],[182.34,48.53],[185.02,48.34],
+      [187.7,49.58],[190.39,49.58],[193.07,49.58],[195.75,49.55],[198.43,49.55],
+      [201.11,49.56],[203.79,49.57],[206.48,49.57],[209.16,49.04],[211.84,49.02],
+      [214.52,48.74],[217.2,48.67],[219.88,48.48],[222.56,48.48],[225.25,48.24],
+      [227.93,48.24],[230.61,48.85],[233.29,48.88],[235.97,48.9],[238.65,48.93],
+      [241.33,48.39],[244.02,47.6],[246.7,46.75],[249.38,45.1],[252.06,44.43],
+      [254.74,44.26],[257.42,43.95],[260.11,44.01],[262.79,44.15],[265.47,44.05],
+      [268.15,46.07],[270.83,46.12],[273.51,46.14],[276.19,46.42],[278.88,46.0],
+      [281.56,45.98],[284.24,46.07],[286.92,46.63],[289.6,48.41],[292.28,48.97],
+      [294.96,47.55],[297.65,47.55],[300.33,48.52],[303.01,47.31],[305.69,47.13],
+      [308.37,46.52],[311.05,44.96],[313.74,44.96],[316.42,45.44],[319.1,45.44],
+      [321.78,40.61],[324.46,40.56],[327.14,36.88],[329.82,36.91],[332.51,34.84],
+      [335.19,34.8],[336.08,34.77],[338.76,30.51],[341.44,30.59],[344.13,27.98],
+      [346.81,28.0],[349.49,27.99],[352.17,27.98],[354.85,25.57],[357.53,25.55],
+      [360.21,26.23],[362.9,26.2],[365.58,27.39],[368.26,27.37],[370.94,27.59],
+      [373.62,27.59],[376.3,19.56],[378.98,19.74],[381.67,11.6],[384.35,11.71],
+      [387.03,12.59],[389.71,12.59],[392.39,15.56],[395.07,15.58],[397.76,11.71],
+      [400.44,11.76],[403.12,6.89],[405.8,6.89],[408.48,6.88],[411.16,6.89],
+      [413.84,6.93],[416.53,7.03],[419.21,9.0],[421.89,9.0],[424.57,9.0],
+      [427.25,9.79],[429.93,10.5],[432.61,9.78],[435.3,11.17],[437.98,11.19],
+      [440.51,11.04],[442,11.04]
+    ];
+
+    /**
+     * Build a smooth cubic bezier SVG path through points.
+     * Uses Catmull-Rom to cubic bezier conversion for smooth curves.
+     */
+    function buildSmoothPath(points) {
+      if (points.length < 2) return '';
+
+      let d = `M${points[0][0]},${points[0][1]}`;
+
+      for (let i = 0; i < points.length - 1; i++) {
+        const p0 = points[Math.max(0, i - 1)];
+        const p1 = points[i];
+        const p2 = points[i + 1];
+        const p3 = points[Math.min(points.length - 1, i + 2)];
+
+        // Catmull-Rom to cubic bezier control points
+        const tension = 6; // higher = less curvy
+        const cp1x = p1[0] + (p2[0] - p0[0]) / tension;
+        const cp1y = p1[1] + (p2[1] - p0[1]) / tension;
+        const cp2x = p2[0] - (p3[0] - p1[0]) / tension;
+        const cp2y = p2[1] - (p3[1] - p1[1]) / tension;
+
+        d += `C${cp1x},${cp1y},${cp2x},${cp2y},${p2[0]},${p2[1]}`;
+      }
+
+      return d;
+    }
+
+    // Build stroke path
+    const strokeD = buildSmoothPath(rawPoints);
+    document.getElementById('strokePath').setAttribute('d', strokeD);
+
+    // Build fill path (close at the bottom)
+    const lastPoint = rawPoints[rawPoints.length - 1];
+    const fillD = strokeD + `L${lastPoint[0]},54L0,54Z`;
+    document.getElementById('fillPath').setAttribute('d', fillD);
+
+    // Time button interactivity
+    document.querySelectorAll('.time-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+  </script>
+</body>
+</html>

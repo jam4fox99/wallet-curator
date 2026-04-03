@@ -13,46 +13,20 @@
   }
 
   function createSeries(chart) {
-    const baselineOptions = {
-      baseValue: { type: "price", price: 0 },
-      topLineColor: "#2ed47a",
-      topFillColor1: "rgba(46, 212, 122, 0.18)",
-      topFillColor2: "rgba(46, 212, 122, 0.03)",
-      bottomLineColor: "#ff5a67",
-      bottomFillColor1: "rgba(255, 90, 103, 0.16)",
-      bottomFillColor2: "rgba(255, 90, 103, 0.03)",
+    var areaOptions = {
+      lineColor: "#0093fd",
+      topColor: "rgba(0, 147, 253, 0.25)",
+      bottomColor: "rgba(155, 81, 224, 0.005)",
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,
     };
 
-    if (typeof chart.addSeries === "function" && window.LightweightCharts.BaselineSeries) {
-      return chart.addSeries(window.LightweightCharts.BaselineSeries, baselineOptions);
-    }
-    if (typeof chart.addBaselineSeries === "function") {
-      return chart.addBaselineSeries(baselineOptions);
-    }
     if (typeof chart.addSeries === "function" && window.LightweightCharts.AreaSeries) {
-      return chart.addSeries(window.LightweightCharts.AreaSeries, {
-        lineColor: "#60a5fa",
-        topColor: "rgba(96, 165, 250, 0.24)",
-        bottomColor: "rgba(96, 165, 250, 0.03)",
-        lineWidth: 2,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
-      });
+      return chart.addSeries(window.LightweightCharts.AreaSeries, areaOptions);
     }
-    return chart.addAreaSeries({
-      lineColor: "#60a5fa",
-      topColor: "rgba(96, 165, 250, 0.24)",
-      bottomColor: "rgba(96, 165, 250, 0.03)",
-      lineWidth: 2,
-      priceLineVisible: false,
-      lastValueVisible: false,
-      crosshairMarkerVisible: false,
-    });
+    return chart.addAreaSeries(areaOptions);
   }
 
   function createChartEntry(containerId) {
@@ -64,14 +38,14 @@
     const chart = window.LightweightCharts.createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: "solid", color: "#12161f" },
-        textColor: "#97a3b7",
+        background: { type: "solid", color: "#181d21" },
+        textColor: "#7b8996",
         fontFamily: '"Inter", "Segoe UI", sans-serif',
         attributionLogo: false,
       },
       grid: {
-        vertLines: { color: "rgba(255, 255, 255, 0.035)" },
-        horzLines: { color: "rgba(255, 255, 255, 0.035)" },
+        vertLines: { color: "rgba(255, 255, 255, 0.025)" },
+        horzLines: { color: "rgba(255, 255, 255, 0.025)" },
       },
       rightPriceScale: {
         borderVisible: false,
@@ -88,11 +62,11 @@
       crosshair: {
         vertLine: {
           color: "rgba(151, 163, 183, 0.22)",
-          labelBackgroundColor: "#4f8cff",
+          labelBackgroundColor: "#0093fd",
         },
         horzLine: {
           color: "rgba(151, 163, 183, 0.22)",
-          labelBackgroundColor: "#4f8cff",
+          labelBackgroundColor: "#0093fd",
         },
       },
       handleScale: {

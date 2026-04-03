@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import closing
 
 from lib.cloud_db import CloudConnection, connect as connect_postgres, init_postgres_schema
+from lib.tier_defaults import DEFAULT_TIER_CONFIG_ROWS, TIER_SORT_ORDER_UPDATES
 
 logger = logging.getLogger(__name__)
 
@@ -453,16 +454,10 @@ def init_db():
         INSERT OR IGNORE INTO tier_config (tier_name, display_name, copy_percentage, sort_order)
         VALUES (?, ?, ?, ?)
         """,
-        [
-            ("high_conviction", "High Conviction", 20.0, 1),
-            ("promoted", "Promoted", 10.0, 2),
-            ("test", "Test", 4.0, 3),
-        ],
+        DEFAULT_TIER_CONFIG_ROWS,
     )
-    # Migration: reorder tiers (high_conviction first, test last)
-    conn.execute("UPDATE tier_config SET sort_order = 1 WHERE tier_name = 'high_conviction'")
-    conn.execute("UPDATE tier_config SET sort_order = 2 WHERE tier_name = 'promoted'")
-    conn.execute("UPDATE tier_config SET sort_order = 3 WHERE tier_name = 'test'")
+    for sql in TIER_SORT_ORDER_UPDATES:
+        conn.execute(sql)
     conn.execute(
         """
         INSERT OR IGNORE INTO synced_csv_state (id, header_row, global_row, csv_content)

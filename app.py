@@ -53,19 +53,35 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 COLORS = {
-    "background": "#090b10",
-    "card": "#12161f",
-    "card_alt": "#171c27",
-    "surface_soft": "#0f131b",
-    "text": "#f4f6fb",
-    "text_secondary": "#97a3b7",
-    "positive": "#2ed47a",
-    "negative": "#ff5a67",
-    "border": "#232a36",
+    "background": "#15191d",
+    "card": "#181d21",
+    "card_alt": "#1e2428",
+    "surface_soft": "#15191d",
+    "text": "#dee3e7",
+    "text_secondary": "#7b8996",
+    "positive": "#3db468",
+    "negative": "#ff4d4d",
+    "border": "#242b32",
     "border_soft": "#1a202b",
-    "button": "#4f8cff",
+    "button": "#0093fd",
+    "chart_line": "#0093fd",
+    "chart_fill": "rgba(0, 147, 253, 0.12)",
 }
 FONT_FAMILY = '"Inter", "Segoe UI", sans-serif'
+
+
+def _polymarket_chart_layout(fig):
+    """Apply Polymarket-style dark chart layout to a Plotly figure."""
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.08)", zeroline=False, tickprefix="$"),
+        hovermode="x unified",
+        font=dict(family=FONT_FAMILY, color=COLORS["text_secondary"]),
+    )
 READ_ONLY_UI = os.environ.get("READ_ONLY_UI") == "1"
 
 RANGES = ["1D", "3D", "7D", "15D", "30D", "ALL"]
@@ -1185,6 +1201,7 @@ def wallet_curation_layout():
             dcc.Store(id="cur-approved", data=[]),
             dcc.Store(id="cur-decisions", data={}),
             dcc.Store(id="cur-filter", data=""),
+            dcc.Store(id="cur-selected-range", data=365),
             dcc.Store(id="cur-range", data=365),
             dcc.Store(id="cur-session-id", data=""),
             dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0),
@@ -2791,23 +2808,16 @@ def generate_subcategory_chart(n_clicks, active_range, wallet, filter_raw):
     series = payload["series"]
     summary = payload["summary"]
     final_pnl = summary["final_pnl"]
-    color = "#22c55e" if final_pnl >= 0 else "#ef4444"
-    fill_color = "rgba(34,197,94,0.12)" if final_pnl >= 0 else "rgba(239,68,68,0.12)"
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=[s["date"] for s in series], y=[s["pnl"] for s in series],
-        mode="lines", line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
+        mode="lines", line=dict(color=COLORS["chart_line"], width=2),
+        fill="tozeroy", fillcolor=COLORS["chart_fill"],
         customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
         hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
     ))
-    fig.update_layout(
-        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=50, r=20, t=20, b=40),
-        xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.10)", zeroline=False, tickprefix="$"),
-        hovermode="x unified",
-    )
+    _polymarket_chart_layout(fig)
 
     pnl_tone = "positive" if final_pnl >= 0 else "negative"
     sign = "" if final_pnl == 0 else ("-" if final_pnl < 0 else "")
@@ -2861,19 +2871,42 @@ def load_curation_categories(tab, pathname):
 _CUR_RANGES = [1, 7, 14, 30, 365]
 
 
+def _normalize_curation_lookback(selected_range):
+    try:
+        selected_range = int(selected_range)
+    except (TypeError, ValueError):
+        return 365
+    return selected_range if selected_range in _CUR_RANGES else 365
+
+
 @callback(
-    [Output(f"cur-setup-range-{d}", "className") for d in _CUR_RANGES],
+    Output("cur-selected-range", "data"),
     [Input(f"cur-setup-range-{d}", "n_clicks") for d in _CUR_RANGES],
+    State("cur-selected-range", "data"),
     prevent_initial_call=True,
 )
-def highlight_cur_range(c1, c7, c14, c30, c365):
+def set_cur_setup_range(c1, c7, c14, c30, c365, current):
     triggered = dash.ctx.triggered_id
     click_map = {f"cur-setup-range-{d}": d for d in _CUR_RANGES}
-    clicks_map = {f"cur-setup-range-1": c1, f"cur-setup-range-7": c7, f"cur-setup-range-14": c14,
-                  f"cur-setup-range-30": c30, f"cur-setup-range-365": c365}
-    selected = 365
+    clicks_map = {
+        "cur-setup-range-1": c1,
+        "cur-setup-range-7": c7,
+        "cur-setup-range-14": c14,
+        "cur-setup-range-30": c30,
+        "cur-setup-range-365": c365,
+    }
+    selected = _normalize_curation_lookback(current)
     if triggered in click_map and clicks_map.get(triggered):
-        selected = click_map[triggered]
+        return click_map[triggered]
+    return selected
+
+
+@callback(
+    [Output(f"cur-setup-range-{d}", "className") for d in _CUR_RANGES],
+    Input("cur-selected-range", "data"),
+)
+def highlight_cur_range(selected):
+    selected = _normalize_curation_lookback(selected)
     return [
         "pm-range-pill pm-range-pill--active" if d == selected else "pm-range-pill"
         for d in _CUR_RANGES
@@ -2887,11 +2920,10 @@ def highlight_cur_range(c1, c7, c14, c30, c365):
      Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
      Output("cur-setup-msg", "children")],
     Input("cur-start", "n_clicks"),
-    [State("cur-wallet-input", "value"), State("cur-category", "value")] +
-    [State(f"cur-setup-range-{d}", "n_clicks") for d in [1, 7, 14, 30, 365]],
+    [State("cur-wallet-input", "value"), State("cur-category", "value"), State("cur-selected-range", "data")],
     prevent_initial_call=True,
 )
-def start_curation(n_clicks, wallet_text, category, *range_clicks):
+def start_curation(n_clicks, wallet_text, category, selected_range):
     if not n_clicks:
         return [no_update] * 11
 
@@ -2904,14 +2936,7 @@ def start_curation(n_clicks, wallet_text, category, *range_clicks):
     if not wallets:
         return [no_update] * 10 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
 
-    # Determine range
-    range_map = {0: 1, 1: 7, 2: 14, 3: 30, 4: 365}
-    lookback = 365
-    max_c = 0
-    for i, c in enumerate(range_clicks):
-        if c and c > max_c:
-            max_c = c
-            lookback = range_map[i]
+    lookback = _normalize_curation_lookback(selected_range)
 
     if "::" in category:
         filter_level, filter_value = category.split("::", 1)
@@ -3031,23 +3056,16 @@ def render_curation_wallet(index, session_id, _poll, wallets, filter_raw, lookba
     series = data["series"]
     summary = data["summary"]
     final_pnl = summary["final_pnl"]
-    color = "#22c55e" if final_pnl >= 0 else "#ef4444"
-    fill_color = "rgba(34,197,94,0.12)" if final_pnl >= 0 else "rgba(239,68,68,0.12)"
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=[s["date"] for s in series], y=[s["pnl"] for s in series],
-        mode="lines", line=dict(color=color, width=2), fill="tozeroy", fillcolor=fill_color,
+        mode="lines", line=dict(color=COLORS["chart_line"], width=2),
+        fill="tozeroy", fillcolor=COLORS["chart_fill"],
         customdata=[[s["cumulative_cash"], s["marked_value"], s["daily_trade_count"]] for s in series],
         hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<br>Cash: $%{customdata[0]:,.2f}<br>Marked: $%{customdata[1]:,.2f}<br>Trades: %{customdata[2]}<extra></extra>",
     ))
-    fig.update_layout(
-        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=50, r=20, t=10, b=40),
-        xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(showgrid=True, gridcolor="rgba(122,145,173,0.10)", zeroline=False, tickprefix="$"),
-        hovermode="x unified",
-    )
+    _polymarket_chart_layout(fig)
 
     # Stats
     pnl_color = "positive" if final_pnl >= 0 else "negative"

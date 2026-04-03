@@ -8,9 +8,12 @@ data/sims/sim_*
 data/malformed/
 reports/*.md
 reports/*.csv
+reports/*.xlsx
+reports/~$*
 !reports/.gitkeep
 .env
 *.egg-info/
 .DS_Store
 active_wallets.csv
 scratch/
+tests/Copysim 5024.xlsx

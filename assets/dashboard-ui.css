@@ -1,22 +1,23 @@
 :root {
-  --pm-bg: #090b10;
-  --pm-surface: #12161f;
-  --pm-surface-alt: #171c27;
-  --pm-surface-soft: #0f131b;
-  --pm-border: #232a36;
+  --pm-bg: #15191d;
+  --pm-surface: #181d21;
+  --pm-surface-alt: #1e2428;
+  --pm-surface-soft: #15191d;
+  --pm-border: #242b32;
   --pm-border-soft: #1a202b;
-  --pm-text: #f4f6fb;
-  --pm-text-secondary: #97a3b7;
-  --pm-blue: #4f8cff;
-  --pm-green: #2ed47a;
-  --pm-red: #ff5a67;
+  --pm-text: #dee3e7;
+  --pm-text-secondary: #7b8996;
+  --pm-blue: #0093fd;
+  --pm-green: #3db468;
+  --pm-red: #ff4d4d;
+  --pm-purple: #9B51E0;
   --pm-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
 }
 
 html,
 body {
   background:
-    radial-gradient(circle at top, rgba(79, 140, 255, 0.08), transparent 28%),
+    radial-gradient(circle at top, rgba(0, 147, 253, 0.08), transparent 28%),
     linear-gradient(180deg, #0b0e14 0%, #090b10 100%);
   color: var(--pm-text);
   font-family: "Inter", "Segoe UI", sans-serif;
@@ -87,7 +88,7 @@ a {
 
 .pm-brand-mark span:last-child {
   clip-path: polygon(66% 0, 100% 0, 100% 100%, 34% 100%);
-  background: linear-gradient(135deg, #78a9ff 0%, #4f8cff 100%);
+  background: linear-gradient(135deg, #0093fd 0%, #9B51E0 100%);
 }
 
 .pm-brand-copy {
@@ -358,9 +359,9 @@ a {
 .pm-chart-shell {
   margin-top: 18px;
   padding: 10px 6px 0;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.015);
-  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 15.2px;
+  background: var(--pm-surface);
+  border: 1px solid var(--pm-border);
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -409,8 +410,8 @@ a {
 
 .pm-range-pill--active {
   color: var(--pm-text);
-  background: rgba(79, 140, 255, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(79, 140, 255, 0.22);
+  background: rgba(0, 147, 253, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(0, 147, 253, 0.22);
 }
 
 .pm-side-rail {
@@ -445,8 +446,8 @@ a {
 
 .pm-button--primary {
   color: white;
-  background: linear-gradient(180deg, #6198ff 0%, #4f8cff 100%);
-  border-color: rgba(97, 152, 255, 0.75);
+  background: linear-gradient(180deg, #0093fd 0%, #9B51E0 100%);
+  border-color: rgba(0, 147, 253, 0.75);
 }
 
 .pm-button--secondary {
