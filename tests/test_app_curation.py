@@ -10,6 +10,29 @@ import app
 
 
 class AppCurationTests(unittest.TestCase):
+    def test_handle_sim_upload_activates_sim_mode(self):
+        fake_payload = {
+            "wallet_order": ["0xabc"],
+            "wallets": {"0xabc": {"address": "0xabc", "filter_level": "detail", "filter_value": "League of Legends"}},
+            "filter_summary": {"League of Legends": 1},
+        }
+        session_manager = Mock()
+        session_manager.create_session.return_value = "sim-session-1"
+
+        with patch("lib.sharpsim_parser.parse_sharpsim", return_value=fake_payload), patch(
+            "lib.sharpsim_session.get_sharpsim_session_manager", return_value=session_manager
+        ):
+            result = app.handle_sim_upload(
+                "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,ZmFrZQ==",
+                "Sharpsim.xlsx",
+            )
+
+        self.assertEqual(result[0], "sim-session-1")
+        self.assertTrue(result[1])
+        self.assertTrue(result[2])
+        self.assertEqual(result[4], {"display": "none"})
+        self.assertEqual(result[5], {"display": "inline-flex"})
+
     def test_cur_range_store_is_owned_by_single_callback(self):
         source = Path(app.__file__).read_text()
         self.assertEqual(source.count('Output("cur-range", "data")'), 1)
@@ -55,6 +78,8 @@ class AppCurationTests(unittest.TestCase):
                 "0xabc\n0xdef",
                 "detail::Esports",
                 30,
+                False,
+                "",
             )
 
         self.assertEqual(result[0], ["0xabc", "0xdef"])
@@ -62,10 +87,41 @@ class AppCurationTests(unittest.TestCase):
         self.assertEqual(result[2], 0)
         manager.prime_session.assert_called_once()
         self.assertEqual(manager.prime_session.call_args.kwargs["session_id"], result[5])
-        self.assertEqual(manager.prime_session.call_args.kwargs["wallets"], ["0xabc", "0xdef"])
-        self.assertEqual(manager.prime_session.call_args.kwargs["filter_level"], "detail")
-        self.assertEqual(manager.prime_session.call_args.kwargs["filter_value"], "Esports")
+        self.assertEqual(
+            manager.prime_session.call_args.kwargs["wallet_configs"],
+            [
+                {"address": "0xabc", "filter_level": "detail", "filter_value": "Esports"},
+                {"address": "0xdef", "filter_level": "detail", "filter_value": "Esports"},
+            ],
+        )
         self.assertEqual(manager.prime_session.call_args.kwargs["warm_count"], 6)
+
+    def test_start_curation_uses_sim_wallet_configs_when_session_is_active(self):
+        payload = {
+            "wallet_order": ["0xabc", "0xdef"],
+            "wallets": {
+                "0xabc": {"address": "0xabc", "filter_level": "detail", "filter_value": "League of Legends"},
+                "0xdef": {"address": "0xdef", "filter_level": "detail", "filter_value": "Valorant"},
+            },
+        }
+        session_manager = Mock()
+        session_manager.get_session.return_value = payload
+        prefetch_manager = Mock()
+
+        with patch("lib.sharpsim_session.get_sharpsim_session_manager", return_value=session_manager), patch(
+            "lib.curation_prefetch.get_curation_prefetch_manager", return_value=prefetch_manager
+        ):
+            result = app.start_curation(1, "", None, "30D", True, "sim-session-1")
+
+        self.assertEqual(result[0], ["0xabc", "0xdef"])
+        self.assertEqual(result[1], "detail::League of Legends")
+        self.assertEqual(
+            prefetch_manager.prime_session.call_args.kwargs["wallet_configs"],
+            [
+                {"address": "0xabc", "filter_level": "detail", "filter_value": "League of Legends"},
+                {"address": "0xdef", "filter_level": "detail", "filter_value": "Valorant"},
+            ],
+        )
 
     def test_update_curation_status_keeps_poll_running_while_current_wallet_loads(self):
         manager = Mock()

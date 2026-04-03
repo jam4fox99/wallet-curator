@@ -1218,6 +1218,9 @@ def wallet_curation_layout():
             dcc.Store(id="cur-range", data=CURATION_ALL_RANGE),
             dcc.Store(id="cur-session-id", data=""),
             dcc.Store(id="cur-view", data={"status": "idle"}),
+            dcc.Store(id="cur-sim-session-id", data=""),
+            dcc.Store(id="cur-sim-active", data=False),
+            dcc.Store(id="cur-sim-overlay-visible", data=False),
             dcc.Interval(id="cur-prefetch-poll", interval=1500, n_intervals=0, disabled=True),
 
             # Setup screen
@@ -1229,20 +1232,43 @@ def wallet_curation_layout():
                             html.Div("Wallet Curation", className="pm-kicker"),
                             html.H2("Swipe Review", className="pm-section-title pm-section-title--blue"),
                         ], className="pm-card-title-block"),
-                        html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
-                        dcc.Textarea(
-                            id="cur-wallet-input",
-                            className="pm-textarea pm-textarea--mono",
-                            placeholder="0xabc123...\n0xdef456...\n0x789...",
-                            style={"minHeight": "120px"},
+                        html.Div(
+                            [
+                                dcc.Upload(
+                                    id="cur-sim-upload",
+                                    children=html.Button("Upload Sharpsim", className="pm-button pm-button--secondary"),
+                                    accept=".xlsx",
+                                ),
+                                html.Button(
+                                    "Switch to manual",
+                                    id="cur-sim-clear",
+                                    className="pm-button pm-button--secondary",
+                                    n_clicks=0,
+                                    style={"display": "none"},
+                                ),
+                            ],
+                            style={"display": "flex", "gap": "12px", "marginBottom": "12px"},
                         ),
-                        html.Div([
-                            html.Div([
-                                html.Div("Category", className="pm-field-label"),
-                                dcc.Dropdown(id="cur-category", placeholder="Select category...",
-                                             searchable=True, className="pm-wallet-dropdown"),
-                            ], style={"flex": "1"}),
-                        ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                        html.Div(id="cur-sim-summary", className="pm-inline-message"),
+                        html.Div(
+                            id="cur-manual-fields",
+                            children=[
+                                html.Div("Paste wallet addresses (one per line)", className="pm-field-label"),
+                                dcc.Textarea(
+                                    id="cur-wallet-input",
+                                    className="pm-textarea pm-textarea--mono",
+                                    placeholder="0xabc123...\n0xdef456...\n0x789...",
+                                    style={"minHeight": "120px"},
+                                ),
+                                html.Div([
+                                    html.Div([
+                                        html.Div("Category", className="pm-field-label"),
+                                        dcc.Dropdown(id="cur-category", placeholder="Select category...",
+                                                     searchable=True, className="pm-wallet-dropdown"),
+                                    ], style={"flex": "1"}),
+                                ], style={"display": "flex", "gap": "16px", "margin": "12px 0"}),
+                            ],
+                        ),
                         html.Div(
                             [
                                 html.Button(
@@ -1269,6 +1295,7 @@ def wallet_curation_layout():
                 children=[
                     html.Div(id="cur-progress", style={"marginBottom": "12px", "color": "var(--pm-text-secondary)", "fontSize": "13px"}),
                     html.Div(id="cur-wallet-header", style={"marginBottom": "8px"}),
+                    html.Div(id="cur-sim-summary-panel", style={"marginBottom": "12px"}),
                     html.Div(
                         [
                             html.Button(
@@ -3078,34 +3105,145 @@ def highlight_cur_range(selected):
 
 
 @callback(
+    [
+        Output("cur-sim-session-id", "data"),
+        Output("cur-sim-active", "data"),
+        Output("cur-sim-overlay-visible", "data"),
+        Output("cur-sim-summary", "children"),
+        Output("cur-manual-fields", "style"),
+        Output("cur-sim-clear", "style"),
+        Output("cur-setup-msg", "children", allow_duplicate=True),
+    ],
+    Input("cur-sim-upload", "contents"),
+    State("cur-sim-upload", "filename"),
+    prevent_initial_call=True,
+)
+def handle_sim_upload(contents, filename):
+    if not contents:
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+    try:
+        from base64 import b64decode
+        from lib.sharpsim_parser import parse_sharpsim
+        from lib.sharpsim_session import get_sharpsim_session_manager
+
+        _, encoded = contents.split(",", 1)
+        payload = parse_sharpsim(b64decode(encoded), filename or "")
+        session_id = get_sharpsim_session_manager().create_session(payload)
+        summary = " | ".join(
+            [f"{len(payload['wallet_order'])} wallets loaded from Sharpsim"]
+            + [f"{label} ({count})" for label, count in payload.get("filter_summary", {}).items()]
+        )
+        return (
+            session_id,
+            True,
+            True,
+            dbc.Alert(summary, color="secondary"),
+            {"display": "none"},
+            {"display": "inline-flex"},
+            "",
+        )
+    except Exception as exc:
+        logger.exception("Sharpsim upload failed")
+        return (
+            "",
+            False,
+            False,
+            "",
+            {"display": "block"},
+            {"display": "none"},
+            dbc.Alert(f"Invalid Sharpsim workbook: {exc}", color="danger"),
+        )
+
+
+@callback(
+    [
+        Output("cur-sim-session-id", "data", allow_duplicate=True),
+        Output("cur-sim-active", "data", allow_duplicate=True),
+        Output("cur-sim-overlay-visible", "data", allow_duplicate=True),
+        Output("cur-sim-summary", "children", allow_duplicate=True),
+        Output("cur-manual-fields", "style", allow_duplicate=True),
+        Output("cur-sim-clear", "style", allow_duplicate=True),
+    ],
+    Input("cur-sim-clear", "n_clicks"),
+    State("cur-sim-session-id", "data"),
+    prevent_initial_call=True,
+)
+def clear_sim_session(n_clicks, sim_session_id):
+    if not n_clicks:
+        return [no_update] * 6
+
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    if sim_session_id:
+        get_sharpsim_session_manager().clear_session(sim_session_id)
+    return "", False, False, "", {"display": "block"}, {"display": "none"}
+
+
+def _wallet_configs_from_manual_inputs(wallet_text, category):
+    wallets = [wallet.strip().lower() for wallet in (wallet_text or "").splitlines() if wallet.strip().startswith("0x")]
+    if "::" in (category or ""):
+        filter_level, filter_value = category.split("::", 1)
+    else:
+        filter_level, filter_value = "detail", category or ""
+    wallet_configs = [
+        {"address": wallet, "filter_level": filter_level, "filter_value": filter_value}
+        for wallet in wallets
+    ]
+    return wallets, wallet_configs, f"{filter_level}::{filter_value}"
+
+
+def _wallet_configs_from_sim_session(sim_session_id):
+    from lib.sharpsim_session import get_sharpsim_session_manager
+
+    payload = get_sharpsim_session_manager().get_session(sim_session_id) or {}
+    wallet_configs = [
+        {
+            "address": wallet,
+            "filter_level": payload["wallets"][wallet]["filter_level"],
+            "filter_value": payload["wallets"][wallet]["filter_value"],
+        }
+        for wallet in payload.get("wallet_order", [])
+    ]
+    filter_raw = ""
+    if wallet_configs:
+        filter_raw = f"{wallet_configs[0]['filter_level']}::{wallet_configs[0]['filter_value']}"
+    return payload.get("wallet_order", []), wallet_configs, filter_raw
+
+
+@callback(
     [Output("cur-wallets", "data"), Output("cur-filter", "data"),
      Output("cur-index", "data"), Output("cur-approved", "data"), Output("cur-decisions", "data"),
      Output("cur-session-id", "data"),
      Output("cur-setup", "style"), Output("cur-swipe", "style"), Output("cur-results", "style"),
      Output("cur-setup-msg", "children")],
     Input("cur-start", "n_clicks"),
-    [State("cur-wallet-input", "value"), State("cur-category", "value"), State("cur-range", "data")],
+    [
+        State("cur-wallet-input", "value"),
+        State("cur-category", "value"),
+        State("cur-range", "data"),
+        State("cur-sim-active", "data"),
+        State("cur-sim-session-id", "data"),
+    ],
     prevent_initial_call=True,
 )
-def start_curation(n_clicks, wallet_text, category, selected_range):
+def start_curation(n_clicks, wallet_text, category, selected_range, sim_active, sim_session_id):
     if not n_clicks:
         return [no_update] * 10
 
-    if not wallet_text or not wallet_text.strip():
-        return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
-    if not category:
-        return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
-
-    wallets = [w.strip().lower() for w in wallet_text.strip().split("\n") if w.strip().startswith("0x")]
-    if not wallets:
-        return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
+    if sim_active and sim_session_id:
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_sim_session(sim_session_id)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("Uploaded Sharpsim session has no wallets.", color="warning")]
+    else:
+        if not wallet_text or not wallet_text.strip():
+            return [no_update] * 9 + [dbc.Alert("Paste at least one wallet address.", color="warning")]
+        if not category:
+            return [no_update] * 9 + [dbc.Alert("Select a category.", color="warning")]
+        wallets, wallet_configs, filter_raw = _wallet_configs_from_manual_inputs(wallet_text, category)
+        if not wallets:
+            return [no_update] * 9 + [dbc.Alert("No valid wallet addresses found.", color="warning")]
 
     selected_range = _normalize_curation_range(selected_range)
-
-    if "::" in category:
-        filter_level, filter_value = category.split("::", 1)
-    else:
-        filter_level, filter_value = "detail", category
 
     session_id = uuid.uuid4().hex
     try:
@@ -3113,16 +3251,14 @@ def start_curation(n_clicks, wallet_text, category, selected_range):
 
         get_curation_prefetch_manager().prime_session(
             session_id=session_id,
-            wallets=wallets,
-            filter_level=filter_level,
-            filter_value=filter_value,
+            wallet_configs=wallet_configs,
             warm_count=6,
         )
     except Exception:
         logger.exception("Failed to seed curation prefetch session")
 
     return (
-        wallets, category, 0, [], {}, session_id,
+        wallets, filter_raw, 0, [], {}, session_id,
         {"display": "none"}, {"display": "block"}, {"display": "none"}, "",
     )
 
